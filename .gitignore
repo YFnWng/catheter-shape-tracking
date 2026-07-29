@@ -1,0 +1,32 @@
+# ROS2 build artifacts
+build/
+install/
+log/
+
+# Docker
+*.log
+*.pid
+docker-compose.override.yml
+.env
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# OS / host artifacts
+.DS_Store
+Thumbs.db
+
+# Python / ROS2 Python packages
+__pycache__/
+*.pyc
+
+# ROS2 colcon cache
+.ros/
+
+# Misc
+*.pdf
+*.png
+*.npz
+
+**/.venv/

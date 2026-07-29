@@ -1,0 +1,60 @@
+# Camera <-> robot-base registration config for  python -m shape_tracking.register
+#
+# BASE FRAME convention:
+#   origin at the catheter base; +z along the catheter at rest, toward the tip.
+#
+# For each ChArUco board give T_marker_to_base: the transform mapping a point in
+# that MARKER (board) frame into the BASE frame:
+#       p_base = T_marker_to_base @ p_marker
+# i.e. the marker frame expressed in base coordinates.
+#   board 0 = ids 1..8,  board 1 = ids 9..16.
+# Provide EITHER a full 4x4 'matrix' (row-major) OR 'translation' + one of:
+#   'rotation_matrix'    : 3x3 row-major
+#   'rotation_euler_deg' : [rx, ry, rz]  scipy intrinsic 'xyz'
+#                          -> R = Rz(rz) @ Ry(ry) @ Rx(rx)
+#                          (rotate about the frame's X, then the new Y, then the
+#                           new Z). For a single-axis turn just set one angle,
+#                           e.g. [0, 0, 120] = 120 deg about Z (no sqrt(3) to type).
+#   'rotation_quat'      : [x, y, z, w]
+#
+# Include both boards if you have both fixtures; the tool registers from whichever
+# is best-seen and cross-checks the two base estimates for agreement.
+#
+# ---- REPLACE the placeholders below with your measured transforms. ----
+
+# Length units for ALL translations + the workspace box (rotations never scaled).
+units: mm            # 'mm' or 'm'
+
+markers:
+  0:                                   # ids 1..8
+    matrix:
+      - [0.0, 0.0, -1.0, 25.0]
+      - [0.0, 1.0, 0.0, -122.0]
+      - [1.0, 0.0, 0.0, -140.0]
+      - [0.0, 0.0, 0.0, 1.0]
+  1:                                   # ids 9..16  (alternative forms shown)
+    # full 4x4 (rotation + translation together):
+    translation: [25.0, -122.0, -40.0]
+    rotation_euler_deg: [0.0, -150.0, 0.0]
+    # or:  translation: [..]  +  rotation_euler_deg: [..]  /  rotation_quat: [..]
+
+# EM probe registration. Enter the four physical bracket slot-center positions
+# in the robot BASE frame, using the top-level units above. Slot numbers match
+# the 1..4 keys used during recording. The recorder fits:
+#     p_base = robot_base_T_aurora @ p_aurora
+em_registration:
+  slot_centers_base:
+    1: [0.0, -18.0, -2.0]  # [x, y, z]
+    2: [-21.0, 0.0, -2.0]
+    3: [0.0, 21.0, -2.0]
+    4: [21.0, 0.0, -2.0]
+
+# Workspace ROI volume: axis-aligned box in the BASE frame (in 'units' above),
+# fixed to the registered base, sized to cover the full catheter workspace
+# (insertion range + bending). +z runs from the base toward/past the tip.
+# Projected into the image to form the 2D segmentation ROI; 'margin_px' is pixels.
+workspace:
+  x: [-60.0, 60.0]
+  y: [-60.0, 60.0]
+  z: [0.0, 220.0]
+  margin_px: 25

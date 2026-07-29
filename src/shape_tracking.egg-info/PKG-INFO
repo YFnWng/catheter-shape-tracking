@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: shape_tracking
+Version: 0.1.0
+Summary: Catheter centerline 3D shape tracking with ZED2 + NDI Aurora
+Requires-Python: <3.12,>=3.11
+Requires-Dist: numpy
+Requires-Dist: opencv-contrib-python>=4.7
+Provides-Extra: capture

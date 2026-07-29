@@ -1,0 +1,2 @@
+[console_scripts]
+shape-tracking-record = shape_tracking.cli:main

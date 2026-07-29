@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/shape_tracking/__init__.py
+src/shape_tracking/__main__.py
+src/shape_tracking/boards.py
+src/shape_tracking/cli.py
+src/shape_tracking/registration.py
+src/shape_tracking/zed_capture.py
+src/shape_tracking.egg-info/PKG-INFO
+src/shape_tracking.egg-info/SOURCES.txt
+src/shape_tracking.egg-info/dependency_links.txt
+src/shape_tracking.egg-info/entry_points.txt
+src/shape_tracking.egg-info/requires.txt
+src/shape_tracking.egg-info/top_level.txt
