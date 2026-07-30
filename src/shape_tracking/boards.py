@@ -36,6 +36,8 @@ SQUARE_LENGTH_M = 0.025          # 25.0 mm  -- MEASURE YOUR PRINT AND CONFIRM
 MARKER_LENGTH_M = 0.01875        # 18.75 mm (0.75 * square)
 ARUCO_DICT = cv2.aruco.DICT_4X4_50
 BOARD_ID_OFFSETS = (1, 9)        # board#1 ids 1..8, board#2 ids 9..16
+FIELD_GENERATOR_ID_OFFSET = 17   # field-generator board ids 17..24
+FIELD_GENERATOR_BOARD_INDEX = 2
 MARKERS_PER_BOARD = (SQUARES_X * SQUARES_Y) // 2   # = 8
 
 AXIS_LEN_M = 0.03                # length of drawn pose axes (30 mm)
@@ -57,12 +59,24 @@ def get_dictionary():
     return cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
 
 
-def build_boards(dictionary=None):
-    """Return (dictionary, [BoardEntry, ...]) for the two printed boards."""
+def build_boards(dictionary=None, additional=()):
+    """Build the two base boards plus optional ``(index, id_offset)`` boards."""
     if dictionary is None:
         dictionary = get_dictionary()
     boards = []
-    for index, off in enumerate(BOARD_ID_OFFSETS):
+    specifications = list(enumerate(BOARD_ID_OFFSETS)) + list(additional)
+    seen_indices = set()
+    seen_ids = set()
+    for index, off in specifications:
+        index, off = int(index), int(off)
+        ids_set = set(range(off, off + MARKERS_PER_BOARD))
+        if index in seen_indices:
+            raise ValueError(f'duplicate ChArUco board index {index}')
+        overlap = sorted(seen_ids & ids_set)
+        if overlap:
+            raise ValueError(f'overlapping ChArUco marker IDs: {overlap}')
+        seen_indices.add(index)
+        seen_ids.update(ids_set)
         ids = np.arange(off, off + MARKERS_PER_BOARD, dtype=np.int32)
         board = cv2.aruco.CharucoBoard(
             (SQUARES_X, SQUARES_Y), SQUARE_LENGTH_M, MARKER_LENGTH_M,

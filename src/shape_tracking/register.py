@@ -84,6 +84,63 @@ def load_config(path):
     return markers, workspace
 
 
+def load_field_generator_config(path):
+    '''Load the fixed ChArUco-marker pose in the Aurora field frame.
+
+    The configured transform follows ``p_aurora = aurora_T_marker @ p_marker``.
+    Translation uses the YAML file's top-level units.
+    '''
+    with open(path, encoding='utf-8') as stream:
+        config = yaml.safe_load(stream) or {}
+    entry = config.get('field_generator_registration')
+    if entry is None:
+        return None
+    if not isinstance(entry, dict):
+        raise ValueError('field_generator_registration must be a mapping')
+    marker_offset = int(entry.get(
+        'marker_id_offset', boards_mod.FIELD_GENERATOR_ID_OFFSET))
+    board_index = int(entry.get(
+        'board_index', boards_mod.FIELD_GENERATOR_BOARD_INDEX))
+    if marker_offset < 0 or (
+            marker_offset + boards_mod.MARKERS_PER_BOARD
+            > boards_mod.get_dictionary().bytesList.shape[0]):
+        raise ValueError('field-generator marker IDs exceed the dictionary')
+    existing_ids = {
+        marker_id
+        for offset in boards_mod.BOARD_ID_OFFSETS
+        for marker_id in range(
+            offset, offset + boards_mod.MARKERS_PER_BOARD)}
+    requested_ids = set(range(
+        marker_offset, marker_offset + boards_mod.MARKERS_PER_BOARD))
+    overlap = sorted(existing_ids & requested_ids)
+    if overlap:
+        raise ValueError(
+            f'field-generator marker IDs overlap base boards: {overlap}')
+    marker_entry = entry.get('aurora_T_marker')
+    if not isinstance(marker_entry, dict):
+        raise ValueError(
+            'field_generator_registration.aurora_T_marker is required')
+    aurora_T_marker = load_transform(marker_entry)
+    units = str(config.get('units', 'm')).lower()
+    if units not in ('mm', 'm'):
+        raise ValueError("registration config units must be 'mm' or 'm'")
+    if units == 'mm':
+        aurora_T_marker[:3, 3] *= 0.001
+    if (aurora_T_marker.shape != (4, 4)
+            or not np.all(np.isfinite(aurora_T_marker))
+            or not np.allclose(aurora_T_marker[3], [0.0, 0.0, 0.0, 1.0])):
+        raise ValueError('aurora_T_marker must be a finite rigid 4x4 transform')
+    rotation = aurora_T_marker[:3, :3]
+    if (not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5)
+            or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-5)):
+        raise ValueError('aurora_T_marker rotation must be right-handed orthonormal')
+    return {
+        'board_index': board_index,
+        'marker_id_offset': marker_offset,
+        'aurora_T_marker': aurora_T_marker,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # geometry
 # --------------------------------------------------------------------------- #
@@ -313,15 +370,25 @@ def save_session_camera_registration(
 
     The collected mapping contains r, t and c observation lists per board.
     """
-    with open(registration_path, encoding='utf-8') as stream:
-        document = json.load(stream)
-    if not document.get('em') or (
-            document['em'].get('transform_status') != 'solved'):
-        raise ValueError('EM registration must be solved before camera registration')
-    base_T_aurora, overlay_coils = build_em_overlay_geometry(
-        document['em'], em_tool_poses)
-
+    if os.path.isfile(registration_path):
+        with open(registration_path, encoding='utf-8') as stream:
+            document = json.load(stream)
+    else:
+        document = {
+            'schema_version': 2,
+            'session_id': os.path.basename(os.path.normpath(output_dir)),
+            'registration_config': os.path.abspath(config_path),
+            'em': None,
+            'camera': None,
+        }
     markers, workspace = load_config(config_path)
+    field_config = load_field_generator_config(config_path)
+    if field_config is None and (
+            not document.get('em')
+            or document['em'].get('transform_status') != 'solved'):
+        raise ValueError(
+            'registration requires either a solved probe-based EM transform or '
+            'field_generator_registration in the YAML config')
     per_board = {}
     for board_index in sorted(markers):
         data = collected.get(board_index, {'r': [], 't': [], 'c': []})
@@ -363,6 +430,76 @@ def save_session_camera_registration(
         per_board, key=lambda index: per_board[index]['stats']['n_used'])
     left_camera_T_robot_base = per_board[primary][
         'left_camera_T_robot_base']
+
+    field_board = None
+    if field_config is not None:
+        field_index = field_config['board_index']
+        data = collected.get(field_index, {'r': [], 't': [], 'c': []})
+        if len(data['r']) < min_frames:
+            raise ValueError(
+                f'field-generator ChArUco board {field_index} has '
+                f"{len(data['r'])}/{min_frames} valid frames")
+        field_rot, field_translation, field_stats = robust_average_pose(
+            data['r'], data['t'])
+        left_camera_T_field_marker = homogeneous(
+            field_rot, field_translation)
+        left_camera_T_aurora = (
+            left_camera_T_field_marker
+            @ np.linalg.inv(field_config['aurora_T_marker']))
+        robot_base_T_aurora_m = (
+            np.linalg.inv(left_camera_T_robot_base)
+            @ left_camera_T_aurora)
+        robot_base_T_aurora_mm = robot_base_T_aurora_m.copy()
+        robot_base_T_aurora_mm[:3, 3] *= 1000.0
+        aurora_T_robot_base_mm = np.linalg.inv(robot_base_T_aurora_mm)
+        aurora_T_marker_mm = field_config['aurora_T_marker'].copy()
+        aurora_T_marker_mm[:3, 3] *= 1000.0
+        completed_at_ns = time.time_ns()
+        document['em'] = {
+            'method': 'optical_charuco_field_generator',
+            'frame': 'aurora',
+            'complete': True,
+            'completed_at_ns': completed_at_ns,
+            'transform_status': 'solved',
+            'transform_error': None,
+            'robot_base_T_aurora': robot_base_T_aurora_mm.tolist(),
+            'aurora_T_robot_base': aurora_T_robot_base_mm.tolist(),
+            'field_generator_marker': {
+                'board_index': int(field_index),
+                'marker_id_offset': int(
+                    field_config['marker_id_offset']),
+                'marker_ids': list(range(
+                    field_config['marker_id_offset'],
+                    field_config['marker_id_offset']
+                    + boards_mod.MARKERS_PER_BOARD)),
+                'aurora_T_marker': aurora_T_marker_mm.tolist(),
+                'left_camera_T_marker': (
+                    left_camera_T_field_marker.tolist()),
+                'left_camera_T_aurora': left_camera_T_aurora.tolist(),
+                'mean_corners': float(np.mean(data['c'])),
+                'stats': {
+                    'n_total': field_stats['n_total'],
+                    'n_used': field_stats['n_used'],
+                    't_std_mm': np.asarray(
+                        field_stats['t_std_mm']).tolist(),
+                    'rot_std_deg': field_stats['rot_std_deg'],
+                },
+            },
+            'registration_fit': {
+                'method': 'optical_pose_composition',
+                'base_board_index': int(primary),
+                'field_board_index': int(field_index),
+            },
+        }
+        field_board = {
+            'index': field_index,
+            'left_camera_T_board': left_camera_T_field_marker,
+            'stats': field_stats,
+            'mean_corners': float(np.mean(data['c'])),
+        }
+
+    base_T_aurora, overlay_coils = build_em_overlay_geometry(
+        document['em'], em_tool_poses)
     right_camera_T_left_camera = np.eye(4)
     right_camera_T_left_camera[0, 3] = -float(baseline_m)
     right_camera_T_robot_base = (
@@ -377,6 +514,9 @@ def save_session_camera_registration(
     poses_left = {
         index: item['left_camera_T_board']
         for index, item in per_board.items()}
+    if field_board is not None:
+        poses_left[field_board['index']] = field_board[
+            'left_camera_T_board']
     poses_right = {
         index: right_camera_T_left_camera @ pose
         for index, pose in poses_left.items()}
@@ -400,7 +540,7 @@ def save_session_camera_registration(
         'completed_at_ns': time.time_ns(),
         'image_timestamp_ns': int(image_timestamp_ns),
         'primary_board': int(primary),
-        'boards_used': sorted(int(index) for index in per_board),
+        'boards_used': sorted(int(index) for index in poses_left),
         'left_camera_T_robot_base': left_camera_T_robot_base.tolist(),
         'robot_base_T_left_camera': np.linalg.inv(
             left_camera_T_robot_base).tolist(),
@@ -441,6 +581,20 @@ def save_session_camera_registration(
             } for index, item in per_board.items()
         },
         'board_agreement': agreement,
+        'field_generator_board': (
+            None if field_board is None else {
+                'board_index': int(field_board['index']),
+                'left_camera_T_board': field_board[
+                    'left_camera_T_board'].tolist(),
+                'mean_corners': field_board['mean_corners'],
+                'stats': {
+                    'n_total': field_board['stats']['n_total'],
+                    'n_used': field_board['stats']['n_used'],
+                    't_std_mm': np.asarray(
+                        field_board['stats']['t_std_mm']).tolist(),
+                    'rot_std_deg': field_board['stats']['rot_std_deg'],
+                },
+            }),
         'em_overlay': {
             'image_timestamp_ns': int(image_timestamp_ns),
             'field_frame': 'aurora',

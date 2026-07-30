@@ -69,7 +69,44 @@ tool type, and transient port handle. The complete mapping is repeated in
 `em_metadata.json`; downstream code must use `tool_role` or `serial_number`, not
 the discovery index.
 
-### Four-slot base registration
+### Direct optical field-generator registration
+
+The preferred workflow uses the existing base ChArUco board and the 100 x
+100 mm field-generator board (`DICT_4X4_50` IDs 17-24) in the same camera frames.
+Configure the fixed physical transform in `registration_config.yaml`:
+
+```yaml
+field_generator_registration:
+  board_index: 2
+  marker_id_offset: 17
+  aurora_T_marker:              # p_aurora = T @ p_marker
+    matrix:
+      - [r00, r01, r02, tx_mm]
+      - [r10, r11, r12, ty_mm]
+      - [r20, r21, r22, tz_mm]
+      - [0.0, 0.0, 0.0, 1.0]
+```
+
+When unified recording starts with `v` or `--autorecord`, detection begins
+automatically. A sample is retained only when the field board and at least one
+configured base board both have valid poses in the same image. After the fixed
+frame count, the recorder calculates
+`camera_T_aurora = camera_T_field_marker @ inv(aurora_T_marker)` and then
+`base_T_aurora = inv(camera_T_base) @ camera_T_aurora`. No probe placement or
+number-key capture is used in this mode.
+
+The probe may remain connected, preserving the normal
+`--aurora-expected-tools 3` command. If it is unplugged, start the recorder with
+`--aurora-expected-tools 2`; optical mode still requires and identifies exactly
+the two tip coils.
+
+The printed marker origin is the upper-left chessboard corner when viewed
+upright; +x is right, +y is down, and +z points into the printed surface. The
+configured transform must include the true normal-direction offset and axis
+orientation of the Aurora tracking origin. Do not assume that centering the
+printed square alone makes the marker and Aurora frames identical.
+
+### Four-slot probe registration (legacy fallback)
 
 Start unified recording with `v`, then seat and hold the base probe stationary
 in bracket slot 1 for at least 0.75 seconds before pressing `1`; repeat for slots
@@ -96,15 +133,13 @@ empty or invalid, all probe measurements remain saved in the correct session and
 the JSON reports `transform_status: awaiting_valid_config` with a validation
 message.
 
-### Automatic camera registration after EM
+### Automatic camera registration
 
-ChArUco detection is disabled during normal recording and the manual EM slot
-captures, because the probe may block the boards. As soon as the four-slot EM
-transform is solved, the recorder starts a fresh camera-registration phase.
-Remove the probe, keep at least one configured board visible, and keep the
-camera/base fixture stationary. It collects 150 valid board poses, writes those
-registration observations to `board_poses.csv`, performs the camera fit, and
-then disables ChArUco detection again.
+In direct optical mode, base-camera and Aurora-camera registration are solved
+together immediately after recording starts. In legacy mode, ChArUco detection
+starts after the four probe slots are accepted. Both modes collect 150 valid
+poses, write the observations to `board_poses.csv`, perform the fit, and disable
+ChArUco detection afterward.
 
 The same session `registration.json` contains both nested `em` and `camera`
 sections. The camera section includes left/right camera-to-base transforms and
@@ -286,6 +321,33 @@ knob) and reads the factory `fx, fy` for pose. If the catheter at ~30 cm looks
 soft, that's the lens near-limit — move it to ≥0.4–0.5 m and/or capture at
 HD2K/HD1080 so the markers span more pixels.
 
+### Dual-5DOF coil fixture calibration
+
+Capture synchronized stereo ArUco and Aurora samples with:
+
+```powershell
+python -m shape_tracking.tool_calibration_capture `
+    --aurora-port COM4 `
+    --aurora-expected-tools 3
+```
+
+Future captures estimate marker 33 from both ZED images, reject snapshots whose
+stereo reprojection RMSE exceeds 3 px, and automatically write
+`tool_calibration_report.json` after at least six accepted poses. The solver
+uses each 5-DOF coil's center and quaternion +z axis; unobservable roll about z
+is deliberately ignored. It validates the fitted coil spacing against 3.8 mm
+and the fitted axes against OpenCV marker -y (CAD +y).
+The initial field-generator lock likewise estimates the field ChArUco board
+from both cameras over a stationary multi-frame window. Reports from older
+sessions re-estimate that lock from their saved synchronized image pair.
+
+Reprocess an existing capture without hardware using:
+
+```powershell
+python -m shape_tracking.tool_calibration_solve `
+    D:\robot-dev\catheter_sessions\aruco_em_calibration_YYYYMMDD_HHMMSS
+```
+
 ## Install (dedicated venv, Python 3.11 to match the ZED wheel)
 
 ```powershell
@@ -325,9 +387,10 @@ python -m shape_tracking --resolution HD1080 --fps 30
 shape-tracking-record --resolution HD1080 --fps 30
 ```
 Keys in the preview window: `r` save PNG pairs, `v` unified SVO+EM record,
-`1`..`4` capture registration slots, `s` snapshot,
+`s` snapshot, and
 `q`/ESC quit. Data is written under `./recordings/<timestamp>/` (override with
-`--outdir`).
+`--outdir`). In legacy probe-registration mode only, `1`..`4` capture the four
+registration slots.
 
 ### Output (`recordings/<timestamp>/`)
 - `left/`, `right/` — PNGs named `<image_timestamp_ns>.png` (stereo pairs share

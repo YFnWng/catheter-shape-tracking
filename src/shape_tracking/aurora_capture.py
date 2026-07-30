@@ -229,6 +229,7 @@ class AuroraRecorder:
                  em_registration_min_samples: int = 20,
                  em_registration_max_position_deviation_mm: float = 0.15,
                  em_registration_max_orientation_deviation_deg: float = 1.0,
+                 require_probe: bool = True,
                  driver_factory=None):
         self.port = port
         self.driver_root = driver_root
@@ -243,6 +244,7 @@ class AuroraRecorder:
             em_registration_max_position_deviation_mm)
         self.em_registration_max_orientation_deviation_deg = float(
             em_registration_max_orientation_deviation_deg)
+        self.require_probe = bool(require_probe)
         if self.em_registration_dwell_s < 0:
             raise ValueError('EM registration dwell must be non-negative')
         if self.em_registration_min_samples < 2:
@@ -336,12 +338,15 @@ class AuroraRecorder:
             handle for handle, item in info.items()
             if probe_key and probe_key in self._identity_key(item['part_number'])
         ]
-        if len(probe_handles) != 1:
+        if len(probe_handles) > 1 or (
+                self.require_probe and len(probe_handles) != 1):
             found = {h: item['part_number'] for h, item in info.items()}
             raise RuntimeError(
-                f'expected exactly one probe matching {self.probe_part_number!r}; '
+                f'expected {"exactly one" if self.require_probe else "at most one"} '
+                f'probe matching {self.probe_part_number!r}; '
                 f'found {probe_handles}, tool parts={found}')
-        info[probe_handles[0]]['role'] = 'base_probe'
+        if probe_handles:
+            info[probe_handles[0]]['role'] = 'base_probe'
 
         coils = sorted(
             (item for handle, item in info.items() if handle not in probe_handles),
@@ -568,6 +573,29 @@ class AuroraRecorder:
             raise RuntimeError(f'expected two tip coil poses, found {len(result)}')
         return result
 
+    def recent_tip_coil_samples(self) -> list[dict]:
+        '''Return thread-safe copies of recent valid samples for both coils.'''
+        with self._data_lock:
+            recent = {
+                handle: list(samples)
+                for handle, samples in self._recent_tools.items()}
+        result = []
+        coils = sorted(
+            (item for item in self.tool_info.values()
+             if item['role'].startswith('tip_coil_')),
+            key=lambda item: self._identity_key(item['part_number']))
+        for identity in coils:
+            result.append({
+                'tool_role': identity['role'],
+                'part_number': identity['part_number'],
+                'serial_number': identity['serial_number'],
+                'port_handle': identity['port_handle'],
+                'samples': recent.get(identity['port_handle'], []),
+            })
+        if len(result) != 2:
+            raise RuntimeError(f'expected two tip coils, found {len(result)}')
+        return result
+
     def _update_registration_file(self, slot: int, result: dict) -> dict:
         path = os.path.join(self._output_dir, 'registration.json')
         if os.path.isfile(path):
@@ -654,6 +682,7 @@ class AuroraRecorder:
             'tool_count': self.tool_count,
             'expected_tools': self.expected_tools,
             'probe_part_number_match': self.probe_part_number,
+            'probe_required': self.require_probe,
             'registration_config': self.registration_config,
             'registration_stationarity': {
                 'dwell_s': self.em_registration_dwell_s,

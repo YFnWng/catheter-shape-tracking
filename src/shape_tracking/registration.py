@@ -62,7 +62,7 @@ def detect_boards(gray, boards, K, dist, min_corners=4):
     return results, sorted(seen_ids)
 
 
-def draw_pose(img, res, K, dist, axis_len):
+def draw_pose(img, res, K, dist, axis_len, draw_axes=True):
     """Draw detected markers/corners and pose axes for one BoardPose in place."""
     if res.marker_ids is not None and len(res.marker_ids) > 0:
         cv2.aruco.drawDetectedMarkers(img, res.marker_corners, res.marker_ids)
@@ -72,5 +72,5 @@ def draw_pose(img, res, K, dist, axis_len):
         cc = np.asarray(res.charuco_corners, dtype=np.float32).reshape(-1, 1, 2)
         ci = np.asarray(res.charuco_ids, dtype=np.int32).reshape(-1, 1)
         cv2.aruco.drawDetectedCornersCharuco(img, cc, ci)
-    if res.has_pose:
+    if draw_axes and res.has_pose:
         cv2.drawFrameAxes(img, K, dist, res.rvec, res.tvec, axis_len)

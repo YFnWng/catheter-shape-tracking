@@ -1,0 +1,31 @@
+{
+  "copies": 6,
+  "cut_target_size_mm": [
+    21.0,
+    21.0
+  ],
+  "dictionary": "DICT_4X4_50",
+  "marker_id": 33,
+  "marker_size_mm": 15.0,
+  "mounting_instruction": "Mount one copy to a rigid, flat, matte tab fixed to the tip housing. Keep the complete white quiet zone visible.",
+  "opencv_dictionary_constant": 0,
+  "print_instruction": "Print the PDF at 100% / Actual Size with all scaling disabled; measure the black marker edge before use.",
+  "print_pdf": "tip_aruco_id_33_15mm_letter.pdf",
+  "purpose": "rigid optical-to-EM catheter-tip pose calibration",
+  "quiet_zone_each_side_mm": 3.0,
+  "reference_png": "tip_aruco_id_33_15mm.png",
+  "reserved_marker_ids": {
+    "base_boards": [
+      1,
+      16
+    ],
+    "field_generator_board_in_use": [
+      17,
+      24
+    ],
+    "reserved_second_field_board": [
+      25,
+      32
+    ]
+  }
+}

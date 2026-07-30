@@ -38,6 +38,27 @@ markers:
     rotation_euler_deg: [0.0, -150.0, 0.0]
     # or:  translation: [..]  +  rotation_euler_deg: [..]  /  rotation_quat: [..]
 
+# Direct optical Aurora registration using the 100 x 100 mm field-generator
+# ChArUco board (DICT_4X4_50 IDs 17..24). Uncomment this block only after
+# replacing aurora_T_marker with the measured/CAD transform satisfying:
+#     p_aurora = aurora_T_marker @ p_marker
+# The printed marker origin is its upper-left outer corner when viewed upright;
+# +x is right, +y is down, and +z points into the printed surface. Centering the
+# board alone is not enough to determine the rotation or the normal-direction
+# offset to the Aurora tracking origin.
+field_generator_registration:
+  board_index: 2
+  marker_id_offset: 17
+  # Stereo/CAD-constrained calibration from
+  # aruco_em_calibration_20260730_185014. Independently reproduced by
+  # aruco_em_calibration_20260730_162754 within 1.45 mm / 0.24 deg.
+  aurora_T_marker:
+    matrix:
+      - [ 0.999996414663,  0.001364761821, -0.002303928442, -50.386467689]
+      - [-0.001369045782,  0.999997335165, -0.001858864080, -49.959844491]
+      - [ 0.002301385396,  0.001862011599,  0.999995618259,  -1.356003615]
+      - [ 0.0,             0.0,             0.0,               1.0]
+
 # EM probe registration. Enter the four physical bracket slot-center positions
 # in the robot BASE frame, using the top-level units above. Slot numbers match
 # the 1..4 keys used during recording. The recorder fits:

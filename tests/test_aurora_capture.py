@@ -91,6 +91,11 @@ class OneToolDriver(FakeDriver):
     tool_count = 1
 
 
+class TwoCoilDriver(FakeDriver):
+    tool_count = 2
+    identities = FakeDriver.identities[1:]
+
+
 class OneShortFrameDriver(FakeDriver):
     short_frames_remaining = 1
 
@@ -123,6 +128,9 @@ class AuroraRecorderTest(unittest.TestCase):
             self.assertEqual(
                 {pose['part_number'] for pose in coil_poses},
                 {'003', '07222026_01'})
+            histories = recorder.recent_tip_coil_samples()
+            self.assertEqual(len(histories), 2)
+            self.assertTrue(all(item['samples'] for item in histories))
 
             for slot in (1, 2, 3, 4):
                 recorder.capture_registration_slot(slot)
@@ -214,6 +222,15 @@ class AuroraRecorderTest(unittest.TestCase):
             AuroraRecorder(
                 'COM_TEST', driver_root='unused', expected_tools=3,
                 driver_factory=OneToolDriver).open()
+
+    def test_optical_registration_allows_probe_to_be_unplugged(self):
+        recorder = AuroraRecorder(
+            'COM_TEST', driver_root='unused', expected_tools=2,
+            require_probe=False, driver_factory=TwoCoilDriver).open()
+        self.assertEqual(
+            {item['role'] for item in recorder.tool_info.values()},
+            {'tip_coil_0', 'tip_coil_1'})
+        recorder.close()
 
     def test_recovers_from_one_short_binary_frame(self):
         with TemporaryDirectory() as tmp:

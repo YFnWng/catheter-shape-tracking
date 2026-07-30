@@ -36,8 +36,11 @@ class ZedCamera:
         self._right = sl.Mat()
         self._runtime = sl.RuntimeParameters()
         self.K = None
+        self.K_right = None
         self.dist = None
+        self.dist_right = None
         self.left_cam = None
+        self.right_cam = None
         self._recording = False
 
     # -- lifecycle ---------------------------------------------------------- #
@@ -80,12 +83,18 @@ class ZedCamera:
     def _read_intrinsics(self):
         calib = self.zed.get_camera_information().camera_configuration.calibration_parameters
         lc = calib.left_cam
+        rc = calib.right_cam
         self.left_cam = lc
+        self.right_cam = rc
         self.K = np.array([[lc.fx, 0.0, lc.cx],
                            [0.0, lc.fy, lc.cy],
                            [0.0, 0.0, 1.0]], dtype=np.float64)
+        self.K_right = np.array([[rc.fx, 0.0, rc.cx],
+                                 [0.0, rc.fy, rc.cy],
+                                 [0.0, 0.0, 1.0]], dtype=np.float64)
         # Rectified ZED images are undistorted; zeros unless you feed raw frames.
         self.dist = np.zeros((5,), dtype=np.float64)
+        self.dist_right = np.zeros((5,), dtype=np.float64)
         # Stereo baseline (m). SDK historically returns mm; normalize to meters.
         try:
             b = float(calib.get_camera_baseline())
@@ -102,6 +111,8 @@ class ZedCamera:
             "resolution": self.resolution,
             "fx": self.left_cam.fx, "fy": self.left_cam.fy,
             "cx": self.left_cam.cx, "cy": self.left_cam.cy,
+            "right_fx": self.right_cam.fx, "right_fy": self.right_cam.fy,
+            "right_cx": self.right_cam.cx, "right_cy": self.right_cam.cy,
             "baseline_m": self.baseline_m,
         }
 

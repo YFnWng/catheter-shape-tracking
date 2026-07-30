@@ -54,7 +54,9 @@ def parse_args(argv=None):
     ap.add_argument('--aurora-port', default='',
                     help='Aurora serial port, e.g. COM4; empty disables EM.')
     ap.add_argument('--aurora-expected-tools', type=int, default=3,
-                    help='required Aurora tool count (default 3; 0 accepts any).')
+                    help='required Aurora tool count (default 3; use 2 in direct '
+                         'optical mode if the registration probe is unplugged; '
+                         '0 accepts any).')
     ap.add_argument(
         '--aurora-probe-part-number', default='610175 T6E0-S00923',
         help='PHINF part number used to identify the base registration probe.')
@@ -100,6 +102,8 @@ def main(argv=None):
     from .zed_capture import ZedCamera
 
     args = parse_args(argv)
+    field_registration = camera_register.load_field_generator_config(
+        args.registration_config)
 
     em_recorder = None
     if args.aurora_port:
@@ -118,6 +122,7 @@ def main(argv=None):
                 args.em_registration_max_position_deviation_mm),
             em_registration_max_orientation_deviation_deg=(
                 args.em_registration_max_orientation_deviation_deg),
+            require_probe=(field_registration is None),
         )
         try:
             em_recorder.open()
@@ -139,14 +144,25 @@ def main(argv=None):
     for d in (left_dir, right_dir):
         os.makedirs(d, exist_ok=True)
 
-    _, boards = boards_mod.build_boards()
     camera_markers, _ = camera_register.load_config(args.registration_config)
+    additional_boards = []
+    if field_registration is not None:
+        if field_registration['board_index'] in camera_markers:
+            raise ValueError(
+                'field-generator board index must differ from base boards')
+        additional_boards.append((
+            field_registration['board_index'],
+            field_registration['marker_id_offset']))
+    _, boards = boards_mod.build_boards(additional=additional_boards)
+    observation_indices = set(camera_markers)
+    if field_registration is not None:
+        observation_indices.add(field_registration['board_index'])
     camera_observations = {
         index: {
             'r': deque(maxlen=args.camera_registration_frames),
             't': deque(maxlen=args.camera_registration_frames),
             'c': deque(maxlen=args.camera_registration_frames),
-        } for index in camera_markers
+        } for index in observation_indices
     }
 
     with ZedCamera(args.resolution, args.fps, args.sharpness,
@@ -185,6 +201,9 @@ def main(argv=None):
 
         def start_svo():
             nonlocal frame_index_file, frame_index_writer, svo_frame
+            nonlocal camera_registration_collecting
+            nonlocal camera_registration_done, camera_registration_notice
+            nonlocal last_registration_pair
             if not cam.start_recording(svo_path()):
                 return False
             # Sidecar mapping each SVO frame -> absolute capture time so offline
@@ -210,6 +229,20 @@ def main(argv=None):
                         frame_index_file = None
                         frame_index_writer = None
                     raise
+            if field_registration is not None:
+                for data in camera_observations.values():
+                    data['r'].clear()
+                    data['t'].clear()
+                    data['c'].clear()
+                last_registration_pair = None
+                camera_registration_notice = None
+                camera_registration_done = False
+                camera_registration_collecting = True
+                print(
+                    '[REG] optical EM registration: collecting base board and '
+                    f"field board IDs {field_registration['marker_id_offset']}-"
+                    f"{field_registration['marker_id_offset'] + 7} for "
+                    f'{args.camera_registration_frames} valid frames')
             return True
 
         def stop_svo():
@@ -236,7 +269,19 @@ def main(argv=None):
             counts = {
                 index: len(data['r'])
                 for index, data in camera_observations.items()}
-            if not counts or max(counts.values()) < args.camera_registration_frames:
+            if field_registration is not None:
+                base_count = max(
+                    (counts.get(index, 0) for index in camera_markers),
+                    default=0)
+                field_count = counts.get(
+                    field_registration['board_index'], 0)
+                ready = (
+                    base_count >= args.camera_registration_frames
+                    and field_count >= args.camera_registration_frames)
+            else:
+                ready = bool(counts) and (
+                    max(counts.values()) >= args.camera_registration_frames)
+            if not ready:
                 notice = (
                     f'waiting for {args.camera_registration_frames} valid '
                     f'ChArUco frames; counts={counts}')
@@ -294,8 +339,11 @@ def main(argv=None):
             cv2.namedWindow(win, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(win, 1280, 720)
 
-        print("\nControls: r=PNGs v=SVO+EM 1..4=capture probe slot "
-              "s=snapshot q/ESC=quit\n")
+        if field_registration is not None:
+            print("\nControls: r=PNGs v=SVO+EM s=snapshot q/ESC=quit\n")
+        else:
+            print("\nControls: r=PNGs v=SVO+EM 1..4=capture probe slot "
+                  "s=snapshot q/ESC=quit\n")
 
         try:
             while True:
@@ -317,6 +365,8 @@ def main(argv=None):
                     results, seen_ids = registration.detect_boards(
                         gray, boards, cam.K, cam.dist)
                 valid_registration_observation = False
+                valid_registration_indices = set()
+                frame_registration_poses = {}
                 for res in results:
                     registration.draw_pose(overlay, res, cam.K, cam.dist, AXIS_LEN_M)
                     if res.has_pose:
@@ -329,14 +379,27 @@ def main(argv=None):
                         if (res.index in camera_observations
                                 and res.n_corners >=
                                 args.camera_registration_min_corners):
-                            data = camera_observations[res.index]
-                            data['r'].append(r)
-                            data['t'].append(t)
-                            data['c'].append(res.n_corners)
-                            pose_writer.writerow([
-                                ts, res.index, res.n_corners,
-                                t[0], t[1], t[2], r[0], r[1], r[2]])
-                            valid_registration_observation = True
+                            frame_registration_poses[res.index] = (
+                                r, t, res.n_corners)
+                if field_registration is not None:
+                    field_index = field_registration['board_index']
+                    base_indices = (
+                        set(camera_markers) & set(frame_registration_poses))
+                    if field_index in frame_registration_poses and base_indices:
+                        valid_registration_indices = base_indices | {field_index}
+                else:
+                    valid_registration_indices = set(frame_registration_poses)
+                for index in sorted(valid_registration_indices):
+                    r, t, corner_count = frame_registration_poses[index]
+                    data = camera_observations[index]
+                    data['r'].append(r)
+                    data['t'].append(t)
+                    data['c'].append(corner_count)
+                    pose_writer.writerow([
+                        ts, index, corner_count,
+                        t[0], t[1], t[2], r[0], r[1], r[2]])
+                valid_registration_observation = bool(
+                    valid_registration_indices)
                 if valid_registration_observation:
                     last_registration_pair = (ts, left_bgr, right_bgr)
                 finish_camera_registration_if_ready()
@@ -381,6 +444,11 @@ def main(argv=None):
                         else:
                             stop_svo()
                     elif key in (ord('1'), ord('2'), ord('3'), ord('4')):
+                        if field_registration is not None:
+                            print(
+                                '[REG] probe slots disabled: using the optical '
+                                'field-generator ChArUco board')
+                            continue
                         slot = int(chr(key))
                         if em_recorder is None or not em_recorder.is_recording:
                             print('[REG] start SVO+EM recording before capture')
