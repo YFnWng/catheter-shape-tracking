@@ -71,13 +71,20 @@ the discovery index.
 
 ### Four-slot base registration
 
-Start unified recording with `v`, then hold the base probe stationary in bracket
-slot 1 and press `1`; repeat for slots 2, 3, and 4. Each key captures the most
-recent 0.5 seconds of valid probe measurements and reports its maximum positional
-standard deviation. The measurements are written atomically to the `em`
+Start unified recording with `v`, then seat and hold the base probe stationary
+in bracket slot 1 for at least 0.75 seconds before pressing `1`; repeat for slots
+2, 3, and 4. Each key evaluates the recent probe history without blocking camera
+or EM acquisition. A capture is accepted only when at least 20 valid samples
+have a 95th-percentile position deviation no greater than 0.15 mm and orientation
+deviation no greater than 1 degree. A rejected capture does not replace an
+existing slot. The measurements are written atomically to the `em`
 section of `registration.json` in the same session directory, including probe
 identity, sample/frame/time bounds, mean point, standard deviation, and tracking
-error. Repeating a number replaces only that slot.
+error, plus the complete stationarity diagnostics. Repeating a number replaces
+only that slot. Override the defaults with `--em-registration-dwell-s`,
+`--em-registration-min-samples`,
+`--em-registration-max-position-deviation-mm`, and
+`--em-registration-max-orientation-deviation-deg`.
 
 Enter the four known bracket centers in `registration_config.yaml` under
 `em_registration.slot_centers_base`; coordinates use the file's top-level
@@ -105,8 +112,11 @@ their inverses, intrinsics, stereo baseline, configured marker-to-base
 transforms, workspace bounds, left/right ROIs, per-board fit statistics, and the
 source image timestamp. Verification images `registration_left.png` and
 `registration_right.png` show detected markers/corners, board axes, the large
-robot-base coordinate frame, workspace box, and green ROI. Override the defaults
-with `--camera-registration-frames` and
+robot-base coordinate frame, registered Aurora field-generator frame, the
+position and +z direction of each physically identified EM tip coil, workspace
+box, and green ROI. The time-aligned source coil poses and their camera timestamp
+offsets are retained under `camera.em_overlay` in `registration.json`. Override
+the defaults with `--camera-registration-frames` and
 `--camera-registration-min-corners`.
 
 ## Camera ↔ base registration (`shape_tracking.register`)
@@ -195,6 +205,50 @@ Pipeline (a **Croom 2010 stereo + Lu 2023 curve-fit** hybrid):
 > length / depth curvature are uncertain. Orient the catheter **diagonally or
 > vertically** in the frame (or rotate the ZED) for accurate depth.
 
+## Multimodal sequence post-processing
+
+`shape_tracking.sequence` processes an SVO2 session directly and combines the
+rectified stereo video with the two EM tip coils and the unified
+`registration.json`. By default it uses the `run_start` to `return_start`
+markers copied into `<session>/rosbag`, so the position-control return is not
+part of the training trajectory.
+
+Run a sparse pilot before processing a complete session:
+
+```powershell
+D:\robot-dev\shape_tracking\.venv\Scripts\python.exe -m shape_tracking.sequence `
+    --session D:\robot-dev\catheter_sessions\20260728_171407 `
+    --stride 300 --max-frames 30 --write-video --write-3d-video
+```
+
+Process every trajectory frame:
+
+```powershell
+D:\robot-dev\shape_tracking\.venv\Scripts\python.exe -m shape_tracking.sequence `
+    --session D:\robot-dev\catheter_sessions\20260728_171407 `
+    --write-video --write-3d-video
+```
+
+Install the extra HDF5 dependency with `pip install -r
+requirements-postprocess.txt` if the environment predates this pipeline.
+
+Outputs are written to `<session>/processed/`:
+
+- `processed_shapes.h5`: fixed arc-sampled full/distal curves, curvature,
+  tangent, EM tip pose, observation class, and frame-level quality metrics.
+- `frame_summary.csv` and `processing_summary.json`: audit and rejection reasons.
+- `overlay_left.mp4` / `overlay_right.mp4`: material segmentation, projected
+  3D shape, EM midpoint, and tip direction.
+- `shape_3d.mp4` and `shape_3d_preview.png`: base-frame visualization with the
+  distal section colored by curvature.
+
+EM gaps longer than the configured limit are invalid rather than interpolated.
+Observation class 1/2 denotes image-observed proximal/distal shaft, while 3/4
+denotes a base/tip bridge. Curvature in a bridge is model-derived and must not be
+treated as directly observed. The tip frame uses the sign-aligned mean coil z
+axis and defines +x from coil part `07222026_01` toward part `003`, projected
+perpendicular to z. The HDF5 coil-position order is `[003, 07222026_01]`.
+
 ### Board (decoded from `charuco10_DICT4X4_two_boards_LETTER.pdf`)
 | param | value |
 |-------|-------|
@@ -207,6 +261,23 @@ Pipeline (a **Croom 2010 stereo + Lu 2023 curve-fit** hybrid):
 > Print at **100% / Actual size** (not "fit to page"). Measure a printed square
 > with calipers and set `SQUARE_LENGTH_M` at the top of the script — pose scale
 > depends entirely on this number.
+
+Generate distinct 100 x 100 mm targets for the Aurora field-generator fixture:
+
+```powershell
+D:\robot-dev\shape_tracking\.venv\Scripts\python.exe `
+    D:\robot-dev\shape_tracking\scripts\generate_charuco_patterns.py `
+    --output-dir D:\robot-dev\shape_tracking\generated_charuco
+```
+
+The default output contains two new `DICT_4X4_50` boards using IDs 17-24 and
+25-32, so they cannot be confused with the existing base boards. The landscape
+Letter PDF is dimensionally controlled; print it at **100% / Actual Size** and
+confirm that the chessboard outer edge measures 100 x 100 mm. The PNGs are
+inspection/reference files, not dimensionally controlled print files. Use
+`--count 1` if the generator fixture only needs one face, or `--page a4` for an
+A4 print sheet. Keep these targets semantically separate from the existing base
+boards when adding field-generator detection to the registration pipeline.
 
 ### About "changing focal length"
 The ZED2 has **fixed-focus lenses**; the SDK exposes no focus/focal-length

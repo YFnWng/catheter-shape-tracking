@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 import struct
 import time
 import unittest
@@ -9,6 +10,7 @@ from tempfile import TemporaryDirectory
 from shape_tracking.aurora_capture import (
     AuroraRecorder,
     load_em_slot_centers,
+    qualify_stationary_probe_samples,
     solve_rigid_registration,
 )
 
@@ -108,11 +110,19 @@ class AuroraRecorderTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             recorder = AuroraRecorder(
                 'COM_TEST', driver_root='unused', expected_tools=3,
+                em_registration_dwell_s=0.0,
+                em_registration_min_samples=5,
                 driver_factory=FakeDriver).open()
             recorder.start(tmp)
             deadline = time.monotonic() + 1.0
             while recorder.samples < 10 and time.monotonic() < deadline:
                 time.sleep(0.005)
+
+            coil_poses = recorder.tip_coil_poses_at(time.time_ns())
+            self.assertEqual(len(coil_poses), 2)
+            self.assertEqual(
+                {pose['part_number'] for pose in coil_poses},
+                {'003', '07222026_01'})
 
             for slot in (1, 2, 3, 4):
                 recorder.capture_registration_slot(slot)
@@ -137,6 +147,8 @@ class AuroraRecorderTest(unittest.TestCase):
             self.assertEqual(
                 registration['probe_identity']['part_number'],
                 '610175   T6E0-S00923')
+            self.assertTrue(
+                registration['slots']['1']['stationarity']['passed'])
 
             metadata = json.loads(
                 (Path(tmp) / 'em_metadata.json').read_text())
@@ -145,6 +157,56 @@ class AuroraRecorderTest(unittest.TestCase):
             self.assertGreaterEqual(metadata['hardware_frames'], 3)
             self.assertIsNone(metadata['error'])
             recorder.close()
+
+    def test_stationarity_gate_accepts_static_probe(self):
+        samples = [
+            {
+                'timestamp_ns': index * 50_000_000,
+                'position_mm': [1.0 + 0.01 * (index % 2), 2.0, 3.0],
+                'quaternion_wxyz': [1.0, 0.0, 0.0, 0.0],
+            }
+            for index in range(21)
+        ]
+        selected, diagnostics = qualify_stationary_probe_samples(
+            samples, window_s=0.75, min_samples=10,
+            max_position_deviation_mm=0.15,
+            max_orientation_deviation_deg=1.0)
+        self.assertGreaterEqual(len(selected), 10)
+        self.assertTrue(diagnostics['passed'])
+        self.assertLess(diagnostics['position_p95_deviation_mm'], 0.15)
+
+    def test_stationarity_gate_rejects_probe_motion(self):
+        samples = [
+            {
+                'timestamp_ns': index * 50_000_000,
+                'position_mm': [0.05 * index, 0.0, 0.0],
+                'quaternion_wxyz': [1.0, 0.0, 0.0, 0.0],
+            }
+            for index in range(21)
+        ]
+        with self.assertRaisesRegex(RuntimeError, 'probe is not stationary'):
+            qualify_stationary_probe_samples(
+                samples, window_s=0.75, min_samples=10,
+                max_position_deviation_mm=0.15,
+                max_orientation_deviation_deg=1.0)
+
+    def test_stationarity_gate_rejects_orientation_motion(self):
+        samples = []
+        for index in range(21):
+            angle = math.radians(index * 0.5)
+            samples.append({
+                'timestamp_ns': index * 50_000_000,
+                'position_mm': [0.0, 0.0, 0.0],
+                'quaternion_wxyz': [
+                    math.cos(angle / 2.0), 0.0, 0.0,
+                    math.sin(angle / 2.0),
+                ],
+            })
+        with self.assertRaisesRegex(RuntimeError, 'orientation p95'):
+            qualify_stationary_probe_samples(
+                samples, window_s=0.75, min_samples=10,
+                max_position_deviation_mm=0.15,
+                max_orientation_deviation_deg=1.0)
 
     def test_rejects_wrong_tool_count(self):
         with self.assertRaisesRegex(

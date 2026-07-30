@@ -14,6 +14,7 @@ dependencies = [
     "scikit-image",       # skeletonization (segmentation)
     "matplotlib",         # 3D reconstruction plots (offline driver)
     "pyyaml",             # registration config (shape_tracking.register)
+    "h5py",               # fixed-shape multimodal sequence datasets
     'pyserial',
 ]
 
@@ -27,6 +28,7 @@ capture = []
 
 [project.scripts]
 shape-tracking-record = "shape_tracking.cli:main"
+shape-tracking-process = "shape_tracking.sequence:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

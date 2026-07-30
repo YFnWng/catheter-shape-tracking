@@ -34,7 +34,15 @@ class SessionCameraRegistrationTest(unittest.TestCase):
                 'schema_version': 1,
                 'session_id': 'test',
                 'registration_config': str(config),
-                'em': {'transform_status': 'solved'},
+                'em': {
+                    'transform_status': 'solved',
+                    'robot_base_T_aurora': [
+                        [1, 0, 0, 0],
+                        [0, 1, 0, 0],
+                        [0, 0, 1, 0],
+                        [0, 0, 0, 1],
+                    ],
+                },
                 'camera': None,
             }))
             observations = {
@@ -51,6 +59,28 @@ class SessionCameraRegistrationTest(unittest.TestCase):
                 [0.0, 0.0, 1.0],
             ])
             _, boards = boards_mod.build_boards()
+            em_tool_poses = [
+                {
+                    'tool_role': 'tip_coil_0',
+                    'part_number': '003',
+                    'serial_number': 'A',
+                    'timestamp_ns': 450,
+                    'timestamp_delta_ms': -0.006,
+                    'position_aurora_mm': [-20.0, 0.0, 50.0],
+                    'quaternion_aurora_wxyz': [
+                        0.70710678, 0.0, 0.70710678, 0.0],
+                },
+                {
+                    'tool_role': 'tip_coil_1',
+                    'part_number': '07222026_01',
+                    'serial_number': 'B',
+                    'timestamp_ns': 452,
+                    'timestamp_delta_ms': -0.004,
+                    'position_aurora_mm': [20.0, 0.0, 50.0],
+                    'quaternion_aurora_wxyz': [
+                        0.70710678, 0.0, 0.70710678, 0.0],
+                },
+            ]
 
             camera = save_session_camera_registration(
                 registration_path=str(registration_path),
@@ -67,6 +97,7 @@ class SessionCameraRegistrationTest(unittest.TestCase):
                 baseline_m=0.12,
                 image_timestamp_ns=456,
                 min_frames=10,
+                em_tool_poses=em_tool_poses,
             )
 
             document = json.loads(registration_path.read_text())
@@ -76,10 +107,19 @@ class SessionCameraRegistrationTest(unittest.TestCase):
             self.assertEqual(camera['image_timestamp_ns'], 456)
             self.assertEqual(
                 camera['left_camera_T_robot_base'][2][3], 1.0)
+            self.assertEqual(
+                len(camera['em_overlay']['coil_poses']), 2)
+            self.assertEqual(
+                camera['em_overlay']['coil_poses'][0][
+                    'position_robot_base_mm'], [-20.0, 0.0, 50.0])
             self.assertTrue((root / 'registration_left.png').is_file())
             self.assertTrue((root / 'registration_right.png').is_file())
-            self.assertIsNotNone(
-                cv2.imread(str(root / 'registration_left.png')))
+            overlay = cv2.imread(str(root / 'registration_left.png'))
+            self.assertIsNotNone(overlay)
+            self.assertTrue(np.any(np.all(
+                overlay == np.array([255, 0, 255], dtype=np.uint8), axis=2)))
+            self.assertTrue(np.any(np.all(
+                overlay == np.array([0, 255, 255], dtype=np.uint8), axis=2)))
 
 
 if __name__ == '__main__':

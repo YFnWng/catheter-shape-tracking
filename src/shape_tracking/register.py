@@ -157,7 +157,117 @@ def draw_box(vis, K, cam_T_base, workspace, color=(0, 200, 255)):
                 cv2.line(vis, tuple(pts[i]), tuple(pts[j]), color, 1, cv2.LINE_AA)
 
 
-def annotate_view(bgr, boards, K, dist, board_poses, cam_T_base, workspace, axis_len):
+def _mm_transform_to_m(transform):
+    result = np.asarray(transform, dtype=float).copy()
+    if result.shape != (4, 4) or not np.all(np.isfinite(result)):
+        raise ValueError('EM registration transform must be a finite 4x4 matrix')
+    result[:3, 3] *= 0.001
+    return result
+
+
+def build_em_overlay_geometry(em_registration, coil_poses):
+    '''Transform synchronized Aurora coil poses into the robot-base frame.'''
+    if not coil_poses or len(coil_poses) != 2:
+        raise ValueError('camera registration overlay requires two EM coil poses')
+    base_T_aurora_mm = np.asarray(
+        em_registration.get('robot_base_T_aurora'), dtype=float)
+    base_T_aurora = _mm_transform_to_m(base_T_aurora_mm)
+    coils = []
+    seen_parts = set()
+    for source in coil_poses:
+        part_number = str(source.get('part_number', '')).strip()
+        part_key = ''.join(char for char in part_number if char.isalnum())
+        if not part_key or part_key in seen_parts:
+            raise ValueError(
+                f'EM overlay coil part numbers must be unique: {part_number!r}')
+        seen_parts.add(part_key)
+        position = np.asarray(source.get('position_aurora_mm'), dtype=float)
+        quaternion = np.asarray(
+            source.get('quaternion_aurora_wxyz'), dtype=float)
+        if (position.shape != (3,) or quaternion.shape != (4,)
+                or not np.all(np.isfinite(position))
+                or not np.all(np.isfinite(quaternion))):
+            raise ValueError(f'invalid EM overlay pose for coil {part_number!r}')
+        norm = np.linalg.norm(quaternion)
+        if norm < 1e-12:
+            raise ValueError(f'zero-norm EM quaternion for coil {part_number!r}')
+        quaternion /= norm
+        aurora_T_coil_mm = np.eye(4)
+        aurora_T_coil_mm[:3, :3] = Rot.from_quat([
+            quaternion[1], quaternion[2], quaternion[3], quaternion[0],
+        ]).as_matrix()
+        aurora_T_coil_mm[:3, 3] = position
+        base_T_coil_mm = base_T_aurora_mm @ aurora_T_coil_mm
+        base_T_coil = _mm_transform_to_m(base_T_coil_mm)
+        saved = dict(source)
+        saved['position_robot_base_mm'] = base_T_coil_mm[:3, 3].tolist()
+        saved['z_axis_robot_base'] = base_T_coil_mm[:3, 2].tolist()
+        coils.append({
+            'part_number': part_number,
+            'base_T_coil': base_T_coil,
+            'saved_pose': saved,
+        })
+    return base_T_aurora, coils
+
+
+def draw_registered_frame(
+        vis, K, cam_T_base, base_T_frame, axis_len_m, label):
+    '''Draw a registered 3D coordinate frame using rectified-image projection.'''
+    points_frame = np.array([
+        [0.0, 0.0, 0.0, 1.0],
+        [axis_len_m, 0.0, 0.0, 1.0],
+        [0.0, axis_len_m, 0.0, 1.0],
+        [0.0, 0.0, axis_len_m, 1.0],
+    ])
+    points_base = (base_T_frame @ points_frame.T).T
+    uv, in_front = project(K, cam_T_base, points_base)
+    if not in_front[0]:
+        return
+    pixels = np.rint(uv).astype(int)
+    origin = tuple(pixels[0])
+    cv2.circle(vis, origin, 5, (255, 255, 255), -1, cv2.LINE_AA)
+    for index, (color, axis_name) in enumerate((
+            ((0, 0, 255), 'X'),
+            ((0, 255, 0), 'Y'),
+            ((255, 0, 0), 'Z'),
+            ), start=1):
+        if in_front[index]:
+            cv2.arrowedLine(
+                vis, origin, tuple(pixels[index]), color, 2,
+                cv2.LINE_AA, tipLength=0.18)
+            cv2.putText(
+                vis, axis_name, tuple(pixels[index]),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+    cv2.putText(
+        vis, label, (origin[0] + 7, origin[1] - 7),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
+        cv2.LINE_AA)
+
+
+def draw_coil_z_axis(
+        vis, K, cam_T_base, base_T_coil, axis_len_m, label, color):
+    points_coil = np.array([
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, axis_len_m, 1.0],
+    ])
+    points_base = (base_T_coil @ points_coil.T).T
+    uv, in_front = project(K, cam_T_base, points_base)
+    if not np.all(in_front):
+        return
+    pixels = np.rint(uv).astype(int)
+    origin, endpoint = tuple(pixels[0]), tuple(pixels[1])
+    cv2.circle(vis, origin, 6, color, -1, cv2.LINE_AA)
+    cv2.circle(vis, origin, 7, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.arrowedLine(
+        vis, origin, endpoint, color, 3, cv2.LINE_AA, tipLength=0.22)
+    cv2.putText(
+        vis, label, (origin[0] + 8, origin[1] + 18),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+
+
+def annotate_view(
+        bgr, boards, K, dist, board_poses, cam_T_base, workspace, axis_len,
+        base_T_aurora=None, coils=None):
     """Overlay markers+ids, ChArUco corners, every board frame, the base frame,
     the workspace box and 2D ROI. Poses must be expressed in THIS view's camera
     frame. board_poses maps board index -> its 4x4 pose."""
@@ -177,6 +287,16 @@ def annotate_view(bgr, boards, K, dist, board_poses, cam_T_base, workspace, axis
     cv2.drawFrameAxes(vis, K, dist,
                       Rot.from_matrix(cam_T_base[:3, :3]).as_rotvec(),
                       cam_T_base[:3, 3], axis_len * 2)            # base frame (large)
+    if base_T_aurora is not None:
+        draw_registered_frame(
+            vis, K, cam_T_base, base_T_aurora, axis_len * 2,
+            'AURORA FIELD')
+    coil_colors = ((255, 0, 255), (0, 255, 255))
+    for index, coil in enumerate(coils or []):
+        draw_coil_z_axis(
+            vis, K, cam_T_base, coil['base_T_coil'], axis_len,
+            f"EM {coil['part_number']} +Z",
+            coil_colors[index % len(coil_colors)])
     draw_box(vis, K, cam_T_base, workspace)
     h, w = bgr.shape[:2]
     x, y, ww, hh = workspace_roi(K, cam_T_base, workspace, w, h)
@@ -187,11 +307,20 @@ def annotate_view(bgr, boards, K, dist, board_poses, cam_T_base, workspace, axis
 def save_session_camera_registration(
         registration_path, output_dir, config_path, collected,
         left_bgr, right_bgr, boards, K, dist, resolution,
-        zed_serial, baseline_m, image_timestamp_ns, min_frames=10):
+        zed_serial, baseline_m, image_timestamp_ns, min_frames=10,
+        em_tool_poses=None):
     """Fit camera-to-base registration and merge it into a session JSON.
 
     The collected mapping contains r, t and c observation lists per board.
     """
+    with open(registration_path, encoding='utf-8') as stream:
+        document = json.load(stream)
+    if not document.get('em') or (
+            document['em'].get('transform_status') != 'solved'):
+        raise ValueError('EM registration must be solved before camera registration')
+    base_T_aurora, overlay_coils = build_em_overlay_geometry(
+        document['em'], em_tool_poses)
+
     markers, workspace = load_config(config_path)
     per_board = {}
     for board_index in sorted(markers):
@@ -253,10 +382,12 @@ def save_session_camera_registration(
         for index, pose in poses_left.items()}
     overlay_left = annotate_view(
         left_bgr, boards, K, dist, poses_left,
-        left_camera_T_robot_base, workspace, AXIS_LEN_M)
+        left_camera_T_robot_base, workspace, AXIS_LEN_M,
+        base_T_aurora=base_T_aurora, coils=overlay_coils)
     overlay_right = annotate_view(
         right_bgr, boards, K, dist, poses_right,
-        right_camera_T_robot_base, workspace, AXIS_LEN_M)
+        right_camera_T_robot_base, workspace, AXIS_LEN_M,
+        base_T_aurora=base_T_aurora, coils=overlay_coils)
     left_name = 'registration_left.png'
     right_name = 'registration_right.png'
     if not cv2.imwrite(os.path.join(output_dir, left_name), overlay_left):
@@ -310,15 +441,18 @@ def save_session_camera_registration(
             } for index, item in per_board.items()
         },
         'board_agreement': agreement,
+        'em_overlay': {
+            'image_timestamp_ns': int(image_timestamp_ns),
+            'field_frame': 'aurora',
+            'field_axis_length_mm': float(AXIS_LEN_M * 2000.0),
+            'coil_z_axis_length_mm': float(AXIS_LEN_M * 1000.0),
+            'coil_poses': [
+                coil['saved_pose'] for coil in overlay_coils],
+        },
         'overlay_left': left_name,
         'overlay_right': right_name,
     }
 
-    with open(registration_path, encoding='utf-8') as stream:
-        document = json.load(stream)
-    if not document.get('em') or (
-            document['em'].get('transform_status') != 'solved'):
-        raise ValueError('EM registration must be solved before camera registration')
     document['camera'] = camera
     document['complete'] = True
     document['completed_at_ns'] = camera['completed_at_ns']

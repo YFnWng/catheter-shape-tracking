@@ -96,6 +96,115 @@ def solve_rigid_registration(aurora_points_mm, base_points_mm) -> dict:
     }
 
 
+def qualify_stationary_probe_samples(
+        samples, window_s: float, min_samples: int,
+        max_position_deviation_mm: float,
+        max_orientation_deviation_deg: float) -> tuple[list, dict]:
+    '''Select a recent probe window and reject it unless it is stationary.'''
+    window_s = float(window_s)
+    min_samples = int(min_samples)
+    max_position_deviation_mm = float(max_position_deviation_mm)
+    max_orientation_deviation_deg = float(max_orientation_deviation_deg)
+    if window_s < 0:
+        raise ValueError('registration stationarity window must be non-negative')
+    if min_samples < 2:
+        raise ValueError('registration stationarity requires at least 2 samples')
+    if max_position_deviation_mm <= 0:
+        raise ValueError(
+            'registration position-deviation threshold must be positive')
+    if max_orientation_deviation_deg <= 0:
+        raise ValueError(
+            'registration orientation-deviation threshold must be positive')
+    if not samples:
+        raise RuntimeError('no valid base_probe readings are available')
+
+    samples = sorted(samples, key=lambda sample: sample['timestamp_ns'])
+    end_ns = samples[-1]['timestamp_ns']
+    cutoff_ns = end_ns - int(window_s * 1e9)
+    if window_s > 0 and samples[0]['timestamp_ns'] > cutoff_ns:
+        available_s = (end_ns - samples[0]['timestamp_ns']) * 1e-9
+        raise RuntimeError(
+            'probe has not been observed for the complete stationary dwell: '
+            f'available={available_s:.3f}s required={window_s:.3f}s')
+    selected = (
+        samples if window_s == 0 else [
+            sample for sample in samples
+            if sample['timestamp_ns'] >= cutoff_ns])
+    if len(selected) < min_samples:
+        raise RuntimeError(
+            f'only {len(selected)} valid probe samples in the '
+            f'{window_s:.3f}s stationary window; require {min_samples}')
+
+    positions = np.asarray(
+        [sample['position_mm'] for sample in selected], dtype=float)
+    quaternions = np.asarray(
+        [sample['quaternion_wxyz'] for sample in selected], dtype=float)
+    if (positions.shape != (len(selected), 3)
+            or quaternions.shape != (len(selected), 4)
+            or not np.all(np.isfinite(positions))
+            or not np.all(np.isfinite(quaternions))):
+        raise RuntimeError('stationary probe window contains invalid pose data')
+
+    position_center = np.median(positions, axis=0)
+    position_deviation = np.linalg.norm(
+        positions - position_center[None, :], axis=1)
+    position_p95 = float(np.percentile(position_deviation, 95))
+    position_max = float(np.max(position_deviation))
+
+    quaternion_norms = np.linalg.norm(quaternions, axis=1)
+    if np.any(quaternion_norms < 1e-12):
+        raise RuntimeError(
+            'stationary probe window contains a zero-norm quaternion')
+    quaternions = quaternions / quaternion_norms[:, None]
+    reference = quaternions[0]
+    signs = np.where(quaternions @ reference < 0.0, -1.0, 1.0)
+    aligned = quaternions * signs[:, None]
+    quaternion_center = np.sum(aligned, axis=0)
+    center_norm = np.linalg.norm(quaternion_center)
+    if center_norm < 1e-12:
+        raise RuntimeError(
+            'stationary probe window has no stable mean orientation')
+    quaternion_center /= center_norm
+    orientation_deviation = np.degrees(
+        2.0 * np.arccos(np.clip(
+            np.abs(aligned @ quaternion_center), 0.0, 1.0)))
+    orientation_p95 = float(np.percentile(orientation_deviation, 95))
+    orientation_max = float(np.max(orientation_deviation))
+
+    diagnostics = {
+        'passed': (
+            position_p95 <= max_position_deviation_mm
+            and orientation_p95 <= max_orientation_deviation_deg),
+        'requested_window_s': window_s,
+        'observed_window_s': (
+            selected[-1]['timestamp_ns']
+            - selected[0]['timestamp_ns']) * 1e-9,
+        'min_samples': min_samples,
+        'sample_count': len(selected),
+        'position_center_median_mm': position_center.tolist(),
+        'position_p95_deviation_mm': position_p95,
+        'position_max_deviation_mm': position_max,
+        'max_position_deviation_mm': max_position_deviation_mm,
+        'orientation_center_wxyz': quaternion_center.tolist(),
+        'orientation_p95_deviation_deg': orientation_p95,
+        'orientation_max_deviation_deg': orientation_max,
+        'max_orientation_deviation_deg': max_orientation_deviation_deg,
+    }
+    failures = []
+    if position_p95 > max_position_deviation_mm:
+        failures.append(
+            f'position p95={position_p95:.3f} mm '
+            f'(limit {max_position_deviation_mm:.3f} mm)')
+    if orientation_p95 > max_orientation_deviation_deg:
+        failures.append(
+            f'orientation p95={orientation_p95:.3f} deg '
+            f'(limit {max_orientation_deviation_deg:.3f} deg)')
+    if failures:
+        raise RuntimeError(
+            'probe is not stationary: ' + '; '.join(failures))
+    return selected, diagnostics
+
+
 def load_aurora_driver(slicer_robot_root: str):
     '''Load AuroraDriver without loading any Slicer application modules.'''
     root = os.path.abspath(os.path.expanduser(slicer_robot_root))
@@ -116,6 +225,10 @@ class AuroraRecorder:
     def __init__(self, port: str, driver_root: str, expected_tools: int = 3,
                  probe_part_number: str = '610175 T6E0-S00923',
                  registration_config: str | None = None,
+                 em_registration_dwell_s: float = 0.75,
+                 em_registration_min_samples: int = 20,
+                 em_registration_max_position_deviation_mm: float = 0.15,
+                 em_registration_max_orientation_deviation_deg: float = 1.0,
                  driver_factory=None):
         self.port = port
         self.driver_root = driver_root
@@ -124,6 +237,22 @@ class AuroraRecorder:
         self.registration_config = (
             os.path.abspath(os.path.expanduser(registration_config))
             if registration_config else None)
+        self.em_registration_dwell_s = float(em_registration_dwell_s)
+        self.em_registration_min_samples = int(em_registration_min_samples)
+        self.em_registration_max_position_deviation_mm = float(
+            em_registration_max_position_deviation_mm)
+        self.em_registration_max_orientation_deviation_deg = float(
+            em_registration_max_orientation_deviation_deg)
+        if self.em_registration_dwell_s < 0:
+            raise ValueError('EM registration dwell must be non-negative')
+        if self.em_registration_min_samples < 2:
+            raise ValueError('EM registration requires at least 2 samples')
+        if self.em_registration_max_position_deviation_mm <= 0:
+            raise ValueError(
+                'EM registration position-deviation limit must be positive')
+        if self.em_registration_max_orientation_deviation_deg <= 0:
+            raise ValueError(
+                'EM registration orientation-deviation limit must be positive')
         self._factory = driver_factory
         self._device = None
         self._tracking = False
@@ -131,6 +260,7 @@ class AuroraRecorder:
         self._stop = threading.Event()
         self._data_lock = threading.Lock()
         self._recent_probe = deque(maxlen=200)
+        self._recent_tools = {}
         self._output_dir = None
         self.tool_info = {}
         self.error = None
@@ -237,6 +367,8 @@ class AuroraRecorder:
         self._stop.clear()
         with self._data_lock:
             self._recent_probe.clear()
+            self._recent_tools = {
+                handle: deque(maxlen=200) for handle in self.tool_info}
         self._thread = threading.Thread(
             target=self._record_loop, name='aurora-recorder', daemon=True)
         self._thread.start()
@@ -309,15 +441,18 @@ class AuroraRecorder:
                         })
                         self.rows += 1
                         self.valid_rows += int(valid)
-                        if valid and identity['role'] == 'base_probe':
+                        if valid:
+                            recent_pose = {
+                                'timestamp_ns': timestamp_ns,
+                                'aurora_frame_number': ph.frame_number,
+                                'position_mm': list(ph.trans),
+                                'quaternion_wxyz': list(ph.rot),
+                                'error_mm': ph.error,
+                            }
                             with self._data_lock:
-                                self._recent_probe.append({
-                                    'timestamp_ns': timestamp_ns,
-                                    'aurora_frame_number': ph.frame_number,
-                                    'position_mm': list(ph.trans),
-                                    'quaternion_wxyz': list(ph.rot),
-                                    'error_mm': ph.error,
-                                })
+                                self._recent_tools[ph.id].append(recent_pose)
+                                if identity['role'] == 'base_probe':
+                                    self._recent_probe.append(recent_pose)
                     self.samples += 1
         except BaseException as exc:
             self.error = exc
@@ -339,7 +474,8 @@ class AuroraRecorder:
                         f'{max_attempts} attempts') from exc
                 time.sleep(0.01)
 
-    def capture_registration_slot(self, slot: int, window_s: float = 0.5) -> dict:
+    def capture_registration_slot(
+            self, slot: int, window_s: float | None = None) -> dict:
         '''Save a robust static probe measurement for bracket slot 1 through 4.'''
         if slot not in (1, 2, 3, 4):
             raise ValueError('registration slot must be 1, 2, 3, or 4')
@@ -347,14 +483,18 @@ class AuroraRecorder:
             raise RuntimeError('start unified recording before capturing registration')
         with self._data_lock:
             samples = list(self._recent_probe)
-        if not samples:
-            raise RuntimeError('no valid base_probe readings are available')
-        end_ns = samples[-1]['timestamp_ns']
-        cutoff_ns = end_ns - int(window_s * 1e9)
-        samples = [s for s in samples if s['timestamp_ns'] >= cutoff_ns]
-        if len(samples) < 5:
-            raise RuntimeError(
-                f'only {len(samples)} valid probe samples in the capture window')
+        window_s = (
+            self.em_registration_dwell_s if window_s is None
+            else float(window_s))
+        samples, stationarity = qualify_stationary_probe_samples(
+            samples,
+            window_s=window_s,
+            min_samples=self.em_registration_min_samples,
+            max_position_deviation_mm=(
+                self.em_registration_max_position_deviation_mm),
+            max_orientation_deviation_deg=(
+                self.em_registration_max_orientation_deviation_deg),
+        )
 
         axes = list(zip(*(sample['position_mm'] for sample in samples)))
         mean_mm = [statistics.fmean(axis) for axis in axes]
@@ -371,12 +511,61 @@ class AuroraRecorder:
             'mean_error_mm': statistics.fmean(s['error_mm'] for s in samples),
             'first_aurora_frame': samples[0]['aurora_frame_number'],
             'last_aurora_frame': samples[-1]['aurora_frame_number'],
+            'stationarity': stationarity,
         }
         registration = self._update_registration_file(slot, result)
         result['registration_complete'] = registration['complete']
         result['transform_status'] = registration['transform_status']
         result['transform_error'] = registration.get('transform_error')
         result['registration_fit'] = registration.get('registration_fit')
+        return result
+
+    def tip_coil_poses_at(
+            self, timestamp_ns: int, max_age_s: float = 0.25) -> list[dict]:
+        '''Return the nearest valid pose of each tip coil to an image time.'''
+        timestamp_ns = int(timestamp_ns)
+        max_age_ns = int(float(max_age_s) * 1e9)
+        if max_age_ns < 0:
+            raise ValueError('maximum EM/image pose age must be non-negative')
+        with self._data_lock:
+            recent = {
+                handle: list(samples)
+                for handle, samples in self._recent_tools.items()}
+        result = []
+        coils = sorted(
+            (item for item in self.tool_info.values()
+             if item['role'].startswith('tip_coil_')),
+            key=lambda item: self._identity_key(item['part_number']))
+        for identity in coils:
+            candidates = recent.get(identity['port_handle'], [])
+            if not candidates:
+                raise RuntimeError(
+                    f"no recent pose for {identity['role']} "
+                    f"({identity['part_number']})")
+            pose = min(
+                candidates,
+                key=lambda item: abs(item['timestamp_ns'] - timestamp_ns))
+            delta_ns = pose['timestamp_ns'] - timestamp_ns
+            if abs(delta_ns) > max_age_ns:
+                raise RuntimeError(
+                    f"nearest pose for {identity['role']} "
+                    f"({identity['part_number']}) is "
+                    f'{abs(delta_ns) * 1e-6:.1f} ms from the image; '
+                    f'limit={max_age_s * 1000.0:.1f} ms')
+            result.append({
+                'tool_role': identity['role'],
+                'part_number': identity['part_number'],
+                'serial_number': identity['serial_number'],
+                'port_handle': identity['port_handle'],
+                'timestamp_ns': pose['timestamp_ns'],
+                'timestamp_delta_ms': delta_ns * 1e-6,
+                'aurora_frame_number': pose['aurora_frame_number'],
+                'position_aurora_mm': pose['position_mm'],
+                'quaternion_aurora_wxyz': pose['quaternion_wxyz'],
+                'error_mm': pose['error_mm'],
+            })
+        if len(result) != 2:
+            raise RuntimeError(f'expected two tip coil poses, found {len(result)}')
         return result
 
     def _update_registration_file(self, slot: int, result: dict) -> dict:
@@ -466,6 +655,15 @@ class AuroraRecorder:
             'expected_tools': self.expected_tools,
             'probe_part_number_match': self.probe_part_number,
             'registration_config': self.registration_config,
+            'registration_stationarity': {
+                'dwell_s': self.em_registration_dwell_s,
+                'min_samples': self.em_registration_min_samples,
+                'max_position_deviation_mm': (
+                    self.em_registration_max_position_deviation_mm),
+                'max_orientation_deviation_deg': (
+                    self.em_registration_max_orientation_deviation_deg),
+                'deviation_percentile': 95,
+            },
             'tools': sorted(
                 self.tool_info.values(), key=lambda item: item['role']),
             'started_ns': self.started_ns,

@@ -72,6 +72,20 @@ def parse_args(argv=None):
                 os.path.dirname(__file__), '..', '..', 'registration_config.yaml'))),
         help='YAML containing EM bracket slot centers in the robot-base frame.')
     ap.add_argument(
+        '--em-registration-dwell-s', type=float, default=0.75,
+        help='stationary probe history required for each slot (default 0.75s).')
+    ap.add_argument(
+        '--em-registration-min-samples', type=int, default=20,
+        help='minimum valid probe samples in a slot capture (default 20).')
+    ap.add_argument(
+        '--em-registration-max-position-deviation-mm',
+        type=float, default=0.15,
+        help='maximum 95th-percentile probe position deviation (default 0.15mm).')
+    ap.add_argument(
+        '--em-registration-max-orientation-deviation-deg',
+        type=float, default=1.0,
+        help='maximum 95th-percentile probe orientation deviation (default 1deg).')
+    ap.add_argument(
         '--camera-registration-frames', type=int, default=150,
         help='valid ChArUco poses collected after EM registration.')
     ap.add_argument(
@@ -98,6 +112,12 @@ def main(argv=None):
             expected_tools=args.aurora_expected_tools,
             probe_part_number=args.aurora_probe_part_number,
             registration_config=args.registration_config,
+            em_registration_dwell_s=args.em_registration_dwell_s,
+            em_registration_min_samples=args.em_registration_min_samples,
+            em_registration_max_position_deviation_mm=(
+                args.em_registration_max_position_deviation_mm),
+            em_registration_max_orientation_deviation_deg=(
+                args.em_registration_max_orientation_deviation_deg),
         )
         try:
             em_recorder.open()
@@ -226,6 +246,10 @@ def main(argv=None):
                 return
             image_ts, image_left, image_right = last_registration_pair
             try:
+                if em_recorder is None:
+                    raise RuntimeError(
+                        'camera registration overlay requires live EM tracking')
+                em_tool_poses = em_recorder.tip_coil_poses_at(image_ts)
                 camera = camera_register.save_session_camera_registration(
                     registration_path=os.path.join(
                         session_dir, 'registration.json'),
@@ -242,8 +266,9 @@ def main(argv=None):
                     baseline_m=info['baseline_m'],
                     image_timestamp_ns=image_ts,
                     min_frames=args.camera_registration_frames,
+                    em_tool_poses=em_tool_poses,
                 )
-            except (OSError, TypeError, ValueError) as exc:
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 notice = str(exc)
                 if notice != camera_registration_notice:
                     print(f'[CAM-REG] not completed: {notice}')
@@ -367,6 +392,8 @@ def main(argv=None):
                                     f"[REG] slot {slot}: "
                                     f"mean_mm={result['mean_aurora_mm']} "
                                     f"max_std_mm={result['max_std_mm']:.3f} "
+                                    f"pos_p95_mm={result['stationarity']['position_p95_deviation_mm']:.3f} "
+                                    f"rot_p95_deg={result['stationarity']['orientation_p95_deviation_deg']:.3f} "
                                     f"n={result['sample_count']}")
                                 if result['transform_status'] == 'solved':
                                     fit = result['registration_fit']
