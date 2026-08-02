@@ -365,7 +365,7 @@ def save_session_camera_registration(
         registration_path, output_dir, config_path, collected,
         left_bgr, right_bgr, boards, K, dist, resolution,
         zed_serial, baseline_m, image_timestamp_ns, min_frames=10,
-        em_tool_poses=None):
+        em_tool_poses=None, image_only=False):
     """Fit camera-to-base registration and merge it into a session JSON.
 
     The collected mapping contains r, t and c observation lists per board.
@@ -382,8 +382,9 @@ def save_session_camera_registration(
             'camera': None,
         }
     markers, workspace = load_config(config_path)
-    field_config = load_field_generator_config(config_path)
-    if field_config is None and (
+    field_config = (
+        None if image_only else load_field_generator_config(config_path))
+    if not image_only and field_config is None and (
             not document.get('em')
             or document['em'].get('transform_status') != 'solved'):
         raise ValueError(
@@ -498,8 +499,16 @@ def save_session_camera_registration(
             'mean_corners': float(np.mean(data['c'])),
         }
 
-    base_T_aurora, overlay_coils = build_em_overlay_geometry(
-        document['em'], em_tool_poses)
+    if image_only:
+        document['em'] = None
+        document['mode'] = 'image_only'
+        document['modalities'] = {'camera': True, 'em': False}
+        base_T_aurora, overlay_coils = None, []
+    else:
+        document['mode'] = 'camera_em'
+        document['modalities'] = {'camera': True, 'em': True}
+        base_T_aurora, overlay_coils = build_em_overlay_geometry(
+            document['em'], em_tool_poses)
     right_camera_T_left_camera = np.eye(4)
     right_camera_T_left_camera[0, 3] = -float(baseline_m)
     right_camera_T_robot_base = (
@@ -595,14 +604,15 @@ def save_session_camera_registration(
                     'rot_std_deg': field_board['stats']['rot_std_deg'],
                 },
             }),
-        'em_overlay': {
-            'image_timestamp_ns': int(image_timestamp_ns),
-            'field_frame': 'aurora',
-            'field_axis_length_mm': float(AXIS_LEN_M * 2000.0),
-            'coil_z_axis_length_mm': float(AXIS_LEN_M * 1000.0),
-            'coil_poses': [
-                coil['saved_pose'] for coil in overlay_coils],
-        },
+        'em_overlay': (
+            None if image_only else {
+                'image_timestamp_ns': int(image_timestamp_ns),
+                'field_frame': 'aurora',
+                'field_axis_length_mm': float(AXIS_LEN_M * 2000.0),
+                'coil_z_axis_length_mm': float(AXIS_LEN_M * 1000.0),
+                'coil_poses': [
+                    coil['saved_pose'] for coil in overlay_coils],
+            }),
         'overlay_left': left_name,
         'overlay_right': right_name,
     }

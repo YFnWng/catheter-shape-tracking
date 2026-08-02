@@ -80,8 +80,8 @@ class SessionRegistration:
     baseline_m: float
     left_camera_T_base: np.ndarray
     right_camera_T_base: np.ndarray
-    base_T_aurora: np.ndarray
-    aurora_T_base: np.ndarray
+    base_T_aurora: np.ndarray | None
+    aurora_T_base: np.ndarray | None
     roi_left_xywh: tuple[int, int, int, int]
     roi_right_xywh: tuple[int, int, int, int]
     workspace_base_m: dict
@@ -89,7 +89,9 @@ class SessionRegistration:
     resolution: str
 
 
-def load_session_registration(path_or_session: os.PathLike | str) -> SessionRegistration:
+def load_session_registration(
+        path_or_session: os.PathLike | str,
+        require_em: bool = True) -> SessionRegistration:
     """Load and validate the unified ``registration.json``."""
     path = Path(path_or_session)
     if path.is_dir():
@@ -98,7 +100,8 @@ def load_session_registration(path_or_session: os.PathLike | str) -> SessionRegi
         document = json.load(stream)
     em = document.get("em") or {}
     camera = document.get("camera") or {}
-    if em.get("transform_status") != "solved":
+    em_solved = em.get("transform_status") == "solved"
+    if require_em and not em_solved:
         raise ValueError(f"EM registration is not solved in {path}")
     if camera.get("status") != "solved":
         raise ValueError(f"camera registration is not solved in {path}")
@@ -117,10 +120,12 @@ def load_session_registration(path_or_session: os.PathLike | str) -> SessionRegi
             camera["left_camera_T_robot_base"], dtype=np.float64),
         right_camera_T_base=np.asarray(
             camera["right_camera_T_robot_base"], dtype=np.float64),
-        base_T_aurora=np.asarray(
-            em["robot_base_T_aurora"], dtype=np.float64),
-        aurora_T_base=np.asarray(
-            em["aurora_T_robot_base"], dtype=np.float64),
+        base_T_aurora=(
+            np.asarray(em["robot_base_T_aurora"], dtype=np.float64)
+            if em_solved else None),
+        aurora_T_base=(
+            np.asarray(em["aurora_T_robot_base"], dtype=np.float64)
+            if em_solved else None),
         roi_left_xywh=tuple(int(v) for v in camera["roi_left_xywh"]),
         roi_right_xywh=tuple(int(v) for v in camera["roi_right_xywh"]),
         workspace_base_m=dict(camera["workspace_base_m"]),
@@ -383,6 +388,31 @@ class FrameRecord:
     timestamp_ns: int
 
 
+def normalize_frame_records(records: list[FrameRecord]) -> list[FrameRecord]:
+    """Drop repeated timestamps and map retained images to contiguous SVO slots.
+
+    A successful live ZED ``grab`` can occasionally expose the preceding image
+    timestamp again. SVO stores only the new image, so a sidecar indexed by
+    grab count drifts by one at every repeated timestamp. Playback positions
+    instead correspond to the strictly increasing timestamp sequence.
+    """
+    normalized = []
+    last_timestamp_ns = None
+    for record in records:
+        timestamp_ns = int(record.timestamp_ns)
+        if last_timestamp_ns is not None:
+            if timestamp_ns == last_timestamp_ns:
+                continue
+            if timestamp_ns < last_timestamp_ns:
+                raise ValueError(
+                    "frame index timestamps are not monotonic: "
+                    f"{timestamp_ns} follows {last_timestamp_ns}")
+        normalized.append(FrameRecord(
+            svo_frame=len(normalized), timestamp_ns=timestamp_ns))
+        last_timestamp_ns = timestamp_ns
+    return normalized
+
+
 def load_frame_index(path_or_session: os.PathLike | str) -> list[FrameRecord]:
     path = Path(path_or_session)
     if path.is_dir():
@@ -393,6 +423,7 @@ def load_frame_index(path_or_session: os.PathLike | str) -> list[FrameRecord]:
             rows.append(FrameRecord(
                 svo_frame=int(row["svo_frame"]),
                 timestamp_ns=int(row["timestamp_ns"])))
+    rows = normalize_frame_records(rows)
     if not rows:
         raise ValueError(f"frame index is empty: {path}")
     return rows

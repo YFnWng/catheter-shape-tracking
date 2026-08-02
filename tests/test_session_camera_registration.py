@@ -8,9 +8,76 @@ import numpy as np
 
 from shape_tracking import boards as boards_mod
 from shape_tracking.register import save_session_camera_registration
+from shape_tracking.session import load_session_registration
 
 
 class SessionCameraRegistrationTest(unittest.TestCase):
+    def test_image_only_registration_uses_base_board_without_em(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / 'registration_config.yaml'
+            config.write_text(
+                'units: m\n'
+                'markers:\n'
+                '  0:\n'
+                '    matrix:\n'
+                '      - [1, 0, 0, 0]\n'
+                '      - [0, 1, 0, 0]\n'
+                '      - [0, 0, 1, 0]\n'
+                '      - [0, 0, 0, 1]\n'
+                'field_generator_registration:\n'
+                '  board_index: 2\n'
+                '  marker_id_offset: 17\n'
+                '  aurora_T_marker:\n'
+                '    matrix:\n'
+                '      - [1, 0, 0, 0]\n'
+                '      - [0, 1, 0, 0]\n'
+                '      - [0, 0, 1, 0]\n'
+                '      - [0, 0, 0, 1]\n'
+                'workspace:\n'
+                '  x: [-0.05, 0.05]\n'
+                '  y: [-0.05, 0.05]\n'
+                '  z: [0.0, 0.2]\n'
+                '  margin_px: 5\n')
+            observations = {
+                0: {
+                    'r': [[0.0, 0.0, 0.0]] * 10,
+                    't': [[0.0, 0.0, 1.0]] * 10,
+                    'c': [9] * 10,
+                }
+            }
+            image = np.zeros((240, 320, 3), dtype=np.uint8)
+            K = np.array([
+                [200.0, 0.0, 160.0],
+                [0.0, 200.0, 120.0],
+                [0.0, 0.0, 1.0],
+            ])
+            _, boards = boards_mod.build_boards()
+            registration_path = root / 'registration.json'
+
+            camera = save_session_camera_registration(
+                registration_path=str(registration_path),
+                output_dir=str(root), config_path=str(config),
+                collected=observations, left_bgr=image, right_bgr=image,
+                boards=boards, K=K, dist=np.zeros(5), resolution='TEST',
+                zed_serial='123', baseline_m=0.12,
+                image_timestamp_ns=100, min_frames=10,
+                image_only=True)
+
+            document = json.loads(registration_path.read_text())
+            self.assertEqual(document['mode'], 'image_only')
+            self.assertEqual(document['modalities'], {
+                'camera': True, 'em': False})
+            self.assertIsNone(document['em'])
+            self.assertEqual(camera['boards_used'], [0])
+            self.assertIsNone(camera['field_generator_board'])
+            self.assertIsNone(camera['em_overlay'])
+            with self.assertRaisesRegex(ValueError, 'EM registration'):
+                load_session_registration(root)
+            loaded = load_session_registration(root, require_em=False)
+            self.assertIsNone(loaded.base_T_aurora)
+            self.assertIsNone(loaded.aurora_T_base)
+
     def test_merges_camera_registration_and_writes_overlays(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

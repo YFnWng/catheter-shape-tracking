@@ -69,6 +69,27 @@ tool type, and transient port handle. The complete mapping is repeated in
 `em_metadata.json`; downstream code must use `tool_role` or `serial_number`, not
 the discovery index.
 
+### Image-only recording
+
+To remove the EM coils and tip housing and collect stereo images for offline
+segmentation, use the explicit image-only mode:
+
+```powershell
+d:\robot-dev\shape_tracking\.venv\Scripts\python.exe -m shape_tracking `
+    --outdir D:\robot-dev\catheter_sessions `
+    --resolution HD1080 --fps 30 --preview-fps 10 `
+    --registration-config .\registration_config.yaml `
+    --image-only --autorecord
+```
+
+Do not pass `--aurora-port` in this mode. The Aurora driver is not opened and
+the session contains no `em_poses.csv` or `em_metadata.json`. Camera
+registration starts automatically and uses only the configured robot-base
+boards; the field-generator board and `field_generator_registration` entry are
+ignored. The resulting `registration.json` has `mode: image_only`, `em: null`,
+and a solved camera-to-base transform. `session_metadata.json` records the
+enabled modalities independently of registration completion.
+
 ### Direct optical field-generator registration
 
 The preferred workflow uses the existing base ChArUco board and the 100 x

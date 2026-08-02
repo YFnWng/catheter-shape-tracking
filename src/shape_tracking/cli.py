@@ -12,6 +12,7 @@ Controls (focus the OpenCV preview window)
 import argparse
 import csv
 from collections import deque
+import json
 import os
 import time
 
@@ -20,6 +21,21 @@ import numpy as np
 from . import boards as boards_mod
 from . import registration
 from .boards import AXIS_LEN_M, MARKERS_PER_BOARD
+
+
+def _limit_frame_index(path, frame_count):
+    """Atomically retain at most ``frame_count`` rows in an SVO sidecar."""
+    with open(path, newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    rows = rows[:max(0, int(frame_count))]
+    temporary = path + ".finalizing"
+    with open(temporary, "w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["svo_frame", "timestamp_ns"])
+        writer.writerows(
+            (index, row["timestamp_ns"]) for index, row in enumerate(rows))
+    os.replace(temporary, path)
+    return len(rows)
 
 
 def parse_args(argv=None):
@@ -49,8 +65,17 @@ def parse_args(argv=None):
                          "short exposure (adds noise). Default -1 = auto.")
     ap.add_argument("--no-display", action="store_true",
                     help="headless: no preview window.")
+    ap.add_argument(
+        "--preview-fps", type=float, default=10.0,
+        help="image retrieval/preview rate while SVO recording (default 10Hz; "
+             "SVO grab and recording remain at --fps). Set 0 to retrieve every "
+             "recorded frame.")
     ap.add_argument("--autorecord", action="store_true",
                     help="start unified ZED+Aurora recording immediately.")
+    ap.add_argument(
+        "--image-only", action="store_true",
+        help="record stereo images without Aurora; register only the camera "
+             "to the robot-base ChArUco boards.")
     ap.add_argument('--aurora-port', default='',
                     help='Aurora serial port, e.g. COM4; empty disables EM.')
     ap.add_argument('--aurora-expected-tools', type=int, default=3,
@@ -93,7 +118,10 @@ def parse_args(argv=None):
     ap.add_argument(
         '--camera-registration-min-corners', type=int, default=6,
         help='minimum ChArUco corners for a camera-registration observation.')
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if args.image_only and args.aurora_port:
+        ap.error("--image-only cannot be combined with --aurora-port")
+    return args
 
 
 def main(argv=None):
@@ -102,8 +130,9 @@ def main(argv=None):
     from .zed_capture import ZedCamera
 
     args = parse_args(argv)
-    field_registration = camera_register.load_field_generator_config(
-        args.registration_config)
+    field_registration = (
+        None if args.image_only else
+        camera_register.load_field_generator_config(args.registration_config))
 
     em_recorder = None
     if args.aurora_port:
@@ -143,6 +172,22 @@ def main(argv=None):
     right_dir = os.path.join(session_dir, "right")
     for d in (left_dir, right_dir):
         os.makedirs(d, exist_ok=True)
+    with open(os.path.join(session_dir, "session_metadata.json"),
+              "w", encoding="utf-8") as stream:
+        json.dump({
+            "schema_version": 1,
+            "session_id": session,
+            "mode": (
+                "image_only" if args.image_only else
+                "camera_em" if args.aurora_port else "camera_only"),
+            "modalities": {
+                "stereo_camera": True,
+                "em_tracking": bool(args.aurora_port),
+            },
+            "requested_resolution": args.resolution,
+            "requested_fps": args.fps,
+            "preview_fps": args.preview_fps,
+        }, stream, indent=2, sort_keys=True)
 
     camera_markers, _ = camera_register.load_config(args.registration_config)
     additional_boards = []
@@ -193,14 +238,22 @@ def main(argv=None):
         last_registration_pair = None
         frame_idx = 0
         svo_frame = 0
+        recording_grabs = 0
+        repeated_svo_timestamps = 0
+        last_svo_timestamp_ns = None
         frame_index_file = None
         frame_index_writer = None
+        preview_stride = (
+            1 if args.preview_fps <= 0 or args.fps <= 0 else
+            max(1, int(round(args.fps / args.preview_fps))))
 
         def svo_path():
             return os.path.join(session_dir, f"stereo_{session}.svo2")
 
         def start_svo():
             nonlocal frame_index_file, frame_index_writer, svo_frame
+            nonlocal recording_grabs, repeated_svo_timestamps
+            nonlocal last_svo_timestamp_ns
             nonlocal camera_registration_collecting
             nonlocal camera_registration_done, camera_registration_notice
             nonlocal last_registration_pair
@@ -214,6 +267,9 @@ def main(argv=None):
             frame_index_writer = csv.writer(frame_index_file)
             frame_index_writer.writerow(["svo_frame", "timestamp_ns"])
             svo_frame = 0
+            recording_grabs = 0
+            repeated_svo_timestamps = 0
+            last_svo_timestamp_ns = None
             print(f"[SVO] recording -> {svo_path()}")
             if em_recorder is not None:
                 try:
@@ -229,7 +285,7 @@ def main(argv=None):
                         frame_index_file = None
                         frame_index_writer = None
                     raise
-            if field_registration is not None:
+            if field_registration is not None or args.image_only:
                 for data in camera_observations.values():
                     data['r'].clear()
                     data['t'].clear()
@@ -238,27 +294,53 @@ def main(argv=None):
                 camera_registration_notice = None
                 camera_registration_done = False
                 camera_registration_collecting = True
-                print(
-                    '[REG] optical EM registration: collecting base board and '
-                    f"field board IDs {field_registration['marker_id_offset']}-"
-                    f"{field_registration['marker_id_offset'] + 7} for "
-                    f'{args.camera_registration_frames} valid frames')
+                if args.image_only:
+                    print(
+                        '[REG] image-only camera registration: collecting '
+                        f'robot-base boards for '
+                        f'{args.camera_registration_frames} valid frames')
+                else:
+                    print(
+                        '[REG] optical EM registration: collecting base board '
+                        f"and field board IDs "
+                        f"{field_registration['marker_id_offset']}-"
+                        f"{field_registration['marker_id_offset'] + 7} for "
+                        f'{args.camera_registration_frames} valid frames')
             return True
 
         def stop_svo():
-            nonlocal frame_index_file, frame_index_writer
-            cam.stop_recording()
-            if frame_index_file is not None:
-                frame_index_file.close()
-                frame_index_file = None
-                frame_index_writer = None
-            print("[SVO] stopped")
-
+            nonlocal frame_index_file, frame_index_writer, svo_frame
+            recording_status = cam.stop_recording()
             if em_recorder is not None and em_recorder.is_recording:
                 em_recorder.stop()
                 print(
                     f'[EM] stopped: {em_recorder.samples} frames, '
                     f'{em_recorder.valid_rows}/{em_recorder.rows} valid poses')
+            if frame_index_file is not None:
+                frame_index_file.close()
+                frame_index_file = None
+                frame_index_writer = None
+            playable_count = None
+            try:
+                playable_count = cam.playable_svo_frame_count(svo_path())
+                if playable_count < svo_frame:
+                    svo_frame = _limit_frame_index(
+                        os.path.join(session_dir, "frame_index.csv"),
+                        playable_count)
+            except (OSError, RuntimeError) as exc:
+                print(f"[warn] could not reconcile SVO frame count: {exc}")
+            detail = (
+                f" indexed={svo_frame} grabs={recording_grabs} "
+                f"repeated_timestamps={repeated_svo_timestamps}")
+            if playable_count is not None:
+                detail += f" playable={playable_count}"
+            if recording_status is not None:
+                detail += (
+                    " ingested="
+                    f"{recording_status['number_frames_ingested']} encoded="
+                    f"{recording_status['number_frames_encoded']} avg_encode_ms="
+                    f"{recording_status['average_compression_time_ms']:.2f}")
+            print(f"[SVO] stopped:{detail}")
 
         def finish_camera_registration_if_ready():
             nonlocal camera_registration_collecting
@@ -291,10 +373,12 @@ def main(argv=None):
                 return
             image_ts, image_left, image_right = last_registration_pair
             try:
-                if em_recorder is None:
+                if em_recorder is None and not args.image_only:
                     raise RuntimeError(
                         'camera registration overlay requires live EM tracking')
-                em_tool_poses = em_recorder.tip_coil_poses_at(image_ts)
+                em_tool_poses = (
+                    None if args.image_only else
+                    em_recorder.tip_coil_poses_at(image_ts))
                 camera = camera_register.save_session_camera_registration(
                     registration_path=os.path.join(
                         session_dir, 'registration.json'),
@@ -312,6 +396,7 @@ def main(argv=None):
                     image_timestamp_ns=image_ts,
                     min_frames=args.camera_registration_frames,
                     em_tool_poses=em_tool_poses,
+                    image_only=args.image_only,
                 )
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 notice = str(exc)
@@ -339,7 +424,9 @@ def main(argv=None):
             cv2.namedWindow(win, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(win, 1280, 720)
 
-        if field_registration is not None:
+        if args.image_only:
+            print("\nControls: r=PNGs v=SVO s=snapshot q/ESC=quit\n")
+        elif field_registration is not None:
             print("\nControls: r=PNGs v=SVO+EM s=snapshot q/ESC=quit\n")
         else:
             print("\nControls: r=PNGs v=SVO+EM 1..4=capture probe slot "
@@ -347,7 +434,11 @@ def main(argv=None):
 
         try:
             while True:
-                grabbed = cam.grab()
+                retrieve_images = (
+                    not cam.is_recording
+                    or recording_pngs
+                    or recording_grabs % preview_stride == 0)
+                grabbed = cam.grab(retrieve=retrieve_images)
                 if em_recorder is not None and em_recorder.error is not None:
                     raise RuntimeError(
                         f'Aurora recording failed: {em_recorder.error}'
@@ -355,9 +446,19 @@ def main(argv=None):
                 if grabbed is None:
                     continue
                 ts, left_bgr, right_bgr = grabbed
-                if frame_index_writer is not None:      # one SVO frame per grab
-                    frame_index_writer.writerow([svo_frame, ts])
-                    svo_frame += 1
+                if frame_index_writer is not None:
+                    recording_grabs += 1
+                    # A successful SDK grab can repeat the preceding camera
+                    # timestamp. Such a grab is not a new SVO image and must not
+                    # advance the playback index.
+                    if ts != last_svo_timestamp_ns:
+                        frame_index_writer.writerow([svo_frame, ts])
+                        svo_frame += 1
+                        last_svo_timestamp_ns = ts
+                    else:
+                        repeated_svo_timestamps += 1
+                if left_bgr is None:
+                    continue
                 overlay = left_bgr.copy()
                 results, seen_ids = [], []
                 if camera_registration_collecting and cam.is_recording:
@@ -444,6 +545,9 @@ def main(argv=None):
                         else:
                             stop_svo()
                     elif key in (ord('1'), ord('2'), ord('3'), ord('4')):
+                        if args.image_only:
+                            print('[REG] probe slots disabled in image-only mode')
+                            continue
                         if field_registration is not None:
                             print(
                                 '[REG] probe slots disabled: using the optical '

@@ -117,13 +117,20 @@ class ZedCamera:
         }
 
     # -- capture ------------------------------------------------------------ #
-    def grab(self):
+    def grab(self, retrieve=True):
         """Grab one synchronized pair. Returns (timestamp_ns, left_bgr, right_bgr)
-        or None if the grab failed this cycle."""
+        or None if the grab failed this cycle.
+
+        When ``retrieve`` is false, the camera is still grabbed (and therefore
+        still written to an enabled SVO recording), but the expensive full-HD
+        CPU image copies are skipped and both image values are ``None``.
+        """
         import cv2
         if self.zed.grab(self._runtime) != sl.ERROR_CODE.SUCCESS:
             return None
         ts = self.zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
+        if not retrieve:
+            return ts, None, None
         self.zed.retrieve_image(self._left, sl.VIEW.LEFT)
         self.zed.retrieve_image(self._right, sl.VIEW.RIGHT)
         # BGRA (H,W,4) -> BGR; cvtColor copies out of the SDK-owned buffer.
@@ -141,10 +148,55 @@ class ZedCamera:
         self._recording = True
         return True
 
+    def recording_status(self):
+        """Return plain recording counters from the installed ZED SDK."""
+        status = self.zed.get_recording_status()
+        return {
+            'is_recording': bool(status.is_recording),
+            'status': bool(status.status),
+            'number_frames_ingested': int(status.number_frames_ingested),
+            'number_frames_encoded': int(status.number_frames_encoded),
+            'current_compression_time_ms': float(
+                status.current_compression_time),
+            'average_compression_time_ms': float(
+                status.average_compression_time),
+        }
+
     def stop_recording(self):
+        status = None
         if self._recording:
+            try:
+                status = self.recording_status()
+            except Exception:
+                pass
             self.zed.disable_recording()
             self._recording = False
+        return status
+
+    @staticmethod
+    def playable_svo_frame_count(svo_path):
+        """Return the number of frame positions that can actually be grabbed.
+
+        ZED SDK 5.4 reports an EOF sentinel as the final SVO position. Probe the
+        reported final position so the sidecar does not include that sentinel.
+        """
+        init = sl.InitParameters()
+        init.set_from_svo_file(str(svo_path))
+        init.svo_real_time_mode = False
+        init.depth_mode = sl.DEPTH_MODE.NONE
+        playback = sl.Camera()
+        status = playback.open(init)
+        if status != sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"ZED failed to reopen recorded SVO: {status}")
+        try:
+            reported = int(playback.get_svo_number_of_frames())
+            if reported <= 0:
+                return 0
+            playback.set_svo_position(reported - 1)
+            last_status = playback.grab(sl.RuntimeParameters())
+            return reported if last_status == sl.ERROR_CODE.SUCCESS else reported - 1
+        finally:
+            playback.close()
 
     @property
     def is_recording(self):
