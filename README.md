@@ -2,6 +2,103 @@
 
 3D shape tracking of a steerable catheter centerline in free space.
 
+## Current handoff: image-only SAM work (2026-08-02)
+
+The immediate goal is to build a robust offline catheter segmentation pipeline
+from rectified ZED2 stereo video. EM tracking is deliberately excluded from this
+variant so the coil housing can be removed and the complete exposed catheter is
+visible. Keep the existing EM/stereo sequence processor intact; add the SAM
+workflow as a separate image-only processing path.
+
+The latest image-only dataset is:
+
+```
+D:\robot-dev\catheter_sessions\20260802_134726
+```
+
+It was captured without the coil housing, with the joint-1 velocity limit restored
+to 40 deg/s. Its important properties are:
+
+- `session_metadata.json` reports `mode: image_only`, stereo enabled, and EM
+  disabled.
+- `stereo_20260802_134726.svo2` contains both rectified HD1080 views.
+- `frame_index.csv` maps each SVO frame to its ZED image timestamp. Always retain
+  `svo_frame` and `timestamp_ns` in derived SAM outputs.
+- `registration.json` contains the solved left/right camera transforms relative to
+  the robot base and the registered workspace ROIs. It intentionally has
+  `em: null`; load it with `load_session_registration(..., require_em=False)`.
+- Base boards 0 and 1 were both used. The registration overlay images are the
+  quickest visual check that the base axes, workspace, and ROIs are sensible.
+- The matching ROS bag is currently in WSL at
+  `/home/wangyf/catheter_sessions/20260802_134726/rosbag`. Copy that directory
+  into the Windows session as `<session>/rosbag` before transferring the dataset
+  to another workstation.
+
+Audit on 2026-08-02 found 12,661 playable, contiguously indexed frames over
+429.967 s (29.444 Hz effective). Timestamps are strictly increasing, and the SVO
+playable-frame count exactly matches `frame_index.csv`. There are 150 intervals
+over 50 ms, mostly isolated 66.9 ms intervals and concentrated near startup; the
+maximum interval is 401.4 ms. Treat timestamp differences as authoritative rather
+than assuming an exact 30 Hz sample period. Within the marked 6-minute motion
+trajectory, 10,736 frames cover 359.990 s at 29.820 Hz, with 26 intervals over
+50 ms and a 100.35 ms maximum interval. Camera registration used 148/150 board-0
+samples and 145/150 board-1 samples. Their two base estimates differ by 2.77 mm
+and 1.23 degrees; within-board pose scatter is small, but this inter-board
+agreement is the practical registration-accuracy warning for downstream results.
+
+The matching ROS bag contains a complete 360.002 s seed-1 sinusoidal trajectory
+plus its position-control return. Commands were delivered at 100.01 Hz and stayed
+within `[-10,10]` mm/s, `[-37.85,40]` deg/s, and `[-1,1]` mm/s for joints 0-2.
+Measured position ranges were approximately `[-0.038,39.598]` mm,
+`[-137.055,175.125]` degrees, and `[-0.0002,9.786]` mm, so there is no meaningful
+limit excursion. One axis-0 stall was suspected and recovered about 11 ms later;
+there was no confirmed or latched hardware fault. Return-to-zero succeeded with
+final absolute errors `[0.0014 mm, 0.0371 deg, 0.00018 mm]`. Camera frames match
+the ROS `run_start`, `return_start`, and `run_end` markers within 2.2, 10.1, and
+6.6 ms respectively.
+
+### Moving to the SAM workstation
+
+Transfer the entire `shape_tracking` repository and the entire session directory;
+do not transfer `.venv`. On the new Windows workstation:
+
+```powershell
+cd D:\robot-dev\shape_tracking
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -e .
+python -m unittest discover -s tests -q
+```
+
+Reading SVO2 directly also requires the ZED SDK and its `pyzed` wheel installed
+for that Python 3.11 environment. A workstation without the SDK cannot decode the
+SVO merely by installing this repository. Install PyTorch and the chosen SAM
+implementation according to that workstation's CUDA version rather than adding a
+machine-specific CUDA wheel to this package's base dependencies.
+
+Recommended first SAM milestone:
+
+1. Add an image-only processor that reads stereo frames through `SvoReader`, uses
+   the registered left/right ROIs, and runs the same model independently on both
+   rectified views.
+2. Start with sparse frames and explicit positive/negative point or box prompts.
+   Propagate masks only after single-frame behavior is reliable; periodically
+   re-prompt to prevent video-tracker drift.
+3. Preserve the complete distal flexible blue segment while excluding the dark
+   blue proximal stiff segment, tape, wires, fixtures, and background. Store the
+   full mask first, then derive an ordered base-to-tip centerline and the
+   distal/proximal material boundary as separate outputs.
+4. Write per-view masks, centerlines, prompt/model provenance, confidence and
+   rejection reasons keyed by `svo_frame,timestamp_ns`. Never silently fill a
+   failed frame.
+5. Produce sparse overlay videos before bulk inference. Stereo consistency and
+   temporal mask/centerline continuity should be quality checks, not assumptions.
+
+The current `shape_tracking.sequence` command requires EM and is not the entry
+point for this dataset. The HSV/skeleton code in `segmentation.py` is a useful
+baseline and centerline utility, but no SAM integration has been implemented yet.
+
 Sensors:
 - **NDI Aurora** EM coils at the tip → 6-DOF pose feedback.
 - **ZED2** stereo camera → time-stamped binocular video for offline centerline
