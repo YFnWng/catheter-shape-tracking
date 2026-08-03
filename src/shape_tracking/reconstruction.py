@@ -193,23 +193,31 @@ def _reproj_to_centerlines(X_cam, cl_left, cl_right, K, baseline_m):
 
 
 def smooth_polyline_2d(points, n_out, smooth=None):
-    """Fit a smoothing spline to a 2D polyline, resample to n_out points.
+    """Resample a 2D polyline, with an explicitly requested optional spline.
 
-    Removes pixel-level jitter while preserving genuine turns. `smooth` is
-    scipy's splprep `s` (sum of squared residuals); default ~= 0.1*len(points)
-    (about 0.3 px RMS), which strips sub-pixel jitter while keeping a sharp bend.
-    Raise it if the curve looks noisy; lower it for an even sharper turn.
+    The default is piecewise-linear arc-length resampling, which preserves sharp
+    turns in the mask skeleton. A positive `smooth` opts into the former cubic
+    FITPACK smoothing spline and is retained for explicit experiments.
     """
-    from scipy.interpolate import splprep, splev
     p = np.asarray(points, dtype=np.float64)
     keep = np.r_[True, np.any(np.diff(p, axis=0) != 0, axis=1)]
     p = p[keep]
     if len(p) < 2:
         return p
-    s = max(6.0, 0.1 * len(p)) if smooth is None else smooth
-    tck, _ = splprep([p[:, 0], p[:, 1]], s=s, k=min(3, len(p) - 1))
-    uu = np.linspace(0, 1, n_out)
-    x, y = splev(uu, tck)
+    segment = np.linalg.norm(np.diff(p, axis=0), axis=1)
+    source_s = np.concatenate([[0.0], np.cumsum(segment)])
+    if source_s[-1] <= 1e-9:
+        return np.repeat(p[:1], int(n_out), axis=0)
+    target_s = np.linspace(0.0, source_s[-1], int(n_out))
+    if smooth is None or float(smooth) <= 0.0:
+        return np.column_stack([
+            np.interp(target_s, source_s, p[:, axis]) for axis in range(2)])
+
+    from scipy.interpolate import splprep, splev
+    tck, _ = splprep(
+        [p[:, 0], p[:, 1]], u=source_s / source_s[-1],
+        s=float(smooth), k=min(3, len(p) - 1))
+    x, y = splev(target_s / source_s[-1], tck)
     return np.column_stack([x, y])
 
 

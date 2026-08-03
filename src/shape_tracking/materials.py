@@ -238,6 +238,7 @@ def draw_material_overlay(
         projected_shape: np.ndarray | None = None,
         projected_tip: np.ndarray | None = None,
         projected_tip_direction: np.ndarray | None = None,
+        projected_boundary: np.ndarray | None = None,
         quality_text: str = "") -> np.ndarray:
     """Draw proximal/distal segmentation and optional reconstructed shape."""
     output = image.copy()
@@ -247,6 +248,22 @@ def draw_material_overlay(
     sub[selected] = (
         0.7 * sub[selected] + 0.3 * np.array([0, 100, 0])
     ).astype(np.uint8)
+    # The translucent fill is difficult to see when the correct mask is only a
+    # few pixels wide and is covered by the centerline. An outline makes mask
+    # presence and gross mask errors inspectable in both stereo views.
+    contours, _ = cv2.findContours(
+        np.uint8(selected) * 255, cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(sub, contours, -1, (0, 180, 0), 1, cv2.LINE_AA)
+    if projected_shape is not None:
+        curve = np.asarray(projected_shape, dtype=np.float64)
+        finite = np.all(np.isfinite(curve), axis=1)
+        if np.count_nonzero(finite) >= 2:
+            curve_i = np.rint(curve[finite]).astype(np.int32)
+            # A wider yellow underlay leaves the measured material centerline
+            # visible as a colored core when the two curves agree.
+            cv2.polylines(output, [curve_i], False, (0, 255, 255), 5,
+                          cv2.LINE_AA)
     points = material.points.astype(np.int32)
     boundary = material.distal_boundary_index
     if boundary >= 2:
@@ -255,15 +272,11 @@ def draw_material_overlay(
     if len(points) - boundary >= 2:
         cv2.polylines(output, [points[boundary:]], False, (255, 160, 20), 2,
                       cv2.LINE_AA)
-    cv2.circle(output, tuple(points[boundary]), 6, (0, 255, 255), 2,
+    boundary_point = (
+        points[boundary] if projected_boundary is None
+        else np.rint(projected_boundary).astype(np.int32))
+    cv2.circle(output, tuple(boundary_point), 6, (0, 255, 255), 2,
                cv2.LINE_AA)
-    if projected_shape is not None:
-        curve = np.asarray(projected_shape, dtype=np.float64)
-        finite = np.all(np.isfinite(curve), axis=1)
-        if np.count_nonzero(finite) >= 2:
-            curve_i = np.rint(curve[finite]).astype(np.int32)
-            cv2.polylines(output, [curve_i], False, (0, 255, 255), 2,
-                          cv2.LINE_AA)
     if projected_tip is not None and np.all(np.isfinite(projected_tip)):
         tip = tuple(np.rint(projected_tip).astype(int))
         cv2.circle(output, tip, 7, (0, 0, 255), 2, cv2.LINE_AA)

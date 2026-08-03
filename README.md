@@ -57,47 +57,214 @@ final absolute errors `[0.0014 mm, 0.0371 deg, 0.00018 mm]`. Camera frames match
 the ROS `run_start`, `return_start`, and `run_end` markers within 2.2, 10.1, and
 6.6 ms respectively.
 
-### Moving to the SAM workstation
+### Setting up the SAM environment
 
 Transfer the entire `shape_tracking` repository and the entire session directory;
-do not transfer `.venv`. On the new Windows workstation:
+do not transfer `.venv`. On the Ubuntu 22.04 ROS workstation, reuse the shared
+Python 3.10 `cr-venv` environment:
 
-```powershell
-cd D:\robot-dev\shape_tracking
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+```bash
+source /home/chen-lab/Yifan/cr-venv/bin/activate
+cd /home/chen-lab/Yifan/catheter-shape-tracking
 python -m pip install --upgrade pip
 pip install -e .
 python -m unittest discover -s tests -q
 ```
 
 Reading SVO2 directly also requires the ZED SDK and its `pyzed` wheel installed
-for that Python 3.11 environment. A workstation without the SDK cannot decode the
-SVO merely by installing this repository. Install PyTorch and the chosen SAM
-implementation according to that workstation's CUDA version rather than adding a
+for that Python 3.10 environment. A workstation without the SDK cannot decode the
+SVO merely by installing this repository. On Linux, activate `cr-venv` before
+running `/usr/local/zed/get_python_api.py`; the helper detects Python 3.10 and
+installs the matching `cp310` wheel into the active environment. ZED SDK 5.4's
+wheel requires NumPy 2.x; keep the version selected by `pyzed` rather than
+downgrading NumPy afterward. Install PyTorch and the chosen SAM implementation
+according to that workstation's CUDA version rather than adding a
 machine-specific CUDA wheel to this package's base dependencies.
 
-Recommended first SAM milestone:
+The image-only implementation is `shape_tracking.image_sequence`. It runs the
+same SAM 2.1 model on both registered rectified ROIs as one image batch per
+stereo pair. In the default quality-preserving pipeline, bounded 16-frame
+chunks are decoded and their frame-local colour prompts are prepared by four
+CPU workers. A background producer overlaps the next chunk with main-thread
+SAM inference and chronological stereo reconstruction. Automatic
+prompts use the projected robot base, the selected blue/cyan shaft, and the
+yellow component adjacent to the distal shaft endpoint; optional JSON prompts
+can override them on individual frames. SAM masks are stored first, then reduced
+to an ordered base-to-tip centerline and a dark-blue/cyan material boundary.
 
-1. Add an image-only processor that reads stereo frames through `SvoReader`, uses
-   the registered left/right ROIs, and runs the same model independently on both
-   rectified views.
-2. Start with sparse frames and explicit positive/negative point or box prompts.
-   Propagate masks only after single-frame behavior is reliable; periodically
-   re-prompt to prevent video-tracker drift.
-3. Preserve the complete distal flexible blue segment while excluding the dark
-   blue proximal stiff segment, tape, wires, fixtures, and background. Store the
-   full mask first, then derive an ordered base-to-tip centerline and the
-   distal/proximal material boundary as separate outputs.
-4. Write per-view masks, centerlines, prompt/model provenance, confidence and
-   rejection reasons keyed by `svo_frame,timestamp_ns`. Never silently fill a
-   failed frame.
-5. Produce sparse overlay videos before bulk inference. Stereo consistency and
-   temporal mask/centerline continuity should be quality checks, not assumptions.
+Run a sparse audited pilot before bulk inference (run from any directory after
+the official SAM 2 checkout has been installed editable in `cr-venv`):
 
-The current `shape_tracking.sequence` command requires EM and is not the entry
-point for this dataset. The HSV/skeleton code in `segmentation.py` is a useful
-baseline and centerline utility, but no SAM integration has been implemented yet.
+```bash
+source /home/chen-lab/Yifan/cr-venv/bin/activate
+python -m shape_tracking.image_sequence \
+  --session /media/chen-lab/84BABCB7BABCA6D81/Yifan/catheter_sessions/20260802_134726 \
+  --sam-checkpoint /home/chen-lab/Yifan/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --stride 300 --max-frames 30 --write-video
+```
+
+Process every marked trajectory frame after reviewing the pilot overlays:
+
+```bash
+python -m shape_tracking.image_sequence \
+  --session /media/chen-lab/84BABCB7BABCA6D81/Yifan/catheter_sessions/20260802_134726 \
+  --sam-checkpoint /home/chen-lab/Yifan/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --window run_and_return \
+  --write-video
+```
+
+`run_and_return` is the default processing window. It includes the commanded
+trajectory and the return-to-zero motion, while excluding unrelated recording
+before and after the run. Unless `--outdir` is supplied, results are written to
+the session's `processed_image/` directory alongside the source data.
+
+The performance controls are:
+
+- `--prompt-workers 4`: CPU workers for independent left/right colour and
+  prompt extraction.
+- `--preprocess-chunk-size 16`: number of decoded frames prepared together.
+- `--prefetch-frames 16`: maximum prepared-frame queue; use 0 to disable
+  decode/preprocessing overlap.
+- `--sam-frame-batch-size 1`: preserves previous-accepted-frame SAM prompting.
+  Values above 1 batch independent timestamps through the image encoder and
+  use temporal prompts only as selective retries. This is experimental because
+  independently plausible masks can choose different skeleton branches.
+
+True SAM 2 video-memory propagation is available as an optional two-stage
+backend. It propagates each registered stereo ROI both forward and backward in
+bounded chunks, refreshes memory with automatic prompts at regular anchors, and
+stores a reusable bit-packed mask cache:
+
+```bash
+python -m shape_tracking.sam_video_propagation \
+  --session /media/chen-lab/84BABCB7BABCA6D81/Yifan/catheter_sessions/20260802_134726 \
+  --sam-checkpoint /home/chen-lab/Yifan/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --chunk-frames 300 --anchor-stride 30 \
+  --output propagated_masks.h5
+
+python -m shape_tracking.image_sequence \
+  --session /media/chen-lab/84BABCB7BABCA6D81/Yifan/catheter_sessions/20260802_134726 \
+  --sam-checkpoint /home/chen-lab/Yifan/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --segmentation-backend propagated \
+  --propagated-mask-h5 propagated_masks.h5 --write-video
+```
+
+Propagation is deliberately not the default: it can bridge weak individual
+frames, but a bad video-memory track can drift for several frames and produce
+inconsistent left/right centerlines. The same reconstruction can be run with
+`--segmentation-backend hsv` for an ablation. HSV remains useful for automatic
+prompts and propagation-candidate scoring, but a propagated mask does not
+require an HSV detection to be accepted.
+
+Outputs land in `<session>/processed_image/`: `processed_shapes.h5` contains
+bit-packed per-view masks, fixed-sample pixel/3D centerlines, tangents,
+curvature, distal flexible-segment base position, aligned command/POS/raw-ENC
+streams, provenance, and quality metrics. `frame_summary.csv` and
+`processing_summary.json` retain every failed frame and its rejection reason;
+`overlay_left.mp4` and `overlay_right.mp4` are the visual audit. Per-frame stage
+times (milliseconds) are included as `timing_*_ms` columns in
+`frame_summary.csv`; `processing_summary.json` reports total time, mean time per
+frame, and fraction of elapsed processing time for each stage. With background
+prefetch, stage totals describe work rather than a serial critical path, so
+their fractions can sum to more than 100%. GPU encoder and
+prompt-decoder times use CUDA synchronization at their boundaries. The image-only
+processor never invokes EM. The existing `shape_tracking.sequence` command
+remains the EM-dependent path for older sessions.
+
+The image-only stereo path preserves sharp turns by arc-length-resampling the
+ordered pixel skeleton with piecewise-linear interpolation by default. Disparity
+has one degree of freedom per stereo sample and is estimated with robust Huber
+weights plus local first- and second-difference regularization; the registered
+base depth is an endpoint observation, not a global polynomial constraint. The
+ordered stereo reference is selected from the longer, less-foreshortened image
+centerline rather than always using the left view. A 15% hysteresis
+(`--stereo-reference-switch-ratio`) prevents reference-view chatter. At full
+frame rate, the previous accepted disparity field is a weak local prior
+(`--temporal-disparity-weight`, default 0.5), reducing depth and distal-base
+jitter. In addition, the fixed-material-coordinate distal points can be
+filtered causally with a first-order low-pass
+(`--temporal-shape-cutoff-hz`; disabled by default), then refit under the exact
+60 mm arc-length constraint. This filters
+the transition point and the whole shape coherently instead of filtering a
+single endpoint independently. It adds frequency-dependent lag, so enable it
+only when that tradeoff is appropriate (for example, pass
+`--temporal-shape-cutoff-hz 4`). The
+per-frame coefficient is stored as `quality/temporal_shape_alpha`. The chosen
+stereo view is stored as `quality/stereo_reference_view` (1=left, 2=right).
+
+No modelled base bridge is inserted: a visible proximal endpoint farther than
+`--max-base-endpoint-distance-mm` (15 mm by default) from the registered base
+rejects the frame. The known distal material length is supplied with
+`--distal-length-mm` (60 mm by default) as both a search prior and final spline
+constraint. The visible dark-blue/cyan change point is detected only within
+`--distal-boundary-search-half-width-mm` of the geometric 60 mm estimate, so
+short dark sections near the tip cannot become the transition. Valid detections
+from the two views are mapped into the ordered stereo samples and fused; a large
+left/right boundary disagreement rejects the frame. At full frame rate, the
+fused material coordinate receives a weak temporal prior. Thus the image
+determines the distal base while the fitted boundary-to-tip spline retains exact
+60 mm physical length and exact observed endpoints. Its single 3D base point is
+projected into both overlay
+views, so the displayed transition cannot be assigned independently or inherit
+the wrong branch of a folded 2D projection. A frame is rejected rather than
+labelled when its visible
+3D curve is shorter than the distal segment or when the left/right image
+centerline-length ratio exceeds `--max-stereo-centerline-length-ratio`.
+Before rejecting a length mismatch, the processor retries the shorter SAM view
+with prompts transferred from the complete view using rectified epipolar rows
+and the registered base disparity. The retry is retained only when it improves
+the length ratio and passes the normal SAM, base-position, and reprojection
+checks. A transferred prompt can occasionally make SAM include a broad adjacent
+surface and skeletonize through the background. For a failed view, the reliable
+opposite-view centerline supplies the rectified epipolar row at each point; the
+retry searches only the horizontal coordinate for the local blue/cyan image
+ridge and smooths that disparity correction. The resulting path, rather than
+SAM's potentially branched skeleton, defines a catheter-width mask corridor.
+If the second SAM call fails completely, the same recovery may use the original
+partial mask, but only when at least 75% of the transferred path has direct
+blue/cyan or yellow-tip support in the target image and no unsupported run is
+longer than 10% of the path. Stereo geometry alone cannot create an accepted
+centerline. The accepted retry mask is refined from these material-color pixels
+rather than retaining a broad SAM region.
+All masks must also pass an area-per-centerline-length check controlled by
+`--max-mask-effective-width-px` (28 px by default). The overlay includes a green
+mask contour so a correct thin mask remains visible beneath the fitted curves.
+
+For normal full-rate processing, each accepted frame also supplies full-shaft
+positive points and a box to the next frame in the same view. This temporal
+prompt is used only when the timestamp gap is at most
+`--max-temporal-prompt-gap-ms` (100 ms by default), and current-frame color seeds
+and all stereo/geometry checks still apply. Manual per-frame prompts take
+precedence. Thus 30 Hz motion receives a stable image-space prior, while sparse
+pilot frames separated by seconds never reuse stale geometry. Prompt points,
+boxes, and their `temporal_previous_valid` source are stored with the output.
+
+The final full and distal curves are clamped, penalized cubic
+3D B-splines with an explicit basis count (`--curvature-spline-bases`, default
+20, giving 16 internal knots), so the fit cannot collapse to a single global
+cubic. The distal fit also has an explicit arc-length constraint, preventing
+spline smoothing from shortcutting a tight bend and changing the 60 mm material
+length. Spline basis counts, fitted arc length, and RMS residuals are stored as
+quality metrics.
+
+Optional manual prompts are full-image pixels keyed by view and SVO frame:
+
+```json
+{
+  "left": {
+    "1482": {
+      "box": [1018, 410, 1098, 592],
+      "positive": [[1065, 430], [1042, 555]],
+      "negative": [[1018, 410], [1098, 592]]
+    }
+  },
+  "right": {}
+}
+```
+
+Pass this file with `--prompt-json prompts.json`. Prompt source, SAM repository
+commit, configuration, checkpoint path, and checkpoint SHA-256 are recorded in
+the HDF5 metadata.
 
 Sensors:
 - **NDI Aurora** EM coils at the tip → 6-DOF pose feedback.
@@ -466,30 +633,32 @@ python -m shape_tracking.tool_calibration_solve `
     D:\robot-dev\catheter_sessions\aruco_em_calibration_YYYYMMDD_HHMMSS
 ```
 
-## Install (dedicated venv, Python 3.11 to match the ZED wheel)
+## Install (Python 3.10 or 3.11 with a matching ZED wheel)
 
-```powershell
-# 1) dedicated venv for this project
-py -3.11 -m venv D:\robot-dev\shape_tracking\.venv
-D:\robot-dev\shape_tracking\.venv\Scripts\Activate.ps1
+The Ubuntu 22.04 catheter stack uses the shared Python 3.10 `cr-venv` so it can
+also access ROS 2 Humble packages:
+
+```bash
+# 1) activate the shared catheter/ROS environment
+source /home/chen-lab/Yifan/cr-venv/bin/activate
 
 # 2) editable-install the package + its deps (numpy, opencv-contrib-python)
 #    Do NOT also have plain opencv-python installed — it shadows the aruco module.
-pip install -e "D:\robot-dev\shape_tracking[capture]"
+python -m pip install -e /home/chen-lab/Yifan/catheter-shape-tracking
 
-# 3) ZED python API (pyzed) into THIS venv — SDK 5.4.0 is installed. pyzed is not
-#    on PyPI, so run the SDK helper (it detects the active interpreter):
-python "C:\Program Files (x86)\ZED SDK\get_python_api.py"
-#    then pip install the .whl it downloads, e.g.:
-# pip install pyzed-5.4-cp311-cp311-win_amd64.whl
+# 3) after installing ZED SDK, install pyzed into THIS venv. pyzed is not on
+#    PyPI; the SDK helper detects the active CPython 3.10 interpreter and obtains
+#    the matching wheel.
+cd /usr/local/zed
+python get_python_api.py
 ```
 
 Verify:
-```powershell
+```bash
 python -c "import cv2, cv2.aruco, numpy, pyzed.sl; print('ok', cv2.__version__)"
 ```
 
-### Reusing from another project (all consumers on Python 3.11)
+### Reusing from another project (consumers on Python 3.10 or 3.11)
 venvs are isolated — you can't point one venv at another's site-packages. Instead
 editable-install this package into each consumer venv:
 ```powershell

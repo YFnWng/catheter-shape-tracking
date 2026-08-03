@@ -6,16 +6,18 @@ build-backend = "setuptools.build_meta"
 name = "shape_tracking"
 version = "0.1.0"
 description = "Catheter centerline 3D shape tracking with ZED2 + NDI Aurora"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.10,<3.12"
 dependencies = [
-    "numpy",
-    "opencv-contrib-python>=4.7",
+    # ZED SDK 5.4's precompiled Python wheel requires NumPy 2.x.
+    "numpy>=2,<3",
+    "opencv-contrib-python>=4.7,<5",
     "scipy",              # curve fitting / optimization (reconstruction)
     "scikit-image",       # skeletonization (segmentation)
     "matplotlib",         # 3D reconstruction plots (offline driver)
     "pyyaml",             # registration config (shape_tracking.register)
     "h5py",               # fixed-shape multimodal sequence datasets
     'pyserial',
+    "rosbags>=0.11",      # offline custom-message deserialization
 ]
 
 # Live ZED2 capture. `pyzed` is not on PyPI: install the ZED SDK python API for
@@ -29,6 +31,7 @@ capture = []
 [project.scripts]
 shape-tracking-record = "shape_tracking.cli:main"
 shape-tracking-process = "shape_tracking.sequence:main"
+shape-tracking-process-image = "shape_tracking.image_sequence:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

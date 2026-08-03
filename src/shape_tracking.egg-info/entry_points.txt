@@ -1,2 +1,3 @@
 [console_scripts]
+shape-tracking-process = shape_tracking.sequence:main
 shape-tracking-record = shape_tracking.cli:main
