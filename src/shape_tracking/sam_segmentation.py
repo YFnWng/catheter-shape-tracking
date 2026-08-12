@@ -142,8 +142,25 @@ def _yellow_seed(
         return np.zeros((h, w), dtype=np.uint8), None
     selected = np.uint8(labels == best_component) * 255
     ys, xs = np.where(selected > 0)
-    centroid = np.array([np.mean(xs), np.mean(ys)], dtype=np.float64)
-    return selected, centroid + [x, y]
+    pixels = np.column_stack([xs, ys]).astype(np.float64)
+    # A component centroid lies inside the printed yellow cap and therefore
+    # shortens the reconstructed catheter. Estimate the distal edge along the
+    # local shaft tangent instead. Averaging the leading decile is less noisy
+    # than choosing one extreme segmentation pixel.
+    tangent_span = max(2, min(12, len(blue_path) // 4))
+    tangent_xy = np.array([
+        blue_path[-1, 1] - blue_path[-tangent_span, 1],
+        blue_path[-1, 0] - blue_path[-tangent_span, 0],
+    ], dtype=np.float64)
+    tangent_norm = float(np.linalg.norm(tangent_xy))
+    if tangent_norm > 1e-6:
+        tangent_xy /= tangent_norm
+        score = pixels @ tangent_xy
+        threshold = float(np.percentile(score, 90.0))
+        tip_roi = np.mean(pixels[score >= threshold], axis=0)
+    else:
+        tip_roi = np.mean(pixels, axis=0)
+    return selected, tip_roi + [x, y]
 
 
 def _path_with_anchors(
@@ -300,6 +317,14 @@ def material_centerline_from_mask(
     if len(path) < 2:
         return None
     points = np.column_stack([path[:, 1] + x, path[:, 0] + y]).astype(np.float64)
+    if tip_point is not None and np.all(np.isfinite(tip_point)):
+        tip = np.asarray(tip_point, dtype=np.float64)
+        endpoint_gap = float(np.linalg.norm(points[-1] - tip))
+        # The skeleton terminates near the middle of a finite-width yellow cap.
+        # Preserve the observed skeleton and explicitly include the detected
+        # distal cap edge as its endpoint when it is locally consistent.
+        if 1.0 < endpoint_gap <= 35.0:
+            points = np.vstack([points, tip])
     brightness = _sample_brightness(bgr, points)
     boundary, confidence, contrast, valid = detect_distal_boundary(brightness)
     distance = cv2.distanceTransform(np.uint8(mask > 0), cv2.DIST_L2, 5)

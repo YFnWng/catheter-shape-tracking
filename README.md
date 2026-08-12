@@ -118,6 +118,26 @@ trajectory and the return-to-zero motion, while excluding unrelated recording
 before and after the run. Unless `--outdir` is supplied, results are written to
 the session's `processed_image/` directory alongside the source data.
 
+After a completed SAM run, geometry/reconstruction changes can be evaluated
+without running SAM again. The cached backend decodes the SVO, rebuilds the
+material centerlines from the stored masks, and reruns stereo and 3D fitting:
+
+```bash
+python -m shape_tracking.image_sequence \
+  --session /media/chen-lab/84BABCB7BABCA6D81/Yifan/catheter_sessions/20260802_134726 \
+  --sam-checkpoint /home/chen-lab/Yifan/third_party/sam2/checkpoints/sam2.1_hiera_large.pt \
+  --segmentation-backend cached \
+  --cached-mask-h5 /media/chen-lab/84BABCB7BABCA6D81/Yifan/catheter_sessions/20260802_134726/processed_image/processed_shapes.h5 \
+  --outdir /media/chen-lab/84BABCB7BABCA6D81/Yifan/catheter_sessions/20260802_134726/processed_image_refined \
+  --write-video
+```
+
+The cached source and output must differ. This mode retains genuine mask
+failures but can recover frames previously rejected only by downstream stereo,
+transition-color, or spline logic. Cached reconstruction does not duplicate the
+large source masks unless `--store-masks` is explicitly supplied; the refined
+HDF5 still contains pixel centerlines, 3D geometry, quality, and robot data.
+
 The performance controls are:
 
 - `--prompt-workers 4`: CPU workers for independent left/right colour and
@@ -167,9 +187,55 @@ times (milliseconds) are included as `timing_*_ms` columns in
 frame, and fraction of elapsed processing time for each stage. With background
 prefetch, stage totals describe work rather than a serial critical path, so
 their fractions can sum to more than 100%. GPU encoder and
-prompt-decoder times use CUDA synchronization at their boundaries. The image-only
+prompt-decoder times use CUDA synchronization at their boundaries. Each view's
+compressed mask and centerline are now committed once per frame after its final
+retry/boundary state is known; failed views are also written once in the error
+path. This removes the former three overwrites that dominated external-drive
+HDF5 time. The image-only
 processor never invokes EM. The existing `shape_tracking.sequence` command
 remains the EM-dependent path for older sessions.
+
+### Post-hoc sensor fusion
+
+Use `shape_tracking.fusion` after image processing to build the learning dataset.
+Unlike the legacy `shape_tracking.sequence` path, this stage does not use EM to
+alter or anchor the reconstructed image shape. It aligns independently measured
+shape, EM tip pose, and robot actuation while preserving separate validity and
+timestamp-offset fields.
+
+The 100 Hz `/teleop/control` joint-command timestamps are the canonical timeline
+because actuation is present in every recording. POS and raw encoder feedback are
+interpolated onto that timeline. Processed image shapes are nearest-neighbor
+sampled without interpolation, and `image/source_index`,
+`image/source_offset_ms`, and `image/is_new_sample` make repeated camera samples
+explicit. EM coil poses are gap-aware interpolations followed by the existing
+dual-coil tip-frame fusion. `frames/fusion_valid` requires the command and every
+enabled optional modality; `robot/feedback_valid`, `image/valid`, and `em/valid`
+remain available for less restrictive filtering.
+
+For the current image-only session, run this after
+`processed_image/processed_shapes.h5` has closed successfully:
+
+```bash
+source /home/chen-lab/Yifan/cr-venv/bin/activate
+cd /home/chen-lab/Yifan/catheter-shape-tracking
+python -m shape_tracking.fusion \
+  --session /media/chen-lab/84BABCB7BABCA6D81/Yifan/catheter_sessions/20260802_134726 \
+  --image-data --no-em-data \
+  --window run_and_return
+```
+
+For a session with both optional sensors, use `--image-data --em-data`; use
+`--no-image-data --em-data` for EM only. Omitting both switches auto-detects
+modalities from `session_metadata.json` and file presence, but explicit switches
+are recommended for reproducible processing. An enabled missing input is an
+error. Actuation is mandatory and has no disable switch.
+
+The default output is `<session>/processed_fusion/fused_dataset.h5`, with a
+compact `fusion_summary.json` beside it. Fusion also defaults to the marked
+`run_and_return` window. The output copies model-ready 3D full/distal geometry
+and scalar quality fields, but not masks or 2D SAM prompts; those remain in the
+source image HDF5 named by the fusion metadata.
 
 The image-only stereo path preserves sharp turns by arc-length-resampling the
 ordered pixel skeleton with piecewise-linear interpolation by default. Disparity
@@ -179,12 +245,11 @@ base depth is an endpoint observation, not a global polynomial constraint. The
 ordered stereo reference is selected from the longer, less-foreshortened image
 centerline rather than always using the left view. A 15% hysteresis
 (`--stereo-reference-switch-ratio`) prevents reference-view chatter. At full
-frame rate, the previous accepted disparity field is a weak local prior
-(`--temporal-disparity-weight`, default 0.5), reducing depth and distal-base
+frame rate, the previous accepted disparity field is a local prior
+(`--temporal-disparity-weight`, default 2.0), reducing depth and distal-base
 jitter. In addition, the fixed-material-coordinate distal points can be
 filtered causally with a first-order low-pass
-(`--temporal-shape-cutoff-hz`; disabled by default), then refit under the exact
-60 mm arc-length constraint. This filters
+(`--temporal-shape-cutoff-hz`; disabled by default), then refit. This filters
 the transition point and the whole shape coherently instead of filtering a
 single endpoint independently. It adds frequency-dependent lag, so enable it
 only when that tradeoff is appropriate (for example, pass
@@ -195,21 +260,33 @@ stereo view is stored as `quality/stereo_reference_view` (1=left, 2=right).
 No modelled base bridge is inserted: a visible proximal endpoint farther than
 `--max-base-endpoint-distance-mm` (15 mm by default) from the registered base
 rejects the frame. The known distal material length is supplied with
-`--distal-length-mm` (60 mm by default) as both a search prior and final spline
-constraint. The visible dark-blue/cyan change point is detected only within
+`--distal-length-mm` (60 mm by default). The distal source polyline is selected
+geometrically by walking that distance back from the observed tip before the
+data-faithful multi-basis spline is fit. The visible dark-blue/cyan change point
+is also detected only within
 `--distal-boundary-search-half-width-mm` of the geometric 60 mm estimate, so
-short dark sections near the tip cannot become the transition. Valid detections
-from the two views are mapped into the ordered stereo samples and fused; a large
-left/right boundary disagreement rejects the frame. At full frame rate, the
-fused material coordinate receives a weak temporal prior. Thus the image
-determines the distal base while the fitted boundary-to-tip spline retains exact
-60 mm physical length and exact observed endpoints. Its single 3D base point is
-projected into both overlay
+short dark sections near the tip cannot become the transition. Color detections
+and their left/right consistency are retained as quality diagnostics, but they
+do not override the known material length or reject an otherwise sound stereo
+shape. This avoids making an ambiguous dark marking a geometry anchor. The
+unconstrained spline remains within a small fitting tolerance of 60 mm instead
+of satisfying length by cutting across a kink or inventing an off-image bend.
+The final fitted curve receives its own reprojection quality check. Its single
+3D base point is projected into both overlay
 views, so the displayed transition cannot be assigned independently or inherit
 the wrong branch of a folded 2D projection. A frame is rejected rather than
 labelled when its visible
 3D curve is shorter than the distal segment or when the left/right image
 centerline-length ratio exceeds `--max-stereo-centerline-length-ratio`.
+
+The printed yellow component supplies an explicit distal endpoint. Its distal
+edge is estimated along the local shaft tangent rather than using the blob
+centroid, and that point is appended to the mask skeleton when the finite-width
+cap makes the skeleton stop internally. Epipolar-consistent left/right tip
+observations are triangulated and used as the terminal disparity anchor. The
+stored `quality/tip_*` fields expose observation consistency and final endpoint
+error; a stereo-observed endpoint farther than
+`--max-tip-endpoint-error-px` from either detected tip rejects the frame.
 Before rejecting a length mismatch, the processor retries the shorter SAM view
 with prompts transferred from the complete view using rectified epipolar rows
 and the registered base disparity. The retry is retained only when it improves

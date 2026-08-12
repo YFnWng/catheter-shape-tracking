@@ -43,12 +43,16 @@ class SamSegmentationUtilitiesTests(unittest.TestCase):
         self.assertGreaterEqual(len(prompt.positive_xy), 3)
         self.assertGreater(np.count_nonzero(seed), 100)
         self.assertIsNotNone(tip)
+        shaft_direction = points[-1].astype(float) - points[-2].astype(float)
+        shaft_direction /= np.linalg.norm(shaft_direction)
+        self.assertGreater(np.dot(tip - points[-1], shaft_direction), 2.0)
         material = material_centerline_from_mask(
             image, roi, seed, np.array([15.0, 100.0]), tip)
         self.assertIsNotNone(material)
         self.assertGreater(len(material), 100)
         self.assertLess(np.linalg.norm(material.points[0] - points[0]), 15.0)
         self.assertLess(np.linalg.norm(material.points[-1] - points[-1]), 15.0)
+        np.testing.assert_allclose(material.points[-1], tip)
 
     def test_prepare_accepts_precomputed_automatic_prompt(self):
         image = np.zeros((80, 120, 3), dtype=np.uint8)
