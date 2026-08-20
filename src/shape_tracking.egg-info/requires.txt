@@ -1,4 +1,10 @@
-numpy
-opencv-contrib-python>=4.7
+numpy<3,>=2
+opencv-contrib-python<5,>=4.7
+scipy
+scikit-image
+matplotlib
+pyyaml
+h5py
+pyserial
 
 [capture]
