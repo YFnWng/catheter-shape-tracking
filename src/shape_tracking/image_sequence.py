@@ -33,6 +33,7 @@ from .geometry import (
     curve_geometry,
     stereo_condition_score,
 )
+from .interface_smoothing import smooth_interface_hdf5
 from .materials import (
     _sample_brightness,
     detect_distal_boundary,
@@ -53,6 +54,10 @@ from .sequence import load_collection_markers, select_frame_records
 from .sequence_reconstruction import (
     project_camera_points,
     reconstruct_disparity_anchored,
+)
+from .stereo_smoothing import smooth_stereo_disparity_hdf5
+from .spline_temporal_smoothing import (
+    smooth_distal_spline_coefficients_hdf5,
 )
 from .session import (
     FrameRecord,
@@ -76,8 +81,46 @@ class ImageProcessingConfig:
     disparity_second_difference_weight: float = 10.0
     disparity_huber_delta_px: float = 1.5
     temporal_disparity_weight: float = 2.0
+    temporal_disparity_max_gap_ms: float = 1000.0
+    temporal_disparity_decay_ms: float = 500.0
+    stereo_reference_hysteresis_score: float = 3.0
+    overlap_aware_reconstruction: bool = True
+    overlap_row_search_px: int = 2
+    overlap_self_fraction_threshold: float = 0.05
+    overlap_self_distance_px: float = 8.0
+    overlap_min_arclength_separation: float = 0.12
+    centerline_tip_depth_weight: float = 5.0
+    max_centerline_tip_epipolar_error_px: float = 8.0
+    terminal_disparity_refinement: bool = True
+    terminal_disparity_fraction: float = 0.20
+    terminal_disparity_smoothness_scale: float = 0.10
+    terminal_disparity_observation_weight: float = 4.0
+    terminal_disparity_tip_weight: float = 20.0
+    terminal_disparity_max_p95_degradation_px: float = 0.25
+    stereo_offline_cutoff_hz: float = 2.0
+    stereo_offline_huber_delta_px: float = 1.5
     temporal_shape_cutoff_hz: float = 0.0
     distal_length_mm: float = 60.0
+    distal_length_prior_sigma_mm: float = 4.0
+    interface_color_sigma_mm: float = 3.0
+    interface_temporal_sigma_mm: float = 1.5
+    interface_temporal_cutoff_hz: float = 4.0
+    interface_projection_window_mm: float = 15.0
+    interface_offline_cutoff_hz: float = 2.0
+    interface_offline_huber_delta_mm: float = 2.0
+    interface_offline_iterations: int = 4
+    interface_length_gate_mm: float = 4.0
+    interface_session_prior_relative_weight: float = 0.5
+    spline_temporal_cutoff_hz: float = 3.0
+    spline_temporal_terminal_cutoff_hz: float = 5.0
+    spline_temporal_terminal_basis_count: int = 4
+    spline_temporal_huber_delta_mm: float = 1.0
+    spline_temporal_iterations: int = 4
+    spline_temporal_max_gap_ms: float = 500.0
+    spline_temporal_outlier_sigma: float = 4.5
+    spline_temporal_outlier_floor_mm: float = 0.75
+    spline_temporal_frame_outlier_fraction: float = 0.5
+    spline_temporal_terminal_outlier_samples: int = 4
     distal_boundary_search_half_width_mm: float = 12.0
     curvature_smoothing_mm: float = 0.25
     curvature_spline_bases: int = 20
@@ -88,19 +131,25 @@ class ImageProcessingConfig:
     min_sam_iou: float = 0.25
     min_seed_recall: float = 0.75
     max_mask_area_fraction: float = 0.20
-    max_mask_effective_width_px: float = 28.0
+    max_mask_effective_width_px: float = 20.0
     max_temporal_prompt_gap_ms: float = 100.0
     max_mean_reprojection_px: float = 5.0
     max_p95_reprojection_px: float = 12.0
     max_tip_epipolar_error_px: float = 5.0
     max_tip_endpoint_error_px: float = 8.0
+    min_temporal_centerline_coverage: float = 0.55
+    temporal_centerline_tolerance_px: float = 18.0
+    max_temporal_centerline_p95_px: float = 35.0
     max_command_age_ms: float = 30.0
     max_feedback_gap_ms: float = 30.0
     video_scale: float = 0.5
     sam_frame_batch_size: int = 1
+    sam_postprocess_workers: int = 2
     prompt_workers: int = 4
     preprocess_chunk_size: int = 16
     prefetch_frames: int = 16
+    hdf_buffer_frames: int = 128
+    hdf_queue_chunks: int = 2
     store_masks: bool = True
 
 
@@ -408,8 +457,166 @@ def _stereo_tip_camera_point(
     return point, epipolar_error
 
 
+def _stereo_candidate_score(
+        reconstruction: dict,
+        reference_view: str,
+        left_length_px: float,
+        right_length_px: float,
+        previous_points_camera_m: np.ndarray | None = None,
+        previous_reference_view: str | None = None) -> tuple[float, dict[str, float]]:
+    """Score one ordered stereo hypothesis using both views and time."""
+    worst_mean = max(
+        float(reconstruction["reprojection_left_px"]),
+        float(reconstruction["reprojection_right_px"]))
+    reprojection = worst_mean + float(reconstruction["reprojection_p95_px"])
+    terminal_reprojection = max(
+        float(reconstruction.get("terminal_reprojection_left_px", 0.0)),
+        float(reconstruction.get("terminal_reprojection_right_px", 0.0)))
+    reference_length = (
+        left_length_px if reference_view == "left" else right_length_px)
+    best_length = max(left_length_px, right_length_px)
+    foreshortening = max(0.0, best_length / max(reference_length, 1e-9) - 1.0)
+    temporal_rms_mm = 0.0
+    if previous_points_camera_m is not None:
+        previous = np.asarray(previous_points_camera_m, dtype=np.float64)
+        current = np.asarray(reconstruction["points_camera_m"], dtype=np.float64)
+        if len(previous) != len(current):
+            parameter = np.linspace(0.0, 1.0, len(previous))
+            target = np.linspace(0.0, 1.0, len(current))
+            previous = np.column_stack([
+                np.interp(target, parameter, previous[:, axis])
+                for axis in range(3)])
+        temporal_rms_mm = float(np.sqrt(np.mean(np.sum(
+            (current - previous) ** 2, axis=1))) * 1000.0)
+    switch_penalty = float(
+        previous_reference_view is not None
+        and reference_view != previous_reference_view)
+    score = (
+        reprojection
+        + 1.5 * terminal_reprojection
+        + 8.0 * foreshortening
+        + 0.20 * min(temporal_rms_mm, 50.0)
+        + 0.25 * switch_penalty)
+    return score, {
+        "reprojection_score": reprojection,
+        "terminal_reprojection_score": terminal_reprojection,
+        "foreshortening_penalty": foreshortening,
+        "temporal_rms_mm": temporal_rms_mm,
+        "switch_penalty": switch_penalty,
+    }
+
+
+def _select_stereo_reference(
+        candidates: dict[str, tuple[float, dict]],
+        previous_reference_view: str | None,
+        hysteresis_score: float) -> str:
+    """Choose a non-overlapped reference and suppress score chatter."""
+    if not candidates:
+        raise ValueError("stereo_both_reference_candidates_failed")
+    eligible = {
+        view: value for view, value in candidates.items()
+        if (value[1]["reference_eye_self_overlap_fraction"]
+            <= value[1]["other_eye_self_overlap_fraction"] + 0.02)}
+    if not eligible:
+        eligible = candidates
+    selected = min(eligible, key=lambda view: eligible[view][0])
+    if (previous_reference_view in eligible
+            and eligible[previous_reference_view][0]
+            <= eligible[selected][0] + float(hysteresis_score)):
+        selected = previous_reference_view
+    return selected
+
+
+def _fuse_distal_length(
+        nominal_length_mm: float,
+        observed_lengths_mm: list[float],
+        observed_confidences: list[float],
+        previous_length_mm: float | None,
+        prior_sigma_mm: float,
+        color_sigma_mm: float,
+        temporal_sigma_mm: float,
+        robust_delta_mm: float = 8.0) -> tuple[float, float, float]:
+    """Fuse color, nominal length, and temporal evidence without equality."""
+    nominal = float(nominal_length_mm)
+    prior_weight = 1.0 / max(float(prior_sigma_mm), 1e-6) ** 2
+    values = [nominal]
+    weights = [prior_weight]
+    for value, confidence in zip(observed_lengths_mm, observed_confidences):
+        if not np.isfinite(value):
+            continue
+        residual = abs(float(value) - nominal)
+        robust = min(1.0, float(robust_delta_mm) / max(residual, 1e-9))
+        weight = (
+            max(float(confidence), 0.05) * robust
+            / max(float(color_sigma_mm), 1e-6) ** 2)
+        values.append(float(value))
+        weights.append(weight)
+    raw = float(np.average(values, weights=weights))
+    filtered_values = list(values)
+    filtered_weights = list(weights)
+    if previous_length_mm is not None and np.isfinite(previous_length_mm):
+        filtered_values.append(float(previous_length_mm))
+        filtered_weights.append(
+            1.0 / max(float(temporal_sigma_mm), 1e-6) ** 2)
+    filtered = float(np.average(filtered_values, weights=filtered_weights))
+    uncertainty = float(np.sqrt(1.0 / np.sum(filtered_weights)))
+    return raw, filtered, uncertainty
+
+
+def _project_point_to_polyline_s(
+        points: np.ndarray,
+        point: np.ndarray,
+        center_s_mm: float,
+        half_window_mm: float) -> float:
+    """Project a prior 3D interface onto a local part of the current curve."""
+    curve = np.asarray(points, dtype=np.float64)
+    target = np.asarray(point, dtype=np.float64)
+    s = cumulative_arclength(curve)
+    best_distance = float("inf")
+    best_s = float(np.clip(center_s_mm, 0.0, s[-1]))
+    lo = float(center_s_mm) - max(float(half_window_mm), 0.0)
+    hi = float(center_s_mm) + max(float(half_window_mm), 0.0)
+    for index, (start, end) in enumerate(zip(curve[:-1], curve[1:])):
+        if s[index + 1] < lo or s[index] > hi:
+            continue
+        segment = end - start
+        denominator = float(np.dot(segment, segment))
+        alpha = 0.0 if denominator <= 1e-12 else float(np.clip(
+            np.dot(target - start, segment) / denominator, 0.0, 1.0))
+        candidate = start + alpha * segment
+        distance = float(np.linalg.norm(candidate - target))
+        if distance < best_distance:
+            best_distance = distance
+            best_s = float(s[index] + alpha * (s[index + 1] - s[index]))
+    return best_s
+
+
+def _point_at_arclength(points: np.ndarray, target_s_mm: float) -> np.ndarray:
+    curve = np.asarray(points, dtype=np.float64)
+    s = cumulative_arclength(curve)
+    target = float(np.clip(target_s_mm, 0.0, s[-1]))
+    return np.array([
+        np.interp(target, s, curve[:, axis]) for axis in range(3)],
+        dtype=np.float64)
+
+
+def _temporal_centerline_metrics(
+        previous_points: np.ndarray,
+        current_points: np.ndarray,
+        tolerance_px: float) -> tuple[float, float]:
+    previous = np.asarray(previous_points, dtype=np.float64)
+    current = np.asarray(current_points, dtype=np.float64)
+    distances = np.min(np.linalg.norm(
+        previous[:, None, :] - current[None, :, :], axis=2), axis=1)
+    return (
+        float(np.mean(distances <= float(tolerance_px))),
+        float(np.percentile(distances, 95)))
+
+
 class ImageSequenceWriter:
-    """Fixed-shape, compressed image-only processing output."""
+    """Fixed-shape output written as bounded contiguous background batches."""
+
+    _END = object()
 
     def __init__(
             self,
@@ -420,9 +627,12 @@ class ImageSequenceWriter:
             metadata: dict):
         import h5py
 
+        self.image_centerline_samples = int(config.image_centerline_samples)
+        self.store_masks = bool(config.store_masks)
+        self.hdf_buffer_frames = max(1, int(config.hdf_buffer_frames))
         self.file = h5py.File(path, "w")
         self.string_type = h5py.string_dtype(encoding="utf-8")
-        self.file.attrs["schema_version"] = 6
+        self.file.attrs["schema_version"] = 12
         self.file.attrs["mode"] = "image_only_sam2"
         self.file.attrs["coordinate_frame"] = "robot_base"
         self.file.attrs["position_units"] = "mm"
@@ -445,11 +655,31 @@ class ImageSequenceWriter:
         self.file.attrs["processing_config_json"] = json.dumps(
             asdict(config), sort_keys=True)
         self._create(frame_count, config, registration)
+        self.dataset_paths: set[str] = set()
+        self.file.visititems(
+            lambda name, item: self.dataset_paths.add(name)
+            if hasattr(item, "shape") else None)
+        self._pending: dict[int, dict[str, object]] = {}
+        self._staging: list[tuple[int, dict[str, object]]] = []
+        self._write_queue: queue.Queue = queue.Queue(
+            maxsize=max(1, int(config.hdf_queue_chunks)))
+        self._writer_error: BaseException | None = None
+        self.write_time_s = 0.0
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop, name="image-hdf5-writer", daemon=True)
+        self._writer_thread.start()
 
     def _dataset(self, name, shape, dtype=np.float32, fillvalue=None, **extra):
+        dtype = np.dtype(dtype)
+        row_elements = int(np.prod(shape[1:], dtype=np.int64))
+        row_bytes = max(1, row_elements * dtype.itemsize)
+        chunk_rows = max(1, min(
+            int(shape[0]), self.hdf_buffer_frames,
+            max(1, (1024 * 1024) // row_bytes)))
         kwargs = dict(
             shape=shape, dtype=dtype, compression="gzip",
-            compression_opts=1, shuffle=True)
+            compression_opts=1, shuffle=True,
+            chunks=(chunk_rows, *shape[1:]))
         if fillvalue is not None:
             kwargs["fillvalue"] = fillvalue
         kwargs.update(extra)
@@ -472,7 +702,7 @@ class ImageSequenceWriter:
             if config.store_masks:
                 mask = self._dataset(
                     f"images/{view}/mask_packbits", (count, packed_size),
-                    dtype=np.uint8, fillvalue=0, chunks=(1, packed_size))
+                    dtype=np.uint8, fillvalue=0)
                 mask.attrs["roi_xywh"] = roi
                 mask.attrs["unpacked_shape"] = (height, width)
                 mask.attrs["packbits_bitorder"] = "little"
@@ -510,7 +740,26 @@ class ImageSequenceWriter:
             self._dataset(
                 f"{name}/observation_class", (count, samples),
                 dtype=np.uint8, fillvalue=0)
+        self.file.create_group("stereo")
+        self._dataset(
+            "stereo/visible_points_base_mm",
+            (count, config.stereo_samples, 3), fillvalue=np.nan)
+        self._dataset(
+            "stereo/causal_visible_points_base_mm",
+            (count, config.stereo_samples, 3), fillvalue=np.nan)
+        for name in ("ordered_left_px", "ordered_right_px"):
+            self._dataset(
+                f"stereo/{name}", (count, config.stereo_samples, 2),
+                fillvalue=np.nan)
+        for name in ("fitted_disparity_px", "smoothed_disparity_px"):
+            self._dataset(
+                f"stereo/{name}", (count, config.stereo_samples),
+                fillvalue=np.nan)
         self._dataset("distal/base_position_base_mm", (count, 3), fillvalue=np.nan)
+        self._dataset(
+            "distal/raw_base_position_base_mm", (count, 3), fillvalue=np.nan)
+        self._dataset(
+            "distal/causal_base_position_base_mm", (count, 3), fillvalue=np.nan)
 
         self.file.create_group("robot")
         for name in ("joint_velocity_command", "joint_position_measured", "encoder_raw"):
@@ -530,10 +779,37 @@ class ImageSequenceWriter:
                 "fitted_reprojection_p95_px",
                 "tip_epipolar_error_px", "tip_anchor_endpoint_distance_mm",
                 "tip_endpoint_left_px", "tip_endpoint_right_px",
+                "stereo_candidate_score_left", "stereo_candidate_score_right",
+                "stereo_candidate_margin", "stereo_candidate_temporal_rms_left_mm",
+                "stereo_candidate_temporal_rms_right_mm",
+                "stereo_epipolar_ambiguity_left",
+                "stereo_epipolar_ambiguity_right",
+                "stereo_other_eye_self_overlap_left",
+                "stereo_other_eye_self_overlap_right",
+                "overlap_aware_used",
+                "centerline_tip_anchor_used",
+                "centerline_tip_epipolar_error_px",
+                "terminal_reprojection_left_px",
+                "terminal_reprojection_right_px",
+                "terminal_refinement_used",
+                "terminal_refinement_improvement_px",
+                "terminal_refinement_start_fraction",
+                "temporal_centerline_coverage_left",
+                "temporal_centerline_coverage_right",
+                "temporal_centerline_p95_left_px",
+                "temporal_centerline_p95_right_px",
                 "stereo_condition", "material_boundary_fraction",
                 "material_boundary_color_fraction",
                 "material_boundary_prior_error_mm",
                 "material_boundary_observed_distal_length_mm",
+                "distal_length_raw_mm", "distal_length_filtered_mm",
+                "distal_length_smoothed_mm",
+                "distal_length_residual_mm", "interface_uncertainty_mm",
+                "interface_raw_s_mm", "interface_filtered_s_mm",
+                "interface_smoothed_s_mm",
+                "interface_smoothing_adjustment_mm",
+                "interface_smoothing_weight",
+                "interface_temporal_alpha",
                 "material_boundary_confidence", "material_boundary_contrast",
                 "distal_boundary_s_mm", "base_bridge_length_mm",
                 "base_endpoint_distance_mm", "visible_arc_length_mm",
@@ -561,15 +837,89 @@ class ImageSequenceWriter:
             "quality/tip_stereo_observed", (count,),
             dtype=np.uint8, fillvalue=0)
 
+    def _record(self, index: int) -> dict[str, object]:
+        return self._pending.setdefault(int(index), {})
+
+    @staticmethod
+    def _copy_value(value):
+        return value.copy() if isinstance(value, np.ndarray) else value
+
+    def _check_writer(self) -> None:
+        if self._writer_error is not None:
+            raise RuntimeError("background HDF5 writer failed") from self._writer_error
+
+    def _queue_put(self, item) -> None:
+        while True:
+            self._check_writer()
+            try:
+                self._write_queue.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                pass
+
+    def _flush_staging(self) -> None:
+        if self._staging:
+            chunk = tuple(self._staging)
+            self._staging.clear()
+            self._queue_put(chunk)
+
+    def _finalize_record(self, index: int) -> None:
+        record = self._pending.pop(int(index))
+        if self._staging and index != self._staging[-1][0] + 1:
+            self._flush_staging()
+        self._staging.append((int(index), record))
+        if len(self._staging) >= self.hdf_buffer_frames:
+            self._flush_staging()
+
+    def _filled_batch(self, dataset, count: int):
+        shape = (count, *dataset.shape[1:])
+        if dataset.dtype.kind in ("O", "S", "U"):
+            output = np.empty(shape, dtype=object)
+            output[...] = ""
+            return output
+        fill = dataset.fillvalue
+        if fill is None:
+            fill = np.nan if dataset.dtype.kind == "f" else 0
+        return np.full(shape, fill, dtype=dataset.dtype)
+
+    def _write_batch(self, records: tuple[tuple[int, dict[str, object]], ...]) -> None:
+        indices = [item[0] for item in records]
+        if indices != list(range(indices[0], indices[0] + len(indices))):
+            raise ValueError("HDF5 batch indices must be contiguous")
+        paths = sorted({path for _, record in records for path in record})
+        start, stop = indices[0], indices[-1] + 1
+        for path in paths:
+            dataset = self.file[path]
+            batch = self._filled_batch(dataset, len(records))
+            for offset, (_, record) in enumerate(records):
+                if path in record:
+                    batch[offset] = record[path]
+            dataset[start:stop] = batch
+
+    def _writer_loop(self) -> None:
+        try:
+            while True:
+                item = self._write_queue.get()
+                if item is self._END:
+                    return
+                started = time.perf_counter()
+                self._write_batch(item)
+                self.write_time_s += time.perf_counter() - started
+        except BaseException as exc:
+            self._writer_error = exc
+
     def write_identity(
             self,
             index: int,
             record: FrameRecord,
             svo_timestamp_ns: int,
             robot: AlignedRobotData) -> None:
-        self.file["frames/svo_frame"][index] = record.svo_frame
-        self.file["frames/timestamp_ns"][index] = record.timestamp_ns
-        self.file["frames/svo_timestamp_ns"][index] = svo_timestamp_ns
+        output = self._record(index)
+        output.update({
+            "frames/svo_frame": int(record.svo_frame),
+            "frames/timestamp_ns": int(record.timestamp_ns),
+            "frames/svo_timestamp_ns": int(svo_timestamp_ns),
+        })
         mappings = {
             "joint_velocity_command": robot.command_velocity,
             "joint_position_measured": robot.measured_position,
@@ -582,39 +932,44 @@ class ImageSequenceWriter:
             "encoder_valid": robot.encoder_valid,
         }
         for name, values in mappings.items():
-            self.file[f"robot/{name}"][index] = values[index]
+            output[f"robot/{name}"] = self._copy_value(values[index])
 
     def write_view(self, index: int, view: str, result: SamMaterialResult) -> None:
+        output = self._record(index)
         material = result.material
         mask_path = f"images/{view}/mask_packbits"
-        if mask_path in self.file:
+        if self.store_masks:
             packed = np.packbits((material.mask > 0).reshape(-1), bitorder="little")
-            self.file[mask_path][index, :len(packed)] = packed
+            output[mask_path] = packed
         sampled = resample_arclength(
-            material.points, self.file[f"images/{view}/centerline_px"].shape[1],
+            material.points, self.image_centerline_samples,
             smooth_window=1)
-        self.file[f"images/{view}/centerline_px"][index] = sampled
         boundary = int(np.clip(
             material.distal_boundary_index, 0, len(material.points) - 1))
-        self.file[f"images/{view}/distal_boundary_px"][index] = material.points[boundary]
-        self.file[f"images/{view}/sam_iou"][index] = result.sam_iou
-        self.file[f"images/{view}/selection_score"][index] = result.selection_score
-        self.file[f"images/{view}/seed_recall"][index] = result.seed_recall
-        self.file[f"images/{view}/mask_area_px"][index] = result.mask_area_px
-        self.file[f"images/{view}/prompt_source"][index] = result.prompt.source
-        self.file[f"images/{view}/prompt_box_xyxy"][index] = result.prompt.box_xyxy
         positive_count = min(16, len(result.prompt.positive_xy))
         negative_count = min(16, len(result.prompt.negative_xy))
+        positive = np.full((16, 2), np.nan, dtype=np.float32)
+        negative = np.full((16, 2), np.nan, dtype=np.float32)
         if positive_count:
-            self.file[f"images/{view}/prompt_positive_px"][
-                index, :positive_count] = result.prompt.positive_xy[:positive_count]
+            positive[:positive_count] = result.prompt.positive_xy[:positive_count]
         if negative_count:
-            self.file[f"images/{view}/prompt_negative_px"][
-                index, :negative_count] = result.prompt.negative_xy[:negative_count]
-        self.file[f"images/{view}/prompt_positive_count"][index] = positive_count
-        self.file[f"images/{view}/prompt_negative_count"][index] = negative_count
+            negative[:negative_count] = result.prompt.negative_xy[:negative_count]
+        output.update({
+            f"images/{view}/centerline_px": sampled,
+            f"images/{view}/distal_boundary_px": material.points[boundary].copy(),
+            f"images/{view}/sam_iou": float(result.sam_iou),
+            f"images/{view}/selection_score": float(result.selection_score),
+            f"images/{view}/seed_recall": float(result.seed_recall),
+            f"images/{view}/mask_area_px": int(result.mask_area_px),
+            f"images/{view}/prompt_source": result.prompt.source,
+            f"images/{view}/prompt_box_xyxy": result.prompt.box_xyxy.copy(),
+            f"images/{view}/prompt_positive_px": positive,
+            f"images/{view}/prompt_negative_px": negative,
+            f"images/{view}/prompt_positive_count": positive_count,
+            f"images/{view}/prompt_negative_count": negative_count,
+        })
         if result.yellow_tip_xy is not None:
-            self.file[f"images/{view}/yellow_tip_px"][index] = result.yellow_tip_xy
+            output[f"images/{view}/yellow_tip_px"] = result.yellow_tip_xy.copy()
 
     def write_success(
             self,
@@ -622,37 +977,78 @@ class ImageSequenceWriter:
             assembled: AssembledShape,
             full_geometry,
             distal_geometry,
-            metrics: dict) -> None:
+            metrics: dict,
+            raw_interface_base_mm: np.ndarray | None = None,
+            visible_points_base_mm: np.ndarray | None = None,
+            reconstruction: dict | None = None) -> None:
+        output = self._record(index)
         for name, shape, geometry in (
                 ("full", assembled, full_geometry),
                 ("distal", assembled, distal_geometry)):
             prefix = "full" if name == "full" else "distal"
-            self.file[f"{prefix}/points_base_mm"][index] = geometry.points_mm
-            self.file[f"{prefix}/s_mm"][index] = cumulative_arclength(
+            output[f"{prefix}/points_base_mm"] = geometry.points_mm.copy()
+            output[f"{prefix}/s_mm"] = cumulative_arclength(
                 geometry.points_mm)
-            self.file[f"{prefix}/tangent_base"][index] = geometry.tangent
-            self.file[f"{prefix}/curvature_per_mm"][index] = geometry.curvature_per_mm
-            self.file[f"{prefix}/observation_class"][index] = getattr(
-                shape, f"{prefix}_observation_class")
-        self.file["distal/base_position_base_mm"][index] = distal_geometry.points_mm[0]
+            output[f"{prefix}/tangent_base"] = geometry.tangent.copy()
+            output[f"{prefix}/curvature_per_mm"] = (
+                geometry.curvature_per_mm.copy())
+            output[f"{prefix}/observation_class"] = getattr(
+                shape, f"{prefix}_observation_class").copy()
+        output["distal/base_position_base_mm"] = (
+            distal_geometry.points_mm[0].copy())
+        if raw_interface_base_mm is not None:
+            output["distal/raw_base_position_base_mm"] = (
+                np.asarray(raw_interface_base_mm).copy())
+        if visible_points_base_mm is not None:
+            output["stereo/visible_points_base_mm"] = np.asarray(
+                visible_points_base_mm).copy()
+            output["stereo/causal_visible_points_base_mm"] = np.asarray(
+                visible_points_base_mm).copy()
+        if reconstruction is not None:
+            for name in (
+                    "ordered_left_px", "ordered_right_px",
+                    "fitted_disparity_px"):
+                output[f"stereo/{name}"] = np.asarray(
+                    reconstruction[name]).copy()
         self.write_metrics(index, metrics)
-        self.file["frames/valid"][index] = 1
-        self.file["frames/status"][index] = "valid"
+        output["frames/valid"] = 1
+        output["frames/status"] = "valid"
+        self._finalize_record(index)
 
     def write_metrics(self, index: int, metrics: dict) -> None:
+        output = self._record(index)
         for name, value in metrics.items():
             path = f"quality/{name}"
-            if path in self.file:
-                self.file[path][index] = value
+            if path in self.dataset_paths:
+                output[path] = self._copy_value(value)
 
     def write_failure(self, index: int, status: str, metrics: dict | None = None) -> None:
+        output = self._record(index)
         if metrics:
             self.write_metrics(index, metrics)
-        self.file["frames/valid"][index] = 0
-        self.file["frames/status"][index] = status
+        output["frames/valid"] = 0
+        output["frames/status"] = status
+        self._finalize_record(index)
 
     def close(self) -> None:
-        self.file.close()
+        unfinished = sorted(self._pending)
+        for index in unfinished:
+            output = self._record(index)
+            output["frames/valid"] = 0
+            output["frames/status"] = "hdf_writer_closed_before_frame_finalized"
+            self._finalize_record(index)
+        try:
+            self._flush_staging()
+            self._queue_put(self._END)
+            self._writer_thread.join()
+            self._check_writer()
+        finally:
+            if self._writer_error is not None:
+                self._writer_thread.join()
+            self.file.close()
+        if unfinished:
+            raise RuntimeError(
+                f"HDF5 writer closed with unfinished frames: {unfinished[:5]}")
 
 
 class OverlayWriter:
@@ -707,6 +1103,128 @@ class OverlayWriter:
     def close(self) -> None:
         for writer in self.writers.values():
             writer.release()
+
+
+def _write_final_overlay_video(
+        session: Path,
+        output: Path,
+        records: list[FrameRecord],
+        registration,
+        mask_h5: Path,
+        fps: float,
+        scale: float) -> None:
+    """Render overlays after the non-causal interface pass has finalized."""
+    import h5py
+
+    overlay = OverlayWriter(output, fps, scale, enabled=True)
+    cache = PropagatedMaskCache(mask_h5, records)
+    base_left = project_points(
+        registration.K, registration.left_camera_T_base,
+        np.zeros(3, dtype=np.float64))[0][0]
+    base_right = project_points(
+        registration.K, registration.right_camera_T_base,
+        np.zeros(3, dtype=np.float64))[0][0]
+    try:
+        with h5py.File(output / "processed_shapes.h5", "r") as shapes, (
+                SvoReader(find_svo(session))) as svo:
+            valid = shapes["frames/valid"][:].astype(bool)
+            shape_supported = (
+                shapes["quality/shape_temporal_supported"][:].astype(bool)
+                if "quality/shape_temporal_supported" in shapes
+                else valid.copy())
+            statuses = shapes["frames/status"][:]
+            for index, record in enumerate(records):
+                _, left_image, right_image = svo.read(record.svo_frame)
+                status_value = statuses[index]
+                status = (
+                    status_value.decode() if isinstance(status_value, bytes)
+                    else str(status_value))
+                for view, image, roi, base_point in (
+                        ("left", left_image, registration.roi_left_xywh,
+                         base_left),
+                        ("right", right_image, registration.roi_right_xywh,
+                         base_right)):
+                    try:
+                        result = cache.result(
+                            index, view, image, roi, base_point)
+                    except (RuntimeError, ValueError):
+                        result = None
+                    projected = boundary = None
+                    if valid[index] and shape_supported[index] and result is not None:
+                        points = shapes["distal/points_base_mm"][index]
+                        projected = _project_base_points(
+                            registration, points, view == "right")
+                        boundary = projected[0]
+                        boundary_index = int(np.argmin(np.linalg.norm(
+                            result.material.points - boundary, axis=1)))
+                        result = replace(result, material=replace(
+                            result.material,
+                            distal_boundary_index=boundary_index,
+                            distal_boundary_fraction=float(
+                                boundary_index
+                                / max(len(result.material.points) - 1, 1))))
+                    overlay.write(
+                        view, image, result, projected, boundary, status)
+    finally:
+        cache.close()
+        overlay.close()
+
+
+def _refresh_final_geometry_metrics(path: Path, registration) -> None:
+    """Make stored reprojection diagnostics describe the final distal curve."""
+    import h5py
+
+    with h5py.File(path, "r+") as output:
+        valid = output["frames/valid"][:].astype(bool)
+        if "quality/shape_temporal_supported" in output:
+            valid &= output[
+                "quality/shape_temporal_supported"][:].astype(bool)
+        count = len(valid)
+
+        def dataset(name: str):
+            if name in output:
+                return output[name]
+            return output.create_dataset(
+                name, shape=(count,), dtype=np.float32, fillvalue=np.nan,
+                compression="gzip", compression_opts=1, shuffle=True)
+
+        terminal_left = dataset(
+            "quality/final_terminal_reprojection_left_px")
+        terminal_right = dataset(
+            "quality/final_terminal_reprojection_right_px")
+        for index in np.flatnonzero(valid):
+            points = output["distal/points_base_mm"][index]
+            projected_views = []
+            distances = []
+            means = []
+            terminal = []
+            for view, right in (("left", False), ("right", True)):
+                projected = _project_base_points(
+                    registration, points, right=right)
+                centerline = output[f"images/{view}/centerline_px"][index]
+                centerline = centerline[np.all(np.isfinite(centerline), axis=1)]
+                distance = np.min(np.linalg.norm(
+                    projected[:, None, :] - centerline[None, :, :], axis=2),
+                    axis=1)
+                projected_views.append(projected)
+                distances.append(distance)
+                means.append(float(np.mean(distance)))
+                terminal.append(float(np.mean(distance[-8:])))
+            combined = np.concatenate(distances)
+            output["quality/fitted_reprojection_left_px"][index] = means[0]
+            output["quality/fitted_reprojection_right_px"][index] = means[1]
+            output["quality/fitted_reprojection_max_px"][index] = float(
+                np.max(combined))
+            output["quality/fitted_reprojection_p95_px"][index] = float(
+                np.percentile(combined, 95))
+            terminal_left[index], terminal_right[index] = terminal
+            for view_index, view in enumerate(("left", "right")):
+                yellow = output[f"images/{view}/yellow_tip_px"][index]
+                error = (
+                    float(np.linalg.norm(projected_views[view_index][-1] - yellow))
+                    if np.all(np.isfinite(yellow)) else float("nan"))
+                output[f"quality/tip_endpoint_{view}_px"][index] = error
+        output.flush()
 
 
 def _apply_distal_boundary_prior(
@@ -1174,6 +1692,12 @@ def process_image_session(
     median_period_s = (
         float(np.median(np.diff(query_ns))) * 1e-9 if len(query_ns) > 1 else 1 / 30)
     output_fps = float(np.clip(1.0 / max(median_period_s, 1e-6), 1.0, 60.0))
+    defer_final_overlay = bool(
+        write_video and (
+            config.interface_offline_cutoff_hz > 0.0
+            or config.stereo_offline_cutoff_hz > 0.0)
+        and (config.store_masks
+             or segmentation_backend in ("cached", "propagated")))
     checkpoint = Path(sam_checkpoint).resolve()
     metadata = {
         "session": session.name,
@@ -1203,7 +1727,9 @@ def process_image_session(
                   indent=2, sort_keys=True)
 
     segmenter = (
-        Sam2CatheterSegmenter(sam_config, checkpoint, device=device)
+        Sam2CatheterSegmenter(
+            sam_config, checkpoint, device=device,
+            postprocess_workers=config.sam_postprocess_workers)
         if segmentation_backend == "sam" else None)
     propagated_cache = (
         PropagatedMaskCache(
@@ -1213,7 +1739,9 @@ def process_image_session(
     writer = ImageSequenceWriter(
         output / "processed_shapes.h5", len(records), config,
         registration, metadata)
-    overlay = OverlayWriter(output, output_fps, config.video_scale, write_video)
+    overlay = OverlayWriter(
+        output, output_fps, config.video_scale,
+        write_video and not defer_final_overlay)
     base_mm = np.zeros(3, dtype=np.float64)
     base_left = project_points(
         registration.K, registration.left_camera_T_base, base_mm)[0][0]
@@ -1231,8 +1759,14 @@ def process_image_session(
     previous_valid_timestamp_ns: int | None = None
     previous_stereo_reference_view: str | None = None
     previous_fitted_disparity_px: np.ndarray | None = None
+    previous_reconstructed_camera_m: np.ndarray | None = None
+    previous_interface_base_mm: np.ndarray | None = None
+    previous_distal_length_mm: float | None = None
     previous_filtered_distal_points: np.ndarray | None = None
     background_prefetch: _BackgroundPrefetch | None = None
+    interface_smoothing_summary: dict[str, float] = {}
+    stereo_smoothing_summary: dict[str, float] = {}
+    spline_temporal_smoothing_summary: dict[str, float] = {}
 
     try:
         svo_open_started = time.perf_counter()
@@ -1427,6 +1961,25 @@ def process_image_session(
                         left_result.material.points)[-1])
                     right_length_px = float(cumulative_arclength(
                         right_result.material.points)[-1])
+                    if (previous_valid_results is not None
+                            and 0.0 < temporal_gap_ms
+                            <= config.max_temporal_prompt_gap_ms):
+                        left_coverage, left_temporal_p95 = (
+                            _temporal_centerline_metrics(
+                                previous_valid_results[0].material.points,
+                                left_result.material.points,
+                                config.temporal_centerline_tolerance_px))
+                        right_coverage, right_temporal_p95 = (
+                            _temporal_centerline_metrics(
+                                previous_valid_results[1].material.points,
+                                right_result.material.points,
+                                config.temporal_centerline_tolerance_px))
+                        metrics.update({
+                            "temporal_centerline_coverage_left": left_coverage,
+                            "temporal_centerline_coverage_right": right_coverage,
+                            "temporal_centerline_p95_left_px": left_temporal_p95,
+                            "temporal_centerline_p95_right_px": right_temporal_p95,
+                        })
                     centerline_length_ratio = max(
                         left_length_px, right_length_px) / max(
                             min(left_length_px, right_length_px), 1e-9)
@@ -1568,6 +2121,37 @@ def process_image_session(
                         "stereo_retry_used": int(stereo_retry_view != 0),
                         "stereo_retry_view": stereo_retry_view,
                     })
+                    if (previous_valid_results is not None
+                            and 0.0 < temporal_gap_ms
+                            <= config.max_temporal_prompt_gap_ms):
+                        for view, current, previous, length in (
+                                ("left", left_result, previous_valid_results[0],
+                                 left_length_px),
+                                ("right", right_result, previous_valid_results[1],
+                                 right_length_px)):
+                            coverage, temporal_p95 = _temporal_centerline_metrics(
+                                previous.material.points,
+                                current.material.points,
+                                config.temporal_centerline_tolerance_px)
+                            previous_length = float(cumulative_arclength(
+                                previous.material.points)[-1])
+                            metrics[f"temporal_centerline_coverage_{view}"] = coverage
+                            metrics[f"temporal_centerline_p95_{view}_px"] = temporal_p95
+                            collapsed = length < 0.80 * previous_length
+                            displaced = (
+                                coverage < config.min_temporal_centerline_coverage
+                                and temporal_p95
+                                > config.max_temporal_centerline_p95_px)
+                            if ((collapsed and (
+                                    coverage
+                                    < config.min_temporal_centerline_coverage
+                                    or temporal_p95
+                                    > config.max_temporal_centerline_p95_px))
+                                    or displaced):
+                                raise ValueError(
+                                    f"temporal_{view}_mask_inconsistent:"
+                                    f"coverage={coverage:.2f},"
+                                    f"length_ratio={length / max(previous_length, 1e-9):.2f}")
                     frame_timing_s["quality_control"] += (
                         time.perf_counter() - stage_started)
                     if (centerline_length_ratio
@@ -1576,59 +2160,138 @@ def process_image_session(
                             "stereo_centerline_length_mismatch:"
                             f"ratio={centerline_length_ratio:.2f}")
                     stage_started = time.perf_counter()
-                    if previous_stereo_reference_view is None:
-                        reference_view = (
-                            "left" if left_length_px >= right_length_px
-                            else "right")
-                    else:
-                        reference_view = previous_stereo_reference_view
-                        switch_ratio = max(
-                            config.stereo_reference_switch_ratio, 1.0)
-                        if (reference_view == "left"
-                                and right_length_px
-                                > switch_ratio * left_length_px):
-                            reference_view = "right"
-                        elif (reference_view == "right"
-                                and left_length_px
-                                > switch_ratio * right_length_px):
-                            reference_view = "left"
-                    left_tip_observed = bool(
-                        left_result.yellow_tip_xy is not None
-                        and np.all(np.isfinite(left_result.yellow_tip_xy)))
-                    right_tip_observed = bool(
-                        right_result.yellow_tip_xy is not None
-                        and np.all(np.isfinite(right_result.yellow_tip_xy)))
-                    # With only one explicit cap observation, make that view the
-                    # ordered reference so its terminal pixel is preserved
-                    # exactly; depth still comes from the opposite centerline.
-                    if left_tip_observed != right_tip_observed:
-                        reference_view = "left" if left_tip_observed else "right"
                     tip_camera_m, tip_epipolar_error_px = (
                         _stereo_tip_camera_point(
                             left_result.yellow_tip_xy,
                             right_result.yellow_tip_xy,
                             registration.K, registration.baseline_m,
                             config.max_tip_epipolar_error_px))
-                    reconstruction = reconstruct_disparity_anchored(
-                        left_result.material.centerline,
-                        right_result.material.centerline,
-                        registration.K, registration.baseline_m,
-                        base_camera_m, tip_camera_m,
-                        n_samples=config.stereo_samples,
-                        smooth_2d=config.smooth_2d,
-                        disparity_first_difference_weight=(
-                            config.disparity_first_difference_weight),
-                        disparity_second_difference_weight=(
-                            config.disparity_second_difference_weight),
-                        disparity_huber_delta_px=config.disparity_huber_delta_px,
-                        reference_view=reference_view,
-                        disparity_prior_px=(
-                            previous_fitted_disparity_px
-                            if temporal_gap_ms <= config.max_temporal_prompt_gap_ms
-                            else None),
-                        disparity_prior_weight=config.temporal_disparity_weight)
+                    candidates = {}
+                    candidate_details = {}
+                    disparity_prior_available = bool(
+                        previous_fitted_disparity_px is not None
+                        and temporal_gap_ms
+                        <= config.temporal_disparity_max_gap_ms)
+                    disparity_prior_weight = (
+                        config.temporal_disparity_weight * np.exp(
+                            -max(temporal_gap_ms, 0.0)
+                            / max(config.temporal_disparity_decay_ms, 1e-6))
+                        if disparity_prior_available else 0.0)
+                    for candidate_view in ("left", "right"):
+                        try:
+                            candidate = reconstruct_disparity_anchored(
+                                left_result.material.centerline,
+                                right_result.material.centerline,
+                                registration.K, registration.baseline_m,
+                                base_camera_m, tip_camera_m,
+                                n_samples=config.stereo_samples,
+                                smooth_2d=config.smooth_2d,
+                                disparity_first_difference_weight=(
+                                    config.disparity_first_difference_weight),
+                                disparity_second_difference_weight=(
+                                    config.disparity_second_difference_weight),
+                                disparity_huber_delta_px=(
+                                    config.disparity_huber_delta_px),
+                                reference_view=candidate_view,
+                                disparity_prior_px=(
+                                    previous_fitted_disparity_px
+                                    if disparity_prior_available
+                                    else None),
+                                disparity_prior_weight=(
+                                    disparity_prior_weight),
+                                overlap_aware=(
+                                    config.overlap_aware_reconstruction),
+                                overlap_row_search_px=(
+                                    config.overlap_row_search_px),
+                                overlap_self_fraction_threshold=(
+                                    config.overlap_self_fraction_threshold),
+                                overlap_self_distance_px=(
+                                    config.overlap_self_distance_px),
+                                overlap_min_arclength_separation=(
+                                    config.overlap_min_arclength_separation),
+                                centerline_tip_depth_weight=(
+                                    config.centerline_tip_depth_weight),
+                                max_centerline_tip_epipolar_error_px=(
+                                    config.max_centerline_tip_epipolar_error_px),
+                                terminal_refinement=(
+                                    config.terminal_disparity_refinement),
+                                terminal_refinement_fraction=(
+                                    config.terminal_disparity_fraction),
+                                terminal_refinement_smoothness_scale=(
+                                    config.terminal_disparity_smoothness_scale),
+                                terminal_refinement_observation_weight=(
+                                    config.terminal_disparity_observation_weight),
+                                terminal_refinement_tip_weight=(
+                                    config.terminal_disparity_tip_weight),
+                                terminal_refinement_max_p95_degradation_px=(
+                                    config.terminal_disparity_max_p95_degradation_px))
+                            score, details = _stereo_candidate_score(
+                                candidate, candidate_view,
+                                left_length_px, right_length_px,
+                                previous_reconstructed_camera_m if (
+                                    temporal_gap_ms
+                                    <= config.max_temporal_prompt_gap_ms)
+                                else None,
+                                previous_stereo_reference_view)
+                            candidates[candidate_view] = (score, candidate)
+                            candidate_details[candidate_view] = details
+                        except (ArithmeticError, RuntimeError, ValueError,
+                                np.linalg.LinAlgError):
+                            continue
+                    reference_view = _select_stereo_reference(
+                        candidates, previous_stereo_reference_view,
+                        config.stereo_reference_hysteresis_score)
+                    reconstruction = candidates[reference_view][1]
+                    left_score = (
+                        candidates["left"][0] if "left" in candidates
+                        else float("nan"))
+                    right_score = (
+                        candidates["right"][0] if "right" in candidates
+                        else float("nan"))
+                    metrics.update({
+                        "stereo_candidate_score_left": left_score,
+                        "stereo_candidate_score_right": right_score,
+                        "stereo_candidate_margin": (
+                            abs(left_score - right_score)
+                            if np.isfinite(left_score) and np.isfinite(right_score)
+                            else float("nan")),
+                        "stereo_candidate_temporal_rms_left_mm": (
+                            candidate_details.get("left", {}).get(
+                                "temporal_rms_mm", float("nan"))),
+                        "stereo_candidate_temporal_rms_right_mm": (
+                            candidate_details.get("right", {}).get(
+                                "temporal_rms_mm", float("nan"))),
+                        "stereo_epipolar_ambiguity_left": (
+                            candidates.get("left", (None, {}))[1].get(
+                                "epipolar_ambiguity_fraction", float("nan"))),
+                        "stereo_epipolar_ambiguity_right": (
+                            candidates.get("right", (None, {}))[1].get(
+                                "epipolar_ambiguity_fraction", float("nan"))),
+                        "stereo_other_eye_self_overlap_left": (
+                            candidates.get("left", (None, {}))[1].get(
+                                "other_eye_self_overlap_fraction", float("nan"))),
+                        "stereo_other_eye_self_overlap_right": (
+                            candidates.get("right", (None, {}))[1].get(
+                                "other_eye_self_overlap_fraction", float("nan"))),
+                    })
                     metrics["stereo_reference_view"] = (
                         1 if reference_view == "left" else 2)
+                    metrics["overlap_aware_used"] = int(
+                        reconstruction["overlap_aware_used"])
+                    metrics["centerline_tip_anchor_used"] = int(
+                        reconstruction["centerline_tip_anchor_used"])
+                    metrics["centerline_tip_epipolar_error_px"] = (
+                        reconstruction["centerline_tip_epipolar_error_px"])
+                    metrics["terminal_refinement_used"] = int(
+                        reconstruction["terminal_refinement_used"])
+                    metrics["terminal_refinement_improvement_px"] = (
+                        reconstruction["terminal_refinement_improvement_px"])
+                    metrics["terminal_refinement_start_fraction"] = (
+                        reconstruction["terminal_refinement_start_fraction"])
+                    metrics["terminal_reprojection_left_px"] = (
+                        reconstruction["terminal_reprojection_left_px"])
+                    metrics["terminal_reprojection_right_px"] = (
+                        reconstruction["terminal_reprojection_right_px"])
                     metrics["tip_stereo_observed"] = int(
                         tip_camera_m is not None)
                     metrics["tip_epipolar_error_px"] = (
@@ -1702,17 +2365,15 @@ def process_image_session(
                             axis=1))))
                         boundary_weights.append(max(
                             right_result.material.boundary_confidence, 1e-3))
-                    # The physical distal material length is known. Color is
-                    # useful evidence, but short dark markings and view-specific
-                    # occlusion make it unsuitable as a hard geometry anchor.
-                    # Keep its agreement as a diagnostic and define the actual
-                    # transition at exactly 60 mm back from the observed tip.
                     boundary_observed = bool(boundary_indices)
                     boundary_stereo_consistent = bool(
                         boundary_observed and (
                             len(boundary_indices) < 2
                             or abs(boundary_indices[0] - boundary_indices[1])
                             <= max(6, config.stereo_samples // 8)))
+                    observed_lengths_mm = [
+                        float(visible_length_mm - reconstructed_s_mm[index])
+                        for index in boundary_indices]
                     if boundary_observed:
                         observed_sample = int(np.clip(round(np.average(
                             boundary_indices, weights=boundary_weights)),
@@ -1728,6 +2389,55 @@ def process_image_session(
                         observed_distal_length_mm = float("nan")
                         color_fraction = float("nan")
                         boundary_prior_error_mm = float("nan")
+                    raw_distal_length_mm, fused_distal_length_mm, (
+                        interface_uncertainty_mm) = _fuse_distal_length(
+                            config.distal_length_mm,
+                            observed_lengths_mm, boundary_weights,
+                            previous_distal_length_mm if (
+                                temporal_gap_ms
+                                <= config.max_temporal_prompt_gap_ms)
+                            else None,
+                            config.distal_length_prior_sigma_mm,
+                            config.interface_color_sigma_mm,
+                            config.interface_temporal_sigma_mm)
+                    raw_interface_s_mm = float(np.clip(
+                        visible_length_mm - raw_distal_length_mm,
+                        0.0, visible_length_mm))
+                    fused_interface_s_mm = float(np.clip(
+                        visible_length_mm - fused_distal_length_mm,
+                        0.0, visible_length_mm))
+
+                    visible_base_mm = _base_points_from_camera(
+                        registration.left_camera_T_base,
+                        reconstruction["points_camera_m"])
+                    raw_interface_base_mm = _point_at_arclength(
+                        visible_base_mm, raw_interface_s_mm)
+                    interface_temporal_alpha = 1.0
+                    filtered_interface_s_mm = fused_interface_s_mm
+                    if (previous_interface_base_mm is not None
+                            and 0.0 < temporal_gap_ms
+                            <= config.max_temporal_prompt_gap_ms
+                            and config.interface_temporal_cutoff_hz > 0.0):
+                        projected_previous_s_mm = _project_point_to_polyline_s(
+                            visible_base_mm, previous_interface_base_mm,
+                            fused_interface_s_mm,
+                            config.interface_projection_window_mm)
+                        dt_s = max(temporal_gap_ms * 1e-3, 1e-6)
+                        interface_temporal_alpha = float(
+                            1.0 - np.exp(
+                                -2.0 * np.pi
+                                * config.interface_temporal_cutoff_hz * dt_s))
+                        filtered_interface_s_mm = float(
+                            interface_temporal_alpha * fused_interface_s_mm
+                            + (1.0 - interface_temporal_alpha)
+                            * projected_previous_s_mm)
+                    filtered_interface_s_mm = float(np.clip(
+                        filtered_interface_s_mm, 0.0, visible_length_mm))
+                    filtered_distal_length_mm = float(
+                        visible_length_mm - filtered_interface_s_mm)
+                    target_fraction = float(np.interp(
+                        filtered_interface_s_mm,
+                        reconstructed_s_mm, parameter))
                     boundary_sample = int(np.clip(round(
                         target_fraction * (config.stereo_samples - 1)),
                         1, config.stereo_samples - 2))
@@ -1765,9 +2475,6 @@ def process_image_session(
                         time.perf_counter() - stage_started)
 
                     stage_started = time.perf_counter()
-                    visible_base_mm = _base_points_from_camera(
-                        registration.left_camera_T_base,
-                        reconstruction["points_camera_m"])
                     base_endpoint_distance_mm = float(np.linalg.norm(
                         visible_base_mm[0] - base_mm))
                     metrics["base_endpoint_distance_mm"] = (
@@ -1783,7 +2490,7 @@ def process_image_session(
                         distal_count=config.distal_samples,
                         base_position_base_mm=base_mm,
                         bridge_base=False,
-                        distal_length_mm=config.distal_length_mm)
+                        distal_length_mm=filtered_distal_length_mm)
                     full_geometry = curve_geometry(
                         assembled.full_points_mm, config.curvature_smoothing_mm,
                         config.curvature_spline_bases)
@@ -1842,6 +2549,15 @@ def process_image_session(
                         "material_boundary_prior_error_mm": boundary_prior_error_mm,
                         "material_boundary_observed_distal_length_mm": (
                             observed_distal_length_mm),
+                        "distal_length_raw_mm": raw_distal_length_mm,
+                        "distal_length_filtered_mm": filtered_distal_length_mm,
+                        "distal_length_residual_mm": (
+                            filtered_distal_length_mm
+                            - config.distal_length_mm),
+                        "interface_uncertainty_mm": interface_uncertainty_mm,
+                        "interface_raw_s_mm": raw_interface_s_mm,
+                        "interface_filtered_s_mm": filtered_interface_s_mm,
+                        "interface_temporal_alpha": interface_temporal_alpha,
                         "material_boundary_confidence": boundary_confidence,
                         "material_boundary_contrast": boundary_contrast,
                         "material_boundary_observed": int(boundary_observed),
@@ -1906,7 +2622,10 @@ def process_image_session(
                     writer.write_view(index, "left", left_result)
                     writer.write_view(index, "right", right_result)
                     writer.write_success(
-                        index, assembled, full_geometry, distal_geometry, metrics)
+                        index, assembled, full_geometry, distal_geometry, metrics,
+                        raw_interface_base_mm=raw_interface_base_mm,
+                        visible_points_base_mm=visible_base_mm,
+                        reconstruction=reconstruction)
                     frame_timing_s["hdf5_write"] += (
                         time.perf_counter() - stage_started)
                     previous_valid_results = (left_result, right_result)
@@ -1914,6 +2633,11 @@ def process_image_session(
                     previous_stereo_reference_view = reference_view
                     previous_fitted_disparity_px = reconstruction[
                         "fitted_disparity_px"].copy()
+                    previous_reconstructed_camera_m = reconstruction[
+                        "points_camera_m"].copy()
+                    previous_interface_base_mm = (
+                        distal_geometry.points_mm[0].copy())
+                    previous_distal_length_mm = filtered_distal_length_mm
                     previous_filtered_distal_points = (
                         distal_geometry.points_mm.copy())
                 except (ArithmeticError, RuntimeError, ValueError,
@@ -1999,13 +2723,132 @@ def process_image_session(
         finalize_started = time.perf_counter()
         if background_prefetch is not None:
             background_prefetch.close()
-        writer.close()
-        overlay.close()
-        if propagated_cache is not None:
-            propagated_cache.close()
-        timing_totals_s["output_finalize"] = (
-            timing_totals_s.get("output_finalize", 0.0)
-            + time.perf_counter() - finalize_started)
+        try:
+            writer.close()
+            if config.stereo_offline_cutoff_hz > 0.0:
+                smoothing_started = time.perf_counter()
+                stereo_smoothing_summary = smooth_stereo_disparity_hdf5(
+                    output / "processed_shapes.h5", registration,
+                    cutoff_hz=config.stereo_offline_cutoff_hz,
+                    huber_delta_px=config.stereo_offline_huber_delta_px,
+                    maximum_gap_ms=config.temporal_disparity_max_gap_ms,
+                    curvature_smoothing_mm=config.curvature_smoothing_mm,
+                    curvature_spline_bases=config.curvature_spline_bases)
+                timing_totals_s["stereo_offline_smoothing"] = (
+                    time.perf_counter() - smoothing_started)
+            if config.interface_offline_cutoff_hz > 0.0:
+                smoothing_started = time.perf_counter()
+                interface_smoothing_summary = smooth_interface_hdf5(
+                    output / "processed_shapes.h5",
+                    cutoff_hz=config.interface_offline_cutoff_hz,
+                    huber_delta_mm=config.interface_offline_huber_delta_mm,
+                    iterations=config.interface_offline_iterations,
+                    maximum_gap_ms=config.max_temporal_prompt_gap_ms,
+                    curvature_smoothing_mm=config.curvature_smoothing_mm,
+                    curvature_spline_bases=config.curvature_spline_bases,
+                    nominal_distal_length_mm=config.distal_length_mm,
+                    length_gate_mm=config.interface_length_gate_mm,
+                    session_prior_relative_weight=(
+                        config.interface_session_prior_relative_weight))
+                timing_totals_s["interface_offline_smoothing"] = (
+                    time.perf_counter() - smoothing_started)
+            if config.spline_temporal_cutoff_hz > 0.0:
+                smoothing_started = time.perf_counter()
+                spline_temporal_smoothing_summary = (
+                    smooth_distal_spline_coefficients_hdf5(
+                        output / "processed_shapes.h5",
+                        cutoff_hz=config.spline_temporal_cutoff_hz,
+                        huber_delta_mm=(
+                            config.spline_temporal_huber_delta_mm),
+                        iterations=config.spline_temporal_iterations,
+                        maximum_gap_ms=config.spline_temporal_max_gap_ms,
+                        basis_count=config.curvature_spline_bases,
+                        terminal_cutoff_hz=(
+                            config.spline_temporal_terminal_cutoff_hz),
+                        terminal_basis_count=(
+                            config.spline_temporal_terminal_basis_count),
+                        outlier_sigma=(
+                            config.spline_temporal_outlier_sigma),
+                        outlier_floor_mm=(
+                            config.spline_temporal_outlier_floor_mm),
+                        frame_outlier_fraction=(
+                            config.spline_temporal_frame_outlier_fraction),
+                        terminal_outlier_sample_count=(
+                            config.spline_temporal_terminal_outlier_samples),
+                        max_learning_mask_width_px=(
+                            config.max_mask_effective_width_px)))
+                timing_totals_s["spline_temporal_smoothing"] = (
+                    time.perf_counter() - smoothing_started)
+            metrics_started = time.perf_counter()
+            _refresh_final_geometry_metrics(
+                output / "processed_shapes.h5", registration)
+            timing_totals_s["final_geometry_metrics"] = (
+                time.perf_counter() - metrics_started)
+        finally:
+            timing_totals_s["hdf5_write_background"] = writer.write_time_s
+            overlay.close()
+            if segmenter is not None:
+                segmenter.close()
+            if propagated_cache is not None:
+                propagated_cache.close()
+            timing_totals_s["output_finalize"] = (
+                timing_totals_s.get("output_finalize", 0.0)
+                + time.perf_counter() - finalize_started)
+
+    if interface_smoothing_summary:
+        import h5py
+        with h5py.File(output / "processed_shapes.h5", "r") as smoothed_file:
+            smoothed_fields = (
+                "distal_length_smoothed_mm", "interface_smoothed_s_mm",
+                "interface_smoothing_adjustment_mm",
+                "interface_smoothing_weight")
+            values = {
+                name: smoothed_file[f"quality/{name}"][:]
+                for name in smoothed_fields}
+        for index, row in enumerate(summary_rows):
+            for name in smoothed_fields:
+                row[name] = values[name][index]
+
+    if spline_temporal_smoothing_summary:
+        import h5py
+        with h5py.File(output / "processed_shapes.h5", "r") as smoothed_file:
+            smoothed_fields = (
+                "shape_coefficient_innovation_rms_mm",
+                "shape_temporal_adjustment_rms_mm",
+                "shape_temporal_outlier_fraction",
+                "shape_temporal_frame_outlier",
+                "shape_temporal_supported",
+                "shape_temporal_terminal_outlier",
+                "shape_temporal_long_gap_unsupported",
+                "mask_width_learning_rejected")
+            values = {
+                name: smoothed_file[f"quality/{name}"][:]
+                for name in smoothed_fields}
+            learning_valid = smoothed_file["frames/learning_valid"][:]
+            rejection_flags = smoothed_file[
+                "frames/learning_rejection_flags"][:]
+        for index, row in enumerate(summary_rows):
+            for name in smoothed_fields:
+                row[name] = values[name][index]
+            row["learning_valid"] = int(learning_valid[index])
+            row["learning_rejection_flags"] = int(rejection_flags[index])
+
+    if defer_final_overlay:
+        overlay_started = time.perf_counter()
+        if config.store_masks:
+            final_mask_h5 = output / "processed_shapes.h5"
+        elif segmentation_backend == "cached":
+            final_mask_h5 = Path(cached_mask_h5).resolve()
+        elif segmentation_backend == "propagated":
+            final_mask_h5 = Path(propagated_mask_h5).resolve()
+        else:
+            raise ValueError(
+                "final smoothed overlay requires stored or cached masks")
+        _write_final_overlay_video(
+            session, output, records, registration, final_mask_h5,
+            output_fps, config.video_scale)
+        timing_totals_s["overlay_video_final"] = (
+            time.perf_counter() - overlay_started)
 
     fieldnames = []
     for row in summary_rows:
@@ -2041,6 +2884,9 @@ def process_image_session(
             for key, value in sorted(timing_totals_s.items())
         },
         "output_fps": output_fps,
+        "interface_smoothing": interface_smoothing_summary,
+        "stereo_smoothing": stereo_smoothing_summary,
+        "spline_temporal_smoothing": spline_temporal_smoothing_summary,
     }
     with (output / "processing_summary.json").open("w", encoding="utf-8") as stream:
         json.dump(summary, stream, indent=2, sort_keys=True)
@@ -2078,8 +2924,68 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disparity-second-difference-weight", type=float, default=10.0)
     parser.add_argument("--disparity-huber-delta-px", type=float, default=1.5)
     parser.add_argument("--temporal-disparity-weight", type=float, default=2.0)
+    parser.add_argument("--temporal-disparity-max-gap-ms", type=float, default=1000.0)
+    parser.add_argument("--temporal-disparity-decay-ms", type=float, default=500.0)
+    parser.add_argument("--stereo-reference-hysteresis-score", type=float, default=3.0)
+    parser.add_argument(
+        "--overlap-aware-reconstruction",
+        action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--overlap-row-search-px", type=int, default=2)
+    parser.add_argument(
+        "--overlap-self-fraction-threshold", type=float, default=0.05)
+    parser.add_argument("--overlap-self-distance-px", type=float, default=8.0)
+    parser.add_argument(
+        "--overlap-min-arclength-separation", type=float, default=0.12)
+    parser.add_argument("--centerline-tip-depth-weight", type=float, default=5.0)
+    parser.add_argument(
+        "--max-centerline-tip-epipolar-error-px", type=float, default=8.0)
+    parser.add_argument(
+        "--terminal-disparity-refinement",
+        action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--terminal-disparity-fraction", type=float, default=0.20)
+    parser.add_argument(
+        "--terminal-disparity-smoothness-scale", type=float, default=0.10)
+    parser.add_argument(
+        "--terminal-disparity-observation-weight", type=float, default=4.0)
+    parser.add_argument(
+        "--terminal-disparity-tip-weight", type=float, default=20.0)
+    parser.add_argument(
+        "--terminal-disparity-max-p95-degradation-px", type=float, default=0.25)
+    parser.add_argument("--stereo-offline-cutoff-hz", type=float, default=2.0)
+    parser.add_argument(
+        "--stereo-offline-huber-delta-px", type=float, default=1.5)
     parser.add_argument("--temporal-shape-cutoff-hz", type=float, default=0.0)
     parser.add_argument("--distal-length-mm", type=float, default=60.0)
+    parser.add_argument("--distal-length-prior-sigma-mm", type=float, default=4.0)
+    parser.add_argument("--interface-color-sigma-mm", type=float, default=3.0)
+    parser.add_argument("--interface-temporal-sigma-mm", type=float, default=1.5)
+    parser.add_argument("--interface-temporal-cutoff-hz", type=float, default=4.0)
+    parser.add_argument("--interface-projection-window-mm", type=float, default=15.0)
+    parser.add_argument("--interface-offline-cutoff-hz", type=float, default=2.0)
+    parser.add_argument(
+        "--interface-offline-huber-delta-mm", type=float, default=2.0)
+    parser.add_argument("--interface-offline-iterations", type=int, default=4)
+    parser.add_argument("--interface-length-gate-mm", type=float, default=4.0)
+    parser.add_argument(
+        "--interface-session-prior-relative-weight", type=float, default=0.5)
+    parser.add_argument("--spline-temporal-cutoff-hz", type=float, default=3.0)
+    parser.add_argument(
+        "--spline-temporal-terminal-cutoff-hz", type=float, default=5.0)
+    parser.add_argument(
+        "--spline-temporal-terminal-basis-count", type=int, default=4)
+    parser.add_argument(
+        "--spline-temporal-huber-delta-mm", type=float, default=1.0)
+    parser.add_argument("--spline-temporal-iterations", type=int, default=4)
+    parser.add_argument(
+        "--spline-temporal-max-gap-ms", type=float, default=500.0)
+    parser.add_argument(
+        "--spline-temporal-outlier-sigma", type=float, default=4.5)
+    parser.add_argument(
+        "--spline-temporal-outlier-floor-mm", type=float, default=0.75)
+    parser.add_argument(
+        "--spline-temporal-frame-outlier-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--spline-temporal-terminal-outlier-samples", type=int, default=4)
     parser.add_argument(
         "--distal-boundary-search-half-width-mm", type=float, default=12.0)
     parser.add_argument("--curvature-smoothing-mm", type=float, default=0.25)
@@ -2088,12 +2994,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-stereo-centerline-length-ratio", type=float, default=1.8)
     parser.add_argument("--stereo-reference-switch-ratio", type=float, default=1.15)
-    parser.add_argument("--max-mask-effective-width-px", type=float, default=28.0)
+    parser.add_argument("--max-mask-effective-width-px", type=float, default=20.0)
     parser.add_argument("--max-temporal-prompt-gap-ms", type=float, default=100.0)
     parser.add_argument("--max-mean-reprojection-px", type=float, default=5.0)
     parser.add_argument("--max-p95-reprojection-px", type=float, default=12.0)
     parser.add_argument("--max-tip-epipolar-error-px", type=float, default=5.0)
     parser.add_argument("--max-tip-endpoint-error-px", type=float, default=8.0)
+    parser.add_argument(
+        "--min-temporal-centerline-coverage", type=float, default=0.55)
+    parser.add_argument(
+        "--temporal-centerline-tolerance-px", type=float, default=18.0)
+    parser.add_argument(
+        "--max-temporal-centerline-p95-px", type=float, default=35.0)
     parser.add_argument(
         "--sam-frame-batch-size", type=int, default=1,
         help=("stereo timestamps per independent SAM encoder batch; values >1 "
@@ -2102,11 +3014,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prompt-workers", type=int, default=4,
         help="CPU workers for frame-local colour/prompt preprocessing")
     parser.add_argument(
+        "--sam-postprocess-workers", type=int, default=2,
+        help="CPU workers for independent SAM mask finishing")
+    parser.add_argument(
         "--preprocess-chunk-size", type=int, default=16,
         help="bounded frame chunk for CPU prompt preprocessing")
     parser.add_argument(
         "--prefetch-frames", type=int, default=16,
         help="bounded decoded/preprocessed frame queue; 0 disables overlap")
+    parser.add_argument(
+        "--hdf-buffer-frames", type=int, default=128,
+        help="frames combined into each contiguous HDF5 write")
+    parser.add_argument(
+        "--hdf-queue-chunks", type=int, default=2,
+        help="bounded completed HDF5 chunks queued to the writer thread")
     parser.add_argument(
         "--store-masks", action=argparse.BooleanOptionalAction, default=None,
         help="store bit-packed masks (default: off for cached, on otherwise)")
@@ -2126,8 +3047,60 @@ def main(argv=None) -> None:
         disparity_second_difference_weight=args.disparity_second_difference_weight,
         disparity_huber_delta_px=args.disparity_huber_delta_px,
         temporal_disparity_weight=args.temporal_disparity_weight,
+        temporal_disparity_max_gap_ms=args.temporal_disparity_max_gap_ms,
+        temporal_disparity_decay_ms=args.temporal_disparity_decay_ms,
+        stereo_reference_hysteresis_score=(
+            args.stereo_reference_hysteresis_score),
+        overlap_aware_reconstruction=args.overlap_aware_reconstruction,
+        overlap_row_search_px=args.overlap_row_search_px,
+        overlap_self_fraction_threshold=args.overlap_self_fraction_threshold,
+        overlap_self_distance_px=args.overlap_self_distance_px,
+        overlap_min_arclength_separation=(
+            args.overlap_min_arclength_separation),
+        centerline_tip_depth_weight=args.centerline_tip_depth_weight,
+        max_centerline_tip_epipolar_error_px=(
+            args.max_centerline_tip_epipolar_error_px),
+        terminal_disparity_refinement=args.terminal_disparity_refinement,
+        terminal_disparity_fraction=args.terminal_disparity_fraction,
+        terminal_disparity_smoothness_scale=(
+            args.terminal_disparity_smoothness_scale),
+        terminal_disparity_observation_weight=(
+            args.terminal_disparity_observation_weight),
+        terminal_disparity_tip_weight=args.terminal_disparity_tip_weight,
+        terminal_disparity_max_p95_degradation_px=(
+            args.terminal_disparity_max_p95_degradation_px),
+        stereo_offline_cutoff_hz=args.stereo_offline_cutoff_hz,
+        stereo_offline_huber_delta_px=args.stereo_offline_huber_delta_px,
         temporal_shape_cutoff_hz=args.temporal_shape_cutoff_hz,
         distal_length_mm=args.distal_length_mm,
+        distal_length_prior_sigma_mm=args.distal_length_prior_sigma_mm,
+        interface_color_sigma_mm=args.interface_color_sigma_mm,
+        interface_temporal_sigma_mm=args.interface_temporal_sigma_mm,
+        interface_temporal_cutoff_hz=args.interface_temporal_cutoff_hz,
+        interface_projection_window_mm=args.interface_projection_window_mm,
+        interface_offline_cutoff_hz=args.interface_offline_cutoff_hz,
+        interface_offline_huber_delta_mm=(
+            args.interface_offline_huber_delta_mm),
+        interface_offline_iterations=args.interface_offline_iterations,
+        interface_length_gate_mm=args.interface_length_gate_mm,
+        interface_session_prior_relative_weight=(
+            args.interface_session_prior_relative_weight),
+        spline_temporal_cutoff_hz=args.spline_temporal_cutoff_hz,
+        spline_temporal_terminal_cutoff_hz=(
+            args.spline_temporal_terminal_cutoff_hz),
+        spline_temporal_terminal_basis_count=(
+            args.spline_temporal_terminal_basis_count),
+        spline_temporal_huber_delta_mm=(
+            args.spline_temporal_huber_delta_mm),
+        spline_temporal_iterations=args.spline_temporal_iterations,
+        spline_temporal_max_gap_ms=args.spline_temporal_max_gap_ms,
+        spline_temporal_outlier_sigma=args.spline_temporal_outlier_sigma,
+        spline_temporal_outlier_floor_mm=(
+            args.spline_temporal_outlier_floor_mm),
+        spline_temporal_frame_outlier_fraction=(
+            args.spline_temporal_frame_outlier_fraction),
+        spline_temporal_terminal_outlier_samples=(
+            args.spline_temporal_terminal_outlier_samples),
         distal_boundary_search_half_width_mm=(
             args.distal_boundary_search_half_width_mm),
         curvature_smoothing_mm=args.curvature_smoothing_mm,
@@ -2142,10 +3115,19 @@ def main(argv=None) -> None:
         max_p95_reprojection_px=args.max_p95_reprojection_px,
         max_tip_epipolar_error_px=args.max_tip_epipolar_error_px,
         max_tip_endpoint_error_px=args.max_tip_endpoint_error_px,
+        min_temporal_centerline_coverage=(
+            args.min_temporal_centerline_coverage),
+        temporal_centerline_tolerance_px=(
+            args.temporal_centerline_tolerance_px),
+        max_temporal_centerline_p95_px=(
+            args.max_temporal_centerline_p95_px),
         sam_frame_batch_size=args.sam_frame_batch_size,
+        sam_postprocess_workers=args.sam_postprocess_workers,
         prompt_workers=args.prompt_workers,
         preprocess_chunk_size=args.preprocess_chunk_size,
         prefetch_frames=args.prefetch_frames,
+        hdf_buffer_frames=args.hdf_buffer_frames,
+        hdf_queue_chunks=args.hdf_queue_chunks,
         store_masks=(
             args.store_masks if args.store_masks is not None
             else args.segmentation_backend != "cached"),

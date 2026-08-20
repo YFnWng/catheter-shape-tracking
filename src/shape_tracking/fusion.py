@@ -154,8 +154,15 @@ def _write_image(
                 "processing to finish")
         index, offset_ms, gap_valid = nearest_sample_indices(
             image_ns, query_ns, max_offset_ms)
-        source_valid = _gather_dataset(source["frames/valid"], index).astype(np.uint8)
-        valid = (gap_valid.astype(bool) & source_valid.astype(bool)).astype(np.uint8)
+        source_valid = _gather_dataset(
+            source["frames/valid"], index).astype(np.uint8)
+        source_learning_valid = (
+            _gather_dataset(source["frames/learning_valid"], index).astype(
+                np.uint8)
+            if "frames/learning_valid" in source else source_valid.copy())
+        valid = (
+            gap_valid.astype(bool)
+            & source_learning_valid.astype(bool)).astype(np.uint8)
         source_timestamp = image_ns[index]
         is_new = np.r_[True, np.diff(index) != 0].astype(np.uint8)
 
@@ -164,8 +171,13 @@ def _write_image(
             "source_timestamp_ns": source_timestamp,
             "source_offset_ms": offset_ms,
             "is_new_sample": is_new,
+            "reconstruction_valid": source_valid,
+            "learning_valid": source_learning_valid,
             "valid": valid,
         }
+        if "frames/learning_rejection_flags" in source:
+            scalar["learning_rejection_flags"] = _gather_dataset(
+                source["frames/learning_rejection_flags"], index)
         if "frames/svo_frame" in source:
             scalar["svo_frame"] = _gather_dataset(source["frames/svo_frame"], index)
         if "frames/svo_timestamp_ns" in source:

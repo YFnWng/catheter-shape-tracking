@@ -55,6 +55,8 @@ class FusionTests(unittest.TestCase):
             frames = output.create_group("frames")
             frames["timestamp_ns"] = np.array([9_000_000, 29_000_000], np.int64)
             frames["valid"] = np.array([1, 0], np.uint8)
+            frames["learning_valid"] = np.array([1, 0], np.uint8)
+            frames["learning_rejection_flags"] = np.array([0, 1], np.uint16)
             frames["svo_frame"] = np.array([3, 4], np.int32)
             frames.create_dataset(
                 "status", data=np.array(["valid", "bad"], object),
@@ -109,12 +111,41 @@ class FusionTests(unittest.TestCase):
                             output["image/source_index"][:].tolist(), [0, 1, 1])
                         self.assertEqual(
                             output["image/is_new_sample"][:].tolist(), [1, 1, 0])
+                        self.assertEqual(
+                            output["image/reconstruction_valid"][:].tolist(),
+                            [1, 0, 0])
+                        self.assertEqual(
+                            output["image/learning_valid"][:].tolist(),
+                            [1, 0, 0])
+                        self.assertEqual(
+                            output["image/learning_rejection_flags"][:].tolist(),
+                            [0, 1, 1])
                     expected = [1, 1, 1]
                     if use_image:
                         expected[1:] = [0, 0]
                     if use_em:
                         expected[1] = 0
                     self.assertEqual(output["frames/fusion_valid"][:].tolist(), expected)
+
+    def test_image_learning_label_rejects_reconstructed_outlier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            image_path = directory / "image.h5"
+            self._write_image(image_path)
+            with h5py.File(image_path, "r+") as output:
+                output["frames/learning_valid"][0] = 0
+            output_path = directory / "fused.h5"
+            write_fused_dataset(
+                output_path, self.query, self.robot,
+                image_h5=image_path, use_image=True, use_em=False,
+                config=FusionConfig(max_image_offset_ms=15.0))
+            with h5py.File(output_path, "r") as output:
+                self.assertEqual(
+                    output["image/reconstruction_valid"][:].tolist(), [1, 0, 0])
+                self.assertEqual(
+                    output["image/valid"][:].tolist(), [0, 0, 0])
+                self.assertEqual(
+                    output["frames/fusion_valid"][:].tolist(), [0, 0, 0])
 
 
 if __name__ == "__main__":

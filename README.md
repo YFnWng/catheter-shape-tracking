@@ -142,13 +142,78 @@ The performance controls are:
 
 - `--prompt-workers 4`: CPU workers for independent left/right colour and
   prompt extraction.
+- `--sam-postprocess-workers 2`: persistent CPU workers for independent SAM
+  mask selection, morphology, skeletonization, and centerline extraction.
 - `--preprocess-chunk-size 16`: number of decoded frames prepared together.
 - `--prefetch-frames 16`: maximum prepared-frame queue; use 0 to disable
   decode/preprocessing overlap.
+- `--hdf-buffer-frames 128`: consecutive completed records combined into one
+  slice write per dataset. Numeric dataset chunks are aligned to this batching
+  up to a one-megabyte chunk target.
+- `--hdf-queue-chunks 2`: bounded completed-record chunks held for the
+  dedicated HDF5 writer thread. This overlaps compression and external-drive
+  writes with subsequent image processing without unbounded RAM growth.
 - `--sam-frame-batch-size 1`: preserves previous-accepted-frame SAM prompting.
   Values above 1 batch independent timestamps through the image encoder and
   use temporal prompts only as selective retries. This is experimental because
   independently plausible masks can choose different skeleton branches.
+
+The reconstruction and material-interface defaults are now:
+
+- `--overlap-aware-reconstruction`: when one projected centerline touches a
+  nonlocal part of itself, the better-separated eye supplies ordered arc
+  length. The overlapped eye is treated as an unordered mask observation. A
+  dynamic program selects a smooth disparity path from all mask runs on each
+  epipolar row; it never requires other-eye arc order or a one-to-one mapping.
+  Multiple good-eye samples may therefore project onto the same bad-eye pixel.
+  Ordinary frames retain the ordered epipolar solver. Detection is controlled
+  by `--overlap-self-distance-px 8`,
+  `--overlap-min-arclength-separation 0.12`, and
+  `--overlap-self-fraction-threshold 0.05`.
+- A self-overlapped eye is excluded from reference-view selection whenever the
+  other eye remains separated. `--stereo-reference-hysteresis-score 3` keeps
+  the previous good reference through small score fluctuations. The disparity
+  prior survives rejected/overlapped frames for up to
+  `--temporal-disparity-max-gap-ms 1000`, with a 500 ms exponential decay.
+- The two cyan centerline endpoints provide a strong terminal disparity anchor
+  when their rectified-row error is at most 8 px. This keeps the non-reference
+  reprojection near the observed tip when the yellow cap detector is missing.
+- `--stereo-offline-cutoff-hz 2` robustly smooths disparity at every normalized
+  arc sample across time after causal processing. The reference-eye pixels
+  remain exact, the registered base disparity is not moved, and the full 3D
+  spline is rebuilt before the interface is cut. Set this to `0` to retain only
+  causal disparity.
+- `--interface-offline-cutoff-hz 2`: after all causal frames have been written,
+  robust symmetric second-difference smoothing is applied to the scalar
+  tip-back distal length. This is a zero-phase batch operation, so it adds no
+  temporal lag and never smooths the interface XYZ away from the catheter.
+  `--interface-offline-huber-delta-mm 2` controls outlier rejection. Set the
+  cutoff to `0` to disable the final pass.
+- Distal-length observations more than `--interface-length-gate-mm 4` from the
+  nominal 60 mm are identified as the known false near-tip material boundary.
+  They are replaced by a weak robust session-length prior rather than being
+  allowed to pull the interface toward 45--50 mm. This is a soft constraint:
+  trusted color/reconstruction observations still vary within the gate.
+- When `--write-video` is active and masks are available, overlay videos are
+  rendered after the offline pass, so the displayed interface and yellow curve
+  match the final HDF5 data rather than the causal intermediate result.
+
+The HDF5 preserves all interface stages:
+
+- `distal/raw_base_position_base_mm`: unfiltered per-frame interface.
+- `distal/causal_base_position_base_mm`: causal interface used while streaming.
+- `distal/base_position_base_mm`: final zero-phase interface used for learning.
+- `quality/distal_length_raw_mm`, `distal_length_filtered_mm`, and
+  `distal_length_smoothed_mm`: raw, causal, and final tip-back coordinates.
+- `quality/interface_smoothing_adjustment_mm` and
+  `interface_smoothing_weight`: audit fields for the offline estimator.
+- `stereo/visible_points_base_mm`: pre-spline stereo curve retained so the
+  final distal segment can be re-cut without transferring the full-spline fit
+  error into the interface.
+- `quality/overlap_aware_used`, `stereo_epipolar_ambiguity_left/right`, and
+  `stereo_other_eye_self_overlap_left/right`: reconstruction-mode diagnostics.
+- `stereo/fitted_disparity_px`, `smoothed_disparity_px`, ordered stereo pixels,
+  and causal/final visible 3D points: temporal-reconstruction audit fields.
 
 True SAM 2 video-memory propagation is available as an optional two-stage
 backend. It propagates each registered stereo ROI both forward and backward in
@@ -187,11 +252,13 @@ times (milliseconds) are included as `timing_*_ms` columns in
 frame, and fraction of elapsed processing time for each stage. With background
 prefetch, stage totals describe work rather than a serial critical path, so
 their fractions can sum to more than 100%. GPU encoder and
-prompt-decoder times use CUDA synchronization at their boundaries. Each view's
-compressed mask and centerline are now committed once per frame after its final
-retry/boundary state is known; failed views are also written once in the error
-path. This removes the former three overwrites that dominated external-drive
-HDF5 time. The image-only
+prompt-decoder times use CUDA synchronization at their boundaries.
+`hdf5_write` measures main-thread record preparation and queue backpressure;
+`hdf5_write_background` measures actual batched compression/write worker time
+and intentionally overlaps other stages. Each frame is accumulated only after
+its final retry/boundary state is known, and consecutive records are committed
+as dataset slices rather than dozens of per-frame HDF5 assignments. Failed
+frames use the same batched path. The image-only
 processor never invokes EM. The existing `shape_tracking.sequence` command
 remains the EM-dependent path for older sessions.
 
@@ -242,12 +309,15 @@ ordered pixel skeleton with piecewise-linear interpolation by default. Disparity
 has one degree of freedom per stereo sample and is estimated with robust Huber
 weights plus local first- and second-difference regularization; the registered
 base depth is an endpoint observation, not a global polynomial constraint. The
-ordered stereo reference is selected from the longer, less-foreshortened image
-centerline rather than always using the left view. A 15% hysteresis
-(`--stereo-reference-switch-ratio`) prevents reference-view chatter. At full
-frame rate, the previous accepted disparity field is a local prior
+processor constructs both left-ordered and right-ordered stereo hypotheses.
+Each is scored using reprojection in both eyes, foreshortening, and distance
+from the previous accepted 3D curve; a small switching penalty prevents
+reference-view chatter. This lets the well-conditioned eye win on each frame
+without making either camera permanently primary. At full frame rate, the
+previous accepted disparity field is a local prior
 (`--temporal-disparity-weight`, default 2.0), reducing depth and distal-base
-jitter. In addition, the fixed-material-coordinate distal points can be
+jitter. Candidate scores, their margin, and temporal RMS errors are stored in
+`quality/stereo_candidate_*`. In addition, the distal points can be
 filtered causally with a first-order low-pass
 (`--temporal-shape-cutoff-hz`; disabled by default), then refit. This filters
 the transition point and the whole shape coherently instead of filtering a
@@ -257,20 +327,42 @@ only when that tradeoff is appropriate (for example, pass
 per-frame coefficient is stored as `quality/temporal_shape_alpha`. The chosen
 stereo view is stored as `quality/stereo_reference_view` (1=left, 2=right).
 
+When the final 20% of both centerlines is unambiguous and neither view is
+self-overlapped, a terminal disparity refinement increases the opposite-eye
+observation weight and tapers the disparity second-difference penalty toward
+the tip. The trusted stereo tip remains strongly anchored. The refinement is
+accepted only when terminal reprojection improves without materially degrading
+the full-curve p95 error. It is enabled by default with
+`--terminal-disparity-refinement`; its extent and strength are controlled by
+`--terminal-disparity-fraction`,
+`--terminal-disparity-smoothness-scale`, and
+`--terminal-disparity-observation-weight`. Usage and improvement are stored in
+`quality/terminal_refinement_*`.
+
 No modelled base bridge is inserted: a visible proximal endpoint farther than
 `--max-base-endpoint-distance-mm` (15 mm by default) from the registered base
-rejects the frame. The known distal material length is supplied with
-`--distal-length-mm` (60 mm by default). The distal source polyline is selected
-geometrically by walking that distance back from the observed tip before the
-data-faithful multi-basis spline is fit. The visible dark-blue/cyan change point
-is also detected only within
-`--distal-boundary-search-half-width-mm` of the geometric 60 mm estimate, so
-short dark sections near the tip cannot become the transition. Color detections
-and their left/right consistency are retained as quality diagnostics, but they
-do not override the known material length or reject an otherwise sound stereo
-shape. This avoids making an ambiguous dark marking a geometry anchor. The
-unconstrained spline remains within a small fitting tolerance of 60 mm instead
-of satisfying length by cutting across a kink or inventing an off-image bend.
+rejects the frame. The nominal distal material length is supplied with
+`--distal-length-mm` (60 mm by default), but it is a soft prior rather than an
+equality constraint. Dark-blue/cyan transitions from both views are searched
+only within `--distal-boundary-search-half-width-mm` of that prior, robustly
+weighted by color confidence, and fused with the previous accepted distal
+length. The default prior, color, and temporal standard deviations are 4, 3,
+and 1.5 mm and can be changed with `--distal-length-prior-sigma-mm`,
+`--interface-color-sigma-mm`, and `--interface-temporal-sigma-mm`. Thus short
+dark markings near the tip are downweighted without discarding genuine material
+color information, and a local spline error cannot force all error into the
+transition point.
+
+The previous filtered 3D interface is projected onto a local window of the
+current reconstructed curve and its material coordinate is causally filtered
+along that curve (4 Hz by default). This avoids independently smoothing x, y,
+and z off the shaft. The unfiltered and filtered locations are stored in
+`distal/raw_base_position_base_mm` and `distal/base_position_base_mm`; length,
+uncertainty, along-curve coordinate, and filter coefficient are stored in
+`quality/distal_length_*` and `quality/interface_*`. Set
+`--interface-temporal-cutoff-hz 0` to disable this last filter. The final distal
+spline follows the fused, variable-length material segment rather than being
+forced to exactly 60 mm.
 The final fitted curve receives its own reprojection quality check. Its single
 3D base point is projected into both overlay
 views, so the displayed transition cannot be assigned independently or inherit
@@ -304,25 +396,64 @@ longer than 10% of the path. Stereo geometry alone cannot create an accepted
 centerline. The accepted retry mask is refined from these material-color pixels
 rather than retaining a broad SAM region.
 All masks must also pass an area-per-centerline-length check controlled by
-`--max-mask-effective-width-px` (28 px by default). The overlay includes a green
+`--max-mask-effective-width-px` (20 px by default). The overlay includes a green
 mask contour so a correct thin mask remains visible beneath the fitted curves.
 
 For normal full-rate processing, each accepted frame also supplies full-shaft
-positive points and a box to the next frame in the same view. This temporal
-prompt is used only when the timestamp gap is at most
+positive points and a box to the next frame in the same view. This previous
+accepted centerline is used directly as the next SAM prompt rather than being
+unioned with a potentially degenerate current color box. Current-frame color
+remains a mask-selection and completion cue, as in the original stable mask
+pipeline. The temporal prompt is used only when the timestamp gap is at most
 `--max-temporal-prompt-gap-ms` (100 ms by default), and current-frame color seeds
 and all stereo/geometry checks still apply. Manual per-frame prompts take
 precedence. Thus 30 Hz motion receives a stable image-space prior, while sparse
 pilot frames separated by seconds never reuse stale geometry. Prompt points,
-boxes, and their `temporal_previous_valid` source are stored with the output.
+boxes, and their source are stored with the output. Successive accepted
+centerlines must also retain adequate previous-path coverage; a path that
+collapses or jumps to an adjacent structure is rejected by the temporal
+coverage/p95-distance check.
 
-The final full and distal curves are clamped, penalized cubic
-3D B-splines with an explicit basis count (`--curvature-spline-bases`, default
-20, giving 16 internal knots), so the fit cannot collapse to a single global
-cubic. The distal fit also has an explicit arc-length constraint, preventing
-spline smoothing from shortcutting a tight bend and changing the 60 mm material
-length. Spline basis counts, fitted arc length, and RMS residuals are stored as
-quality metrics.
+The spatial curves use penalized cubic 3D B-splines with an explicit basis
+count (`--curvature-spline-bases`, default 20, giving 16 internal knots), so a
+fit cannot collapse to one global cubic.  As a final offline stage, all distal
+frames are represented in the same normalized material coordinate and the same
+uniform clamped knot vector.  The 3D control-point trajectories are robustly
+zero-phase filtered (`--spline-temporal-cutoff-hz`, default 3 Hz).  A symmetric
+rolling-median prediction detects snap-away/snap-back observations; point
+outliers reduce only the weights of the spline bases that influence that shaft
+region, while a predominantly bad curve rejects the whole frame observation.
+The final centerline, tangent, and curvature are evaluated directly from the
+filtered coefficients, with no independent per-frame refit.  Set the cutoff to
+zero to disable this stage. The last four control points use a 5 Hz terminal
+bandwidth by default so localized distal bending modes are attenuated less;
+configure this with `--spline-temporal-terminal-cutoff-hz` and
+`--spline-temporal-terminal-basis-count`.
+
+The HDF5 output preserves the input to this stage in
+`distal/pre_temporal_points_base_mm`, and stores observed and filtered control
+points in `distal/*_spline_coefficients_base_mm`.  Pointwise outlier masks and
+frame-level innovation, adjustment, outlier-fraction, and support diagnostics
+are stored under `distal/temporal_outlier_mask` and
+`quality/shape_temporal_*`.  Spline basis counts, fitted arc length, and RMS
+temporal displacement remain available as quality metrics.  The main tuning
+options are `--spline-temporal-huber-delta-mm`,
+`--spline-temporal-max-gap-ms`, `--spline-temporal-outlier-sigma`, and
+`--spline-temporal-outlier-floor-mm`.
+
+`frames/learning_valid` is the model-facing validity label. It requires a valid
+reconstruction, finite temporally filtered coefficients, no whole-shape or
+terminal temporal-outlier decision, no outlier run longer than the configured
+500 ms interpolation limit, and acceptable mask width. Long unsupported runs
+are not bridged by the final coefficient solve and their overlays omit the
+yellow curve. `frames/learning_rejection_flags` records bitwise reasons:
+1=reconstruction, 2=unsupported temporal gap, 4=whole-shape outlier,
+8=terminal outlier, and 16=mask width. The original `frames/valid` and all
+rejected shape diagnostics are retained for inspection. Sensor fusion uses
+`frames/learning_valid` when present, while exposing both
+`image/reconstruction_valid` and `image/learning_valid`; consequently
+`frames/fusion_valid` automatically excludes intermittent image outliers and
+ill-conditioned reconstruction failures.
 
 Optional manual prompts are full-image pixels keyed by view and SVO frame:
 

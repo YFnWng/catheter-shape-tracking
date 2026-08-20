@@ -71,6 +71,26 @@ class SamSegmentationUtilitiesTests(unittest.TestCase):
         np.testing.assert_array_equal(prepared.seed, seed)
         np.testing.assert_allclose(prepared.tip, automatic.tip)
 
+    def test_temporal_prompt_replaces_current_color_prompt(self):
+        image = np.zeros((80, 160, 3), dtype=np.uint8)
+        temporal = PromptSet(
+            box_xyxy=np.array([10.0, 15.0, 95.0, 70.0]),
+            positive_xy=np.array([[15.0, 45.0], [90.0, 35.0]]),
+            negative_xy=np.empty((0, 2)), source="temporal_previous_valid")
+        color = PromptSet(
+            box_xyxy=np.array([10.0, 10.0, 150.0, 75.0]),
+            positive_xy=np.array([[15.0, 45.0], [145.0, 30.0]]),
+            negative_xy=np.empty((0, 2)), source="automatic_color_seed")
+        seed = np.zeros((80, 160), dtype=np.uint8)
+        cv2.line(seed, (15, 45), (145, 30), 255, 5)
+        automatic = AutomaticPromptResult(
+            prompt=color, seed=seed, tip=np.array([145.0, 30.0]))
+        prepared = Sam2CatheterSegmenter._prepare(
+            image, (0, 0, 160, 80), np.array([15.0, 45.0]),
+            temporal, automatic)
+        self.assertIs(prepared.prompt, temporal)
+        np.testing.assert_array_equal(prepared.seed, seed)
+
     def test_background_prefetch_preserves_order(self):
         prefetch = _BackgroundPrefetch(iter(range(12)), max_items=3)
         try:
@@ -105,9 +125,10 @@ class SamSegmentationUtilitiesTests(unittest.TestCase):
                 self.images = images
 
             def predict_batch(self, **_kwargs):
-                masks = [
-                    np.zeros((3, *image.shape[:2]), dtype=bool)
-                    for image in self.images]
+                masks = []
+                for image in self.images:
+                    foreground = np.max(image, axis=2) - np.min(image, axis=2) > 35
+                    masks.append(np.repeat(foreground[None], 3, axis=0))
                 ious = [np.array([0.9, 0.8, 0.7]) for _ in self.images]
                 logits = [np.empty((3, 1, 1)) for _ in self.images]
                 return masks, ious, logits
@@ -126,6 +147,8 @@ class SamSegmentationUtilitiesTests(unittest.TestCase):
         self.assertEqual(segmenter.predictor.encoder_calls, 1)
         self.assertIn("sam_image_encoder", segmenter.last_timing_s)
         self.assertIn("sam_prompt_decoder", segmenter.last_timing_s)
+        self.assertIsNotNone(segmenter._postprocess_executor)
+        segmenter.close()
 
     def test_stereo_retry_uses_colored_ridge_not_broad_mask_skeleton(self):
         mask = np.zeros((100, 200), dtype=np.uint8)

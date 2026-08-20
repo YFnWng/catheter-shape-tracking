@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -346,7 +347,8 @@ class Sam2CatheterSegmenter:
             self,
             model_config: str,
             checkpoint: str | Path,
-            device: str = "cuda"):
+            device: str = "cuda",
+            postprocess_workers: int = 2):
         try:
             import torch
             from sam2.build_sam import build_sam2
@@ -360,7 +362,19 @@ class Sam2CatheterSegmenter:
             model_config, str(Path(checkpoint).resolve()), device=device,
             apply_postprocessing=True)
         self.predictor = SAM2ImagePredictor(model)
+        self.postprocess_workers = max(1, int(postprocess_workers))
+        self._postprocess_executor = (
+            ThreadPoolExecutor(
+                max_workers=self.postprocess_workers,
+                thread_name_prefix="sam-mask-postprocess")
+            if self.postprocess_workers > 1 else None)
         self.last_timing_s: dict[str, float] = {}
+
+    def close(self) -> None:
+        executor = getattr(self, "_postprocess_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True)
+            self._postprocess_executor = None
 
     def _synchronize(self) -> None:
         """Make CUDA stage timings include queued GPU work."""
@@ -517,11 +531,32 @@ class Sam2CatheterSegmenter:
             timing["sam_prompt_decoder"] = time.perf_counter() - started
 
         started = time.perf_counter()
-        results = []
-        for item, masks, predicted_iou in zip(
-                prepared, masks_batch, iou_batch):
+        finish_inputs = list(zip(prepared, masks_batch, iou_batch))
+        def finish_one(values):
             try:
-                results.append(self._finish(item, masks, predicted_iou))
+                return self._finish(*values)
+            except (ArithmeticError, RuntimeError, ValueError) as exc:
+                return exc
+
+        executor = getattr(self, "_postprocess_executor", None)
+        if executor is None and len(finish_inputs) > 1 and getattr(
+                self, "postprocess_workers", 2) > 1:
+            executor = ThreadPoolExecutor(
+                max_workers=int(getattr(self, "postprocess_workers", 2)),
+                thread_name_prefix="sam-mask-postprocess")
+            self._postprocess_executor = executor
+        if executor is None or len(finish_inputs) == 1:
+            finished = [finish_one(values) for values in finish_inputs]
+        else:
+            futures = [executor.submit(finish_one, values)
+                       for values in finish_inputs]
+            finished = [future.result() for future in futures]
+        results = []
+        for result in finished:
+            try:
+                if isinstance(result, Exception):
+                    raise result
+                results.append(result)
             except (ArithmeticError, RuntimeError, ValueError) as exc:
                 if not allow_finish_errors:
                     raise
