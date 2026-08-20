@@ -17,10 +17,52 @@ import os
 import time
 
 import numpy as np
+import yaml
 
 from . import boards as boards_mod
 from . import registration
 from .boards import AXIS_LEN_M, MARKERS_PER_BOARD
+
+
+CAMERA_CONFIG_KEYS = {
+    "resolution", "fps", "sharpness", "exposure", "gain",
+    "white_balance_temperature", "white_balance_auto_freeze_s",
+    "white_balance_auto_freeze_retries",
+    "brightness", "contrast", "hue",
+    "saturation", "gamma", "svo_compression",
+}
+
+
+def _default_camera_config_path():
+    return os.environ.get(
+        "SHAPE_TRACKING_CAMERA_CONFIG",
+        os.path.abspath(os.path.join(
+            os.path.dirname(__file__), "..", "..", "camera_config.yaml")))
+
+
+def _load_camera_config(path):
+    """Load and flatten the camera/recording sections of a capture profile."""
+    if not path:
+        return {}
+    with open(path, encoding="utf-8") as stream:
+        document = yaml.safe_load(stream) or {}
+    if not isinstance(document, dict):
+        raise ValueError("camera config must contain a YAML mapping")
+    top_level = set(document) - {"camera", "recording"}
+    if top_level:
+        raise ValueError(
+            "unknown camera config section(s): " + ", ".join(sorted(top_level)))
+    camera = document.get("camera", {}) or {}
+    recording = document.get("recording", {}) or {}
+    if not isinstance(camera, dict) or not isinstance(recording, dict):
+        raise ValueError("camera and recording config sections must be mappings")
+    values = dict(camera)
+    values.update(recording)
+    unknown = set(values) - CAMERA_CONFIG_KEYS
+    if unknown:
+        raise ValueError(
+            "unknown camera config setting(s): " + ", ".join(sorted(unknown)))
+    return values
 
 
 def _limit_frame_index(path, frame_count):
@@ -39,30 +81,81 @@ def _limit_frame_index(path, frame_count):
 
 
 def parse_args(argv=None):
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument(
+        "--camera-config", default=_default_camera_config_path())
+    config_args, _ = config_parser.parse_known_args(argv)
+    try:
+        camera_defaults = _load_camera_config(config_args.camera_config)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        config_parser.error(
+            f"could not load --camera-config {config_args.camera_config!r}: {exc}")
+
     ap = argparse.ArgumentParser(
         prog="shape_tracking",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--resolution", default="HD1080",
+    ap.add_argument(
+        "--camera-config", default=config_args.camera_config,
+        help="camera/recording YAML profile. CLI settings override YAML.")
+    ap.add_argument("--resolution", default=camera_defaults.get("resolution", "HD1080"),
                     choices=["HD2K", "HD1080", "HD720", "VGA"],
                     help="ZED capture resolution (default HD1080).")
-    ap.add_argument("--fps", type=int, default=30, help="capture fps (0 = max).")
+    ap.add_argument("--fps", type=int, default=camera_defaults.get("fps", 30),
+                    help="capture fps (0 = max).")
     ap.add_argument("--outdir",
                     default=os.environ.get(
                         "CATHETER_SESSION_ROOT",
                         r"D:\robot-dev\catheter_sessions"),
                     help="session root (default D:\\robot-dev\\catheter_sessions).")
-    ap.add_argument("--sharpness", type=int, default=4,
+    ap.add_argument("--sharpness", type=int,
+                    default=camera_defaults.get("sharpness", 4),
                     help="ZED digital sharpness 0..8 (fixed-focus; digital unsharp, "
                          "not real focus). Default 4 (SDK default); try 6-8 for "
                          "crisper edges.")
-    ap.add_argument("--exposure", type=int, default=-1,
+    ap.add_argument("--exposure", type=int,
+                    default=camera_defaults.get("exposure", -1),
                     help="Manual exposure 0..100 (%% of max time); disables auto. "
                          "Lower = less motion blur (needs more light/gain). "
                          "Default -1 = auto.")
-    ap.add_argument("--gain", type=int, default=-1,
+    ap.add_argument("--gain", type=int,
+                    default=camera_defaults.get("gain", -1),
                     help="Manual gain 0..100; disables auto. Raise to compensate a "
                          "short exposure (adds noise). Default -1 = auto.")
+    ap.add_argument(
+        "--white-balance-temperature", "--whitebalance-temperature",
+        dest="white_balance_temperature", type=int,
+        default=camera_defaults.get("white_balance_temperature", -1),
+        help="Manual white-balance color temperature in kelvin; disables auto "
+             "white balance. Default -1 = auto.")
+    ap.add_argument(
+        "--white-balance-auto-freeze-s", type=float,
+        default=camera_defaults.get("white_balance_auto_freeze_s", 0.0),
+        help="Run auto white balance for this many unrecorded seconds, then "
+             "disable auto without setting a manual temperature (default 0).")
+    ap.add_argument(
+        "--white-balance-auto-freeze-retries", type=int,
+        default=camera_defaults.get("white_balance_auto_freeze_retries", 2),
+        help="freeze retries after a failed stereo color check before falling "
+             "back to continuous auto white balance (default 2).")
+    ap.add_argument("--brightness", type=int,
+                    default=camera_defaults.get("brightness"),
+                    help="Fixed ZED brightness; omitted keeps SDK default.")
+    ap.add_argument("--contrast", type=int,
+                    default=camera_defaults.get("contrast"),
+                    help="Fixed ZED contrast; omitted keeps SDK default.")
+    ap.add_argument("--hue", type=int, default=camera_defaults.get("hue"),
+                    help="Fixed ZED hue; omitted keeps SDK default.")
+    ap.add_argument("--saturation", type=int,
+                    default=camera_defaults.get("saturation"),
+                    help="Fixed ZED saturation; omitted keeps SDK default.")
+    ap.add_argument("--gamma", type=int, default=camera_defaults.get("gamma"),
+                    help="Fixed ZED gamma; omitted keeps SDK default.")
+    ap.add_argument(
+        "--svo-compression",
+        default=camera_defaults.get("svo_compression", "H264"),
+        choices=["H264", "H265", "LOSSLESS", "H264_LOSSLESS", "H265_LOSSLESS"],
+        help="SVO2 compression mode (default H264).")
     ap.add_argument("--no-display", action="store_true",
                     help="headless: no preview window.")
     ap.add_argument(
@@ -121,13 +214,34 @@ def parse_args(argv=None):
     args = ap.parse_args(argv)
     if args.image_only and args.aurora_port:
         ap.error("--image-only cannot be combined with --aurora-port")
+    if (args.exposure >= 0) != (args.gain >= 0):
+        ap.error("--exposure and --gain must be provided together, or both left auto")
+    if args.exposure < -1 or args.gain < -1:
+        ap.error("--exposure and --gain accept -1 for auto or a non-negative value")
+    if args.white_balance_temperature < -1:
+        ap.error("--white-balance-temperature accepts -1 for auto or kelvin")
+    if args.white_balance_temperature >= 0 and (
+            not 2800 <= args.white_balance_temperature <= 6500
+            or args.white_balance_temperature % 100 != 0):
+        ap.error(
+            "--white-balance-temperature must be -1 for auto, or an exact "
+            "100 K step from 2800 through 6500")
+    if args.white_balance_auto_freeze_s < 0:
+        ap.error("--white-balance-auto-freeze-s must be non-negative")
+    if args.white_balance_auto_freeze_retries < 0:
+        ap.error("--white-balance-auto-freeze-retries must be non-negative")
+    if (args.white_balance_auto_freeze_s > 0
+            and args.white_balance_temperature >= 0):
+        ap.error(
+            "auto-freeze and a manual white-balance temperature are mutually "
+            "exclusive; set white_balance_temperature: -1")
     return args
 
 
 def main(argv=None):
     import cv2                      # local import: keeps --help fast, errors clear
     from . import register as camera_register
-    from .zed_capture import ZedCamera
+    from .zed_capture import ZedCamera, assess_stereo_color
 
     args = parse_args(argv)
     field_registration = (
@@ -172,10 +286,9 @@ def main(argv=None):
     right_dir = os.path.join(session_dir, "right")
     for d in (left_dir, right_dir):
         os.makedirs(d, exist_ok=True)
-    with open(os.path.join(session_dir, "session_metadata.json"),
-              "w", encoding="utf-8") as stream:
-        json.dump({
-            "schema_version": 1,
+    metadata_path = os.path.join(session_dir, "session_metadata.json")
+    metadata = {
+            "schema_version": 2,
             "session_id": session,
             "mode": (
                 "image_only" if args.image_only else
@@ -187,7 +300,27 @@ def main(argv=None):
             "requested_resolution": args.resolution,
             "requested_fps": args.fps,
             "preview_fps": args.preview_fps,
-        }, stream, indent=2, sort_keys=True)
+            "camera_config": (
+                os.path.abspath(args.camera_config) if args.camera_config else None),
+            "svo_compression": args.svo_compression,
+            "camera_settings_requested": {
+                "exposure": args.exposure,
+                "gain": args.gain,
+                "white_balance_temperature": args.white_balance_temperature,
+                "white_balance_auto_freeze_s":
+                    args.white_balance_auto_freeze_s,
+                "white_balance_auto_freeze_retries":
+                    args.white_balance_auto_freeze_retries,
+                "brightness": args.brightness,
+                "contrast": args.contrast,
+                "hue": args.hue,
+                "saturation": args.saturation,
+                "gamma": args.gamma,
+                "sharpness": args.sharpness,
+            },
+        }
+    with open(metadata_path, "w", encoding="utf-8") as stream:
+        json.dump(metadata, stream, indent=2, sort_keys=True)
 
     camera_markers, _ = camera_register.load_config(args.registration_config)
     additional_boards = []
@@ -210,13 +343,39 @@ def main(argv=None):
         } for index in observation_indices
     }
 
-    with ZedCamera(args.resolution, args.fps, args.sharpness,
-                   args.exposure, args.gain) as cam:
+    with ZedCamera(
+            resolution=args.resolution, fps=args.fps,
+            sharpness=args.sharpness, exposure=args.exposure, gain=args.gain,
+            white_balance_temperature=args.white_balance_temperature,
+            white_balance_auto_freeze_s=args.white_balance_auto_freeze_s,
+            white_balance_auto_freeze_retries=
+                args.white_balance_auto_freeze_retries,
+            brightness=args.brightness, contrast=args.contrast, hue=args.hue,
+            saturation=args.saturation, gamma=args.gamma,
+            svo_compression=args.svo_compression) as cam:
         info = cam.info()
         print(f"ZED serial {info['serial']}, model {info['model']}, SDK {info['sdk']}")
         print(f"Resolution {info['resolution']}  fx={info['fx']:.1f} fy={info['fy']:.1f} "
               f"cx={info['cx']:.1f} cy={info['cy']:.1f}  (fixed focus)")
+        print("Camera settings: " + ", ".join(
+            f"{key}={value}" for key, value in
+            sorted(info["camera_settings"].items())))
+        if info["white_balance_freeze"] is not None:
+            freeze = info["white_balance_freeze"]
+            print(
+                "[WB] auto-freeze complete: "
+                f"{freeze['frames_grabbed']} warm-up frames, "
+                f"{freeze['actual_warmup_s']:.2f}s, "
+                f"temperature {freeze['temperature_before_freeze']} -> "
+                f"{freeze['temperature_after_freeze']}, "
+                f"auto={freeze['whitebalance_auto_after_freeze']}, "
+                f"attempts={len(freeze['attempts'])}, "
+                f"fallback_auto={freeze['fallback_to_continuous_auto']}")
         print(f"Session dir: {session_dir}")
+
+        metadata["camera"] = info
+        with open(metadata_path, "w", encoding="utf-8") as stream:
+            json.dump(metadata, stream, indent=2, sort_keys=True)
 
         np.savez(os.path.join(session_dir, "left_intrinsics.npz"),
                  K=cam.K, dist=cam.dist, fx=info["fx"], fy=info["fy"],
@@ -241,6 +400,10 @@ def main(argv=None):
         recording_grabs = 0
         repeated_svo_timestamps = 0
         last_svo_timestamp_ns = None
+        last_stereo_color_health = None
+        unhealthy_recording_checks = 0
+        pending_autorecord = bool(args.autorecord)
+        autorecord_deadline = time.monotonic() + 15.0
         frame_index_file = None
         frame_index_writer = None
         preview_stride = (
@@ -250,15 +413,23 @@ def main(argv=None):
         def svo_path():
             return os.path.join(session_dir, f"stereo_{session}.svo2")
 
-        def start_svo():
+        def start_svo(color_health):
             nonlocal frame_index_file, frame_index_writer, svo_frame
             nonlocal recording_grabs, repeated_svo_timestamps
             nonlocal last_svo_timestamp_ns
             nonlocal camera_registration_collecting
             nonlocal camera_registration_done, camera_registration_notice
             nonlocal last_registration_pair
+            if color_health is None or not color_health["healthy"]:
+                print(
+                    "[COLOR] SVO start blocked: stereo color preflight failed; "
+                    f"health={color_health}")
+                return False
             if not cam.start_recording(svo_path()):
                 return False
+            metadata["recording_stereo_color_preflight"] = color_health
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                json.dump(metadata, stream, indent=2, sort_keys=True)
             # Sidecar mapping each SVO frame -> absolute capture time so offline
             # alignment needs no SVO decode. timestamp_ns is epoch ns on the
             # Windows host clock (ZED TIME_REFERENCE.IMAGE).
@@ -415,22 +586,21 @@ def main(argv=None):
                 '[CAM-REG] saved registration.json, '
                 'registration_left.png, registration_right.png')
 
-        if args.autorecord:
-            start_svo()
-
         show = not args.no_display
         win = "ZED2 ChArUco tracker"
         if show:
             cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(win, 1280, 720)
+            cv2.resizeWindow(win, 1600, 500)
 
         if args.image_only:
-            print("\nControls: r=PNGs v=SVO s=snapshot q/ESC=quit\n")
+            print("\nControls: r=PNGs v=SVO s=snapshot q/ESC=quit; "
+                  "preview=LEFT|RIGHT\n")
         elif field_registration is not None:
-            print("\nControls: r=PNGs v=SVO+EM s=snapshot q/ESC=quit\n")
+            print("\nControls: r=PNGs v=SVO+EM s=snapshot q/ESC=quit; "
+                  "preview=LEFT|RIGHT\n")
         else:
             print("\nControls: r=PNGs v=SVO+EM 1..4=capture probe slot "
-                  "s=snapshot q/ESC=quit\n")
+                  "s=snapshot q/ESC=quit; preview=LEFT|RIGHT\n")
 
         try:
             while True:
@@ -459,7 +629,35 @@ def main(argv=None):
                         repeated_svo_timestamps += 1
                 if left_bgr is None:
                     continue
+                last_stereo_color_health = assess_stereo_color(
+                    left_bgr, right_bgr)
+                if pending_autorecord:
+                    if last_stereo_color_health["healthy"]:
+                        if start_svo(last_stereo_color_health):
+                            pending_autorecord = False
+                    elif time.monotonic() >= autorecord_deadline:
+                        raise RuntimeError(
+                            "SVO autorecord blocked for 15s by failed stereo "
+                            f"color preflight: {last_stereo_color_health}")
+                if cam.is_recording:
+                    if last_stereo_color_health["healthy"]:
+                        unhealthy_recording_checks = 0
+                    else:
+                        unhealthy_recording_checks += 1
+                        if unhealthy_recording_checks >= 3:
+                            metadata["stereo_color_fault"] = {
+                                "timestamp_ns": int(ts),
+                                "health": last_stereo_color_health,
+                            }
+                            with open(
+                                    metadata_path, "w", encoding="utf-8") as stream:
+                                json.dump(metadata, stream, indent=2, sort_keys=True)
+                            stop_svo()
+                            raise RuntimeError(
+                                "SVO stopped after 3 consecutive failed stereo "
+                                f"color checks: {last_stereo_color_health}")
                 overlay = left_bgr.copy()
+                right_overlay = right_bgr.copy()
                 results, seen_ids = [], []
                 if camera_registration_collecting and cam.is_recording:
                     gray = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2GRAY)
@@ -524,6 +722,23 @@ def main(argv=None):
                 cv2.putText(overlay, f"ids={seen_ids}  {' '.join(status_txt)}",
                             (10, overlay.shape[0] - 15),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+                health_color = (0, 220, 0) if (
+                    last_stereo_color_health["healthy"]) else (0, 0, 255)
+                left_health = last_stereo_color_health["eyes"]["left"]
+                right_health = last_stereo_color_health["eyes"]["right"]
+                cv2.putText(
+                    overlay,
+                    f"LEFT color_dom={left_health['channel_dominance']:.2f}",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, health_color, 2)
+                cv2.putText(
+                    right_overlay,
+                    f"RIGHT color_dom={right_health['channel_dominance']:.2f} "
+                    f"green_clip={right_health['green_clip_fraction']:.1%}",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, health_color, 2)
+                if pending_autorecord:
+                    cv2.putText(
+                        right_overlay, "AUTORECORD WAITING FOR COLOR PREFLIGHT",
+                        (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
                 if recording_pngs:
                     cv2.imwrite(os.path.join(left_dir, f"{ts}.png"), left_bgr)
@@ -531,7 +746,7 @@ def main(argv=None):
                     frame_idx += 1
 
                 if show:
-                    cv2.imshow(win, overlay)
+                    cv2.imshow(win, np.hstack((overlay, right_overlay)))
                     key = cv2.waitKey(1) & 0xFF
                     if key in (ord('q'), 27):
                         break
@@ -541,7 +756,7 @@ def main(argv=None):
                               f"({frame_idx} frames so far)")
                     elif key == ord('v'):
                         if not cam.is_recording:
-                            start_svo()
+                            start_svo(last_stereo_color_health)
                         else:
                             stop_svo()
                     elif key in (ord('1'), ord('2'), ord('3'), ord('4')):

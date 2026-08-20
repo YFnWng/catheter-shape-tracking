@@ -1,0 +1,26 @@
+# Fixed ZED2 profile used for repeatable catheter-color segmentation.
+# Command-line options override individual values in this file.
+camera:
+  resolution: HD1080
+  fps: 30
+  brightness: 4
+  contrast: 5
+  hue: 0
+  saturation: 8
+  sharpness: 5
+  gamma: 5
+
+  # Supplying both exposure and gain disables AEC/AGC.
+  exposure: 3
+  gain: 1
+
+  # Let auto white balance converge under the final fixed exposure and color
+  # controls, then freeze its current gains before previews/recording begin.
+  white_balance_temperature: -1
+  white_balance_auto_freeze_s: 5.0
+  white_balance_auto_freeze_retries: 2
+
+recording:
+  # H264 is ZED's GPU-encoded lossy mode and is the practical default for
+  # long recordings. H264_LOSSLESS is available for short quality comparisons.
+  svo_compression: H264

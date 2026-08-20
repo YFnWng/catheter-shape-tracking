@@ -562,6 +562,57 @@ ignored. The resulting `registration.json` has `mode: image_only`, `em: null`,
 and a solved camera-to-base transform. `session_metadata.json` records the
 enabled modalities independently of registration completion.
 
+### Fixed camera settings for repeatable segmentation
+
+Auto exposure/gain and auto white balance can change catheter colors and edge
+contrast during a trajectory. Tune the ZED2 in ZED Explorer, then pass the
+chosen values explicitly to the recorder:
+
+```powershell
+python -m shape_tracking `
+    --resolution HD1080 --fps 30 --image-only `
+    --exposure 25 --gain 15 `
+    --white-balance-temperature 5000 `
+    --brightness 4 --contrast 4 --saturation 4 --gamma 8 --sharpness 4
+```
+
+`--exposure` and `--gain` must be supplied together. Omitting both keeps
+AEC/AGC enabled; omitting white-balance temperature keeps auto white balance.
+The SDK-supported ranges are checked when the camera opens. Requested and
+read-back settings are stored in `session_metadata.json`; reuse the same
+values for every dataset intended to share a segmentation model.
+
+The default fixed profile is [`camera_config.yaml`](camera_config.yaml). It
+contains the ZED Explorer settings selected for the light box, including manual
+exposure/gain and an auto-white-balance warm-up/freeze. Running
+`python -m shape_tracking` loads it automatically. Select another profile with:
+
+```powershell
+python -m shape_tracking --camera-config .\my_camera_config.yaml
+```
+
+Command-line camera options override individual YAML values. Pass
+`--camera-config ""` to disable profile loading. The profile also selects the
+SVO2 codec; override it with, for example,
+`--svo-compression H264_LOSSLESS`.
+
+For the ZED2's coarse manual white-balance control, the default profile instead
+uses `white_balance_auto_freeze_s: 5.0`: the camera applies all final image
+controls, grabs five seconds of unrecorded frames with auto white balance, and
+then disables auto without writing a manual temperature. The console and
+`session_metadata.json` record the warm-up duration, frame count, temperature
+read-back, and final auto/manual state. Keep the light box and scene stationary
+during startup.
+
+The recorder checks both eyes after every freeze attempt. A gross single-eye
+color cast or clipping (such as the intermittent all-green right view) causes
+another auto-WB convergence attempt. After the configured retry count it falls
+back to continuous auto white balance and verifies both eyes again. SVO start is
+blocked until the stereo pair passes, both views are shown side by side, and
+three consecutive failures during recording stop the SVO with details saved in
+`session_metadata.json`. Configure retries with
+`white_balance_auto_freeze_retries` (default 2).
+
 ### Direct optical field-generator registration
 
 The preferred workflow uses the existing base ChArUco board and the 100 x

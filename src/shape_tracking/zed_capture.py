@@ -9,7 +9,43 @@ video setting, which open_camera() maxes out. The factory fx/fy are read for
 pose estimation.
 """
 
+import time
+
 import numpy as np
+
+
+def assess_stereo_color(left_bgr, right_bgr):
+    """Detect gross single-eye ISP tint/clipping without scene calibration."""
+    reports = []
+    for name, image in (("left", left_bgr), ("right", right_bgr)):
+        array = np.asarray(image)
+        if array.ndim != 3 or array.shape[2] < 3 or array.size == 0:
+            raise ValueError(f"invalid {name} image for stereo color check")
+        # Subsample for a cheap live check. The light-box background dominates
+        # the scene, so a failed sensor ISP state remains obvious globally.
+        pixels = array[::8, ::8, :3].reshape(-1, 3).astype(np.float64)
+        mean_bgr = pixels.mean(axis=0)
+        channel_dominance = float(
+            mean_bgr.max() / max(1.0, (mean_bgr.sum() - mean_bgr.max()) / 2.0))
+        green_dominance = float(
+            mean_bgr[1] / max(1.0, (mean_bgr[0] + mean_bgr[2]) / 2.0))
+        green_clip_fraction = float(np.mean(
+            (pixels[:, 1] >= 250)
+            & (pixels[:, 0] < 100)
+            & (pixels[:, 2] < 100)))
+        healthy = channel_dominance < 3.0 and green_clip_fraction < 0.10
+        reports.append({
+            "eye": name,
+            "mean_bgr": [float(value) for value in mean_bgr],
+            "channel_dominance": channel_dominance,
+            "green_dominance": green_dominance,
+            "green_clip_fraction": green_clip_fraction,
+            "healthy": bool(healthy),
+        })
+    return {
+        "healthy": bool(all(report["healthy"] for report in reports)),
+        "eyes": {report["eye"]: report for report in reports},
+    }
 
 try:
     import pyzed.sl as sl
@@ -25,12 +61,28 @@ class ZedCamera:
     """Context manager that opens the ZED2 and yields time-stamped stereo frames."""
 
     def __init__(self, resolution="HD1080", fps=30, sharpness=4,
-                 exposure=-1, gain=-1):
+                 exposure=-1, gain=-1, white_balance_temperature=-1,
+                 brightness=None, contrast=None, saturation=None, gamma=None,
+                 hue=None, svo_compression="H264",
+                 white_balance_auto_freeze_s=0.0,
+                 white_balance_auto_freeze_retries=2):
         self.resolution = resolution
         self.fps = fps
         self.sharpness = sharpness      # 0..8 (digital unsharp; 4 = SDK default)
         self.exposure = exposure        # 0..100 (% of max time); -1 = auto (AEC)
         self.gain = gain                # 0..100; -1 = auto (AGC)
+        self.white_balance_temperature = white_balance_temperature
+        self.white_balance_auto_freeze_s = float(
+            white_balance_auto_freeze_s)
+        self.white_balance_auto_freeze_retries = int(
+            white_balance_auto_freeze_retries)
+        self.white_balance_freeze = None
+        self.brightness = brightness
+        self.contrast = contrast
+        self.hue = hue
+        self.saturation = saturation
+        self.gamma = gamma
+        self.svo_compression = svo_compression
         self.zed = sl.Camera()
         self._left = sl.Mat()
         self._right = sl.Mat()
@@ -53,19 +105,174 @@ class ZedCamera:
         status = self.zed.open(init)
         if status != sl.ERROR_CODE.SUCCESS:
             raise RuntimeError(f"ZED open failed: {status}")
-        # Fixed-focus lens: no focus/focal control exists. Sharpness is a digital
-        # unsharp-mask; exposure/gain fight motion blur (shorten exposure + add
-        # light or gain). Setting exposure/gain manually disables AEC/AGC.
         try:
-            self.zed.set_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS, int(self.sharpness))
-            if self.exposure >= 0:
-                self.zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, int(self.exposure))
-            if self.gain >= 0:
-                self.zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, int(self.gain))
-        except Exception as e:  # non-fatal
-            print(f"[warn] could not set camera settings: {e}")
-        self._read_intrinsics()
+            self._apply_camera_settings()
+            self._read_intrinsics()
+        except Exception:
+            # A failed stereo-color preflight must not leave the device open,
+            # especially when callers use ``with ZedCamera(...)`` (where
+            # __enter__ itself raised and __exit__ will therefore not run).
+            self.zed.close()
+            raise
         return self
+
+    def _set_camera_setting(self, setting, value):
+        """Range-check and apply one integer video setting."""
+        if (setting == sl.VIDEO_SETTINGS.WHITEBALANCE_TEMPERATURE
+                and (value % 100 != 0 or not 2800 <= value <= 6500)):
+            raise ValueError(
+                "ZED WHITEBALANCE_TEMPERATURE must be an exact 100 K step "
+                "from 2800 through 6500")
+        range_status, lower, upper = self.zed.get_camera_settings_range(setting)
+        if range_status == sl.ERROR_CODE.SUCCESS and not lower <= value <= upper:
+            raise ValueError(
+                f"ZED {setting.name}={value} outside supported "
+                f"range [{lower}, {upper}]")
+        status = self.zed.set_camera_settings(setting, int(value))
+        if status != sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(f"ZED could not set {setting.name}={value}: {status}")
+
+    def _apply_camera_settings(self):
+        # Camera settings can be retained across applications. Set each auto
+        # state explicitly so repeated sessions do not inherit an old mode.
+        manual_exposure = self.exposure >= 0 and self.gain >= 0
+        self._set_camera_setting(
+            sl.VIDEO_SETTINGS.AEC_AGC, 0 if manual_exposure else 1)
+        if manual_exposure:
+            self._set_camera_setting(sl.VIDEO_SETTINGS.EXPOSURE, self.exposure)
+            self._set_camera_setting(sl.VIDEO_SETTINGS.GAIN, self.gain)
+
+        requested = {
+            sl.VIDEO_SETTINGS.SHARPNESS: self.sharpness,
+            sl.VIDEO_SETTINGS.BRIGHTNESS: self.brightness,
+            sl.VIDEO_SETTINGS.CONTRAST: self.contrast,
+            sl.VIDEO_SETTINGS.HUE: self.hue,
+            sl.VIDEO_SETTINGS.SATURATION: self.saturation,
+            sl.VIDEO_SETTINGS.GAMMA: self.gamma,
+        }
+        for setting, value in requested.items():
+            if value is not None:
+                self._set_camera_setting(setting, int(value))
+
+        # Converge auto WB only after all other image controls have their final
+        # values. Disabling WHITEBALANCE_AUTO without writing a temperature
+        # retains the auto algorithm's current sensor gains.
+        if self.white_balance_auto_freeze_s > 0:
+            self._freeze_auto_white_balance()
+        else:
+            manual_white_balance = self.white_balance_temperature >= 0
+            self._set_camera_setting(
+                sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO,
+                0 if manual_white_balance else 1)
+            if manual_white_balance:
+                self._set_camera_setting(
+                    sl.VIDEO_SETTINGS.WHITEBALANCE_TEMPERATURE,
+                    self.white_balance_temperature)
+
+    def _freeze_auto_white_balance(self):
+        """Warm auto WB, freeze it, and reject intermittent one-eye tint."""
+        attempts = []
+        total_frames = 0
+        total_started = time.monotonic()
+        max_attempts = 1 + self.white_balance_auto_freeze_retries
+        for attempt in range(1, max_attempts + 1):
+            warm_started = time.monotonic()
+            self._set_camera_setting(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
+            warm_frames = 0
+            while time.monotonic() - warm_started < self.white_balance_auto_freeze_s:
+                if self.zed.grab(self._runtime) == sl.ERROR_CODE.SUCCESS:
+                    warm_frames += 1
+                else:
+                    time.sleep(0.005)
+            status, before = self.zed.get_camera_settings(
+                sl.VIDEO_SETTINGS.WHITEBALANCE_TEMPERATURE)
+            before = int(before) if status == sl.ERROR_CODE.SUCCESS else None
+            self._set_camera_setting(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 0)
+            for _ in range(2):
+                if self.zed.grab(self._runtime) == sl.ERROR_CODE.SUCCESS:
+                    warm_frames += 1
+            total_frames += warm_frames
+            health = self.current_stereo_color_health()
+            settings = self.camera_settings()
+            attempts.append({
+                "attempt": attempt,
+                "warmup_s": time.monotonic() - warm_started,
+                "frames_grabbed": warm_frames,
+                "temperature_before_freeze": before,
+                "temperature_after_freeze": settings.get(
+                    "whitebalance_temperature"),
+                "health": health,
+            })
+            if health["healthy"]:
+                self.white_balance_freeze = {
+                    "requested_warmup_s": self.white_balance_auto_freeze_s,
+                    "actual_warmup_s": time.monotonic() - total_started,
+                    "frames_grabbed": total_frames,
+                    "temperature_before_freeze": before,
+                    "temperature_after_freeze": settings.get(
+                        "whitebalance_temperature"),
+                    "whitebalance_auto_after_freeze": settings.get(
+                        "whitebalance_auto"),
+                    "attempts": attempts,
+                    "fallback_to_continuous_auto": False,
+                    "stereo_color_health": health,
+                }
+                return
+
+        # Disabling auto can intermittently corrupt one ZED2 ISP. If all freeze
+        # attempts fail, return to continuous auto and verify both eyes instead
+        # of permitting a silently unusable recording.
+        fallback_started = time.monotonic()
+        self._set_camera_setting(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
+        fallback_frames = 0
+        while time.monotonic() - fallback_started < self.white_balance_auto_freeze_s:
+            if self.zed.grab(self._runtime) == sl.ERROR_CODE.SUCCESS:
+                fallback_frames += 1
+            else:
+                time.sleep(0.005)
+        total_frames += fallback_frames
+        health = self.current_stereo_color_health()
+        settings = self.camera_settings()
+        self.white_balance_freeze = {
+            "requested_warmup_s": self.white_balance_auto_freeze_s,
+            "actual_warmup_s": time.monotonic() - total_started,
+            "frames_grabbed": total_frames,
+            "temperature_before_freeze": attempts[-1][
+                "temperature_before_freeze"],
+            "temperature_after_freeze": settings.get(
+                "whitebalance_temperature"),
+            "whitebalance_auto_after_freeze": settings.get(
+                "whitebalance_auto"),
+            "attempts": attempts,
+            "fallback_to_continuous_auto": True,
+            "stereo_color_health": health,
+        }
+        if not health["healthy"]:
+            raise RuntimeError(
+                "ZED stereo color preflight failed after auto-WB retries and "
+                f"continuous-auto fallback: {health}")
+
+    def current_stereo_color_health(self):
+        """Retrieve the current pair and return gross per-eye color health."""
+        self.zed.retrieve_image(self._left, sl.VIEW.LEFT)
+        self.zed.retrieve_image(self._right, sl.VIEW.RIGHT)
+        left = np.asarray(self._left.get_data())[..., :3]
+        right = np.asarray(self._right.get_data())[..., :3]
+        return assess_stereo_color(left, right)
+
+    def camera_settings(self):
+        """Return verified values read back from the opened camera."""
+        names = (
+            "AEC_AGC", "EXPOSURE", "GAIN", "WHITEBALANCE_AUTO",
+            "WHITEBALANCE_TEMPERATURE", "BRIGHTNESS", "CONTRAST",
+            "HUE", "SATURATION", "GAMMA", "SHARPNESS")
+        values = {}
+        for name in names:
+            setting = getattr(sl.VIDEO_SETTINGS, name)
+            status, value = self.zed.get_camera_settings(setting)
+            if status == sl.ERROR_CODE.SUCCESS:
+                values[name.lower()] = int(value)
+        return values
 
     def __enter__(self):
         return self.open()
@@ -114,6 +321,9 @@ class ZedCamera:
             "right_fx": self.right_cam.fx, "right_fy": self.right_cam.fy,
             "right_cx": self.right_cam.cx, "right_cy": self.right_cam.cy,
             "baseline_m": self.baseline_m,
+            "svo_compression": self.svo_compression,
+            "camera_settings": self.camera_settings(),
+            "white_balance_freeze": self.white_balance_freeze,
         }
 
     # -- capture ------------------------------------------------------------ #
@@ -140,7 +350,12 @@ class ZedCamera:
 
     # -- SVO recording ------------------------------------------------------ #
     def start_recording(self, svo_path):
-        rp = sl.RecordingParameters(svo_path, sl.SVO_COMPRESSION_MODE.H264)
+        try:
+            compression = getattr(sl.SVO_COMPRESSION_MODE, self.svo_compression)
+        except AttributeError as exc:
+            raise ValueError(
+                f"unsupported SVO compression mode {self.svo_compression!r}") from exc
+        rp = sl.RecordingParameters(svo_path, compression)
         err = self.zed.enable_recording(rp)
         if err != sl.ERROR_CODE.SUCCESS:
             print(f"[warn] enable_recording failed: {err}")
@@ -177,8 +392,9 @@ class ZedCamera:
     def playable_svo_frame_count(svo_path):
         """Return the number of frame positions that can actually be grabbed.
 
-        ZED SDK 5.4 reports an EOF sentinel as the final SVO position. Probe the
-        reported final position so the sidecar does not include that sentinel.
+        ZED SDK 5.4 includes one EOF sentinel in get_svo_number_of_frames().
+        Account for it directly; grabbing that sentinel only emits a misleading
+        END_OF_SVO_FILE_REACHED error during otherwise-clean shutdown.
         """
         init = sl.InitParameters()
         init.set_from_svo_file(str(svo_path))
@@ -190,11 +406,7 @@ class ZedCamera:
             raise RuntimeError(f"ZED failed to reopen recorded SVO: {status}")
         try:
             reported = int(playback.get_svo_number_of_frames())
-            if reported <= 0:
-                return 0
-            playback.set_svo_position(reported - 1)
-            last_status = playback.grab(sl.RuntimeParameters())
-            return reported if last_status == sl.ERROR_CODE.SUCCESS else reported - 1
+            return max(0, reported - 1)
         finally:
             playback.close()
 
