@@ -2,6 +2,149 @@
 
 3D shape tracking of a steerable catheter centerline in free space.
 
+## Marked light-box recordings (2026-08-19)
+
+Session `20260819_194906` uses a neutral light-box background and four ordered
+red rings: the proximal ring marks the material interface, two thinner rings
+provide internal landmarks, and the widest distal ring covers most of the
+ablation probe.  The remaining exposed yellow dot is the physical tip.
+For shape learning, marker 3's center—not that small yellow dot—is the distal
+material endpoint, giving an approximately 57 mm interface-to-end segment.
+
+Use the color-first backend for this and compatible recordings:
+
+```bash
+source /home/chen-lab/Yifan/cr-venv/bin/activate
+cd /home/chen-lab/Yifan/catheter-shape-tracking
+python -m shape_tracking.image_sequence \
+  --session /media/chen-lab/84BABCB7BABCA6D81/Yifan/catheter_sessions/20260819_194906 \
+  --segmentation-backend chromatic_markers \
+  --reconstruction-backend joint_spline \
+  --window run_and_return \
+  --outdir /media/chen-lab/84BABCB7BABCA6D81/Yifan/catheter_sessions/20260819_194906/processed_image_marked \
+  --write-video
+```
+
+`joint_spline` is the preferred reconstruction for controlled marked
+recordings. The disparity reconstruction is retained only as a per-frame 3D
+initializer. One cubic material-coordinate B-spline is then optimized directly
+against both cyan centerlines with symmetric model-to-image and image-to-model
+losses, so neither eye is designated as the final reference. Red-ring
+centroids are projected onto each cyan centerline before entering the objective;
+their raw stereo disparities cannot pull the 3D curve away from the blue shaft.
+The approximately 57 mm length, internal-ring material coordinates, endpoint
+locations, local stretch, and curvature variation are finite robust penalties,
+not equality constraints. The existing zero-phase coefficient pass operates on
+these joint-fit curves and final two-view reprojection determines learning
+validity. Use `--reconstruction-backend disparity` for the legacy behavior.
+
+The joint optimizer uses an analytic coefficient Jacobian. Cubic B-spline
+collocation matrices are cached by sample/basis count, perspective projection
+is differentiated in closed form, and the length, local-stretch,
+third-difference, marker, and coefficient-prior blocks are assembled directly.
+Nearest-centerline assignments are held fixed within each local derivative,
+which gives the exact derivative away from Voronoi boundaries. A residual and
+its Jacobian share one cached evaluation at each trust-region iterate; no
+per-coefficient finite differencing is performed.
+
+In joint mode, disparity is only an initializer and its reprojection threshold
+does not reject a finite joint fit. Per-frame joint reprojection weights the
+offline coefficient filter, while learning acceptance is decided from the
+final temporally filtered curve, including endpoint error to marker 3. This
+avoids good/bad chatter when an initializer or raw per-frame p95 value crosses
+a threshold by a fraction of a pixel.
+
+Joint-fit coefficients are stored in `joint/coefficients_base_mm`. Its
+per-view model and coverage residuals, pre/post symmetric residual, optimized
+length, cost, evaluation count, and convergence flag are stored under
+`quality/joint_*`.
+
+`chromatic_markers` does not run SAM inference. It extracts class-specific
+dark-blue/cyan/red/yellow likelihood rather than generic saturation and forms
+an independent per-eye mask by hysteresis: strong paint pixels seed connected
+regions and weaker edge pixels are retained only when attached to a strong
+seed. The mask is clipped to the convex image projection of the registered 3D
+workspace, rather than merely its axis-aligned crop, so the blue sheath behind
+the workspace is excluded. A projected proximal cylinder along base-frame
+`-z` removes the remaining rigid sheath, and a color-seeded local graph cut
+snaps the mask to image edges. It then detects the distinctive distal ring and selects a
+mask-constrained, color-weighted, temporally regularized route from the
+registered base to that ring center. The
+small exposed yellow dot is deliberately ignored. Catheter-specific color
+support uses Lab chromaticity rather than low-value HSV saturation. The route
+is a minimum-cost path over the continuous paint likelihood, not a skeleton of
+a thresholded connected component: it can cross a short weak-paint/specular
+gap, while a long traversal through neutral black or white is expensive. The
+decoded rings are projected onto the independently smoothed centerline and do
+not become path waypoints. There is no generic HSV/component fallback. The
+backend then decodes the ordered ring centers
+using order, relative widths, and a weak approximate spacing score. This
+marker-anchored route prevents a longer saturated ChArUco edge from becoming
+the catheter centerline. The independently detected wide distal ring takes
+precedence over any endpoint decoded from the provisional skeleton, so an
+incorrect ChArUco branch cannot validate itself. A sparse temporal-median
+background removes fixed colored ChArUco fringes. Neither the current nor the
+preceding centerline adds pixels to the mask. Matching
+left/right rings are finite-weight disparity observations; their image
+centroids never pin a 3D spline point because an annulus centroid need not lie
+on the catheter axis. Implausible one-frame identity jumps are marked missing
+rather than replaced by the preceding pixel coordinate. Current-frame
+epipolar candidates from either eye can recover them, so a stale marker cannot
+remain frozen indefinitely. When one eye compresses neighboring IDs onto the
+same visible ring, the eye with the more distinct ordered layout supplies the
+identities for a global one-to-one assignment over current-frame red components
+in the other eye. Thus local detector confidence cannot override a gross
+same-ID epipolar inconsistency. No marker spacing or nominal length is imposed as a hard
+geometric constraint; the approximate 57 mm length is only a soft regularizer. The interface ring
+replaces the old blue-brightness change point when observed; missing
+observations fall back to temporal evidence and the soft length prior.
+When one projection is foreshortened, ordered rings from the longer,
+well-conditioned eye recover small or dark red components in the other eye
+within a relaxed rectified-epipolar band. These matches correct marker identity
+without expanding either eye's mask, and they never force the 2D or 3D curve
+through an annulus centroid. A gross epipolar inconsistency can override local
+confidence. If this changes the distal-ring identity, the affected cyan path
+is rerouted through its existing color mask to the corrected terminal ring
+before 3D fitting. The cyan path stops at the
+nearest image-path pixel in marker 3's terminal neighborhood; its subpixel ring
+centroid is not appended after smoothing, which avoids a hard endpoint snap and
+a short artificial terminal kink.
+
+Marked-mask width QC uses the median local support diameter along the cyan path
+rather than mask-area divided by projected length. The latter grows without
+bound under self-overlap or strong foreshortening even when the mask is correct.
+
+For an ill-conditioned marked view, a large projected-length mismatch (default
+1.23) or more than 15% cyan samples outside its mask triggers ordered
+good-eye/temporal recovery. The good eye supplies normalized arc-length order
+and rectified image rows; the preceding disparity supplies an x-coordinate
+prior; the bad eye supplies current green-mask support. Each ordered sample is
+snapped to target-mask paint near its epipolar row. Target pixels are explicitly
+allowed to repeat, since projected self-overlap is non-bijective. The inferred
+curve therefore cannot leave the target mask merely because disparity
+smoothing placed it between two thin branches. Diagnostics are stored as
+`quality/centerline_outside_mask_fraction_left/right` and
+`quality/stereo_retry_view`.
+
+Marker 3 identity combines distal position, observed width, and the preceding
+tip when available; it is not assigned solely to the largest red component.
+Markers 0 and 3 have higher stereo weights than the two intermediate rings,
+and marker-0 interface observations use a tighter finite uncertainty. A
+temporal identity gate replaces implausible one-frame marker jumps with a
+low-confidence propagated observation.
+
+For a compact visual audit without creating videos, add
+`--write-snapshots --snapshot-count 12`. Full-resolution stereo overlays are
+written under `overlay_snapshots/left/` and `overlay_snapshots/right/`, evenly
+spaced across the selected processing window. Use `--snapshot-frames 26,132`
+to request exact output-frame indices instead.
+
+Per-eye marker centers, widths, confidence, and visibility are stored under
+`images/<view>/marker_*`. Stereo marker positions and observation flags are
+stored under `markers/`. Overlays label decoded markers `0` through `3` in
+magenta. The previous SAM/cached/HSV backends remain unchanged for unmarked
+recordings.
+
 ## Current handoff: image-only SAM work (2026-08-02)
 
 The immediate goal is to build a robust offline catheter segmentation pipeline
@@ -137,6 +280,34 @@ failures but can recover frames previously rejected only by downstream stereo,
 transition-color, or spline logic. Cached reconstruction does not duplicate the
 large source masks unless `--store-masks` is explicitly supplied; the refined
 HDF5 still contains pixel centerlines, 3D geometry, quality, and robot data.
+
+The same cache boundaries are exposed explicitly through `--resume-from`:
+
+```bash
+# Reuse masks, cyan centerlines, rings, and other image observations; rerun all 3D stages.
+python -m shape_tracking.image_sequence --session SESSION \
+  --resume-from observations --resume-h5 OLD/processed_shapes.h5 \
+  --reconstruction-backend joint_spline --outdir NEW_FROM_OBSERVATIONS
+
+# Reuse image observations and the stored stereo initializer; rerun the joint fit onward.
+python -m shape_tracking.image_sequence --session SESSION \
+  --resume-from stereo --resume-h5 OLD/processed_shapes.h5 \
+  --outdir NEW_FROM_STEREO
+
+# Keep the per-frame joint fit; rerun coefficient filtering, geometry, and learning QC only.
+python -m shape_tracking.image_sequence --session SESSION \
+  --resume-from joint --resume-h5 OLD/processed_shapes.h5 \
+  --outdir NEW_FROM_JOINT
+```
+
+`observations` decodes the selected SVO frames to support normal overlays but
+does not repeat segmentation. `stereo` and `joint` copy the source HDF5 into a
+new output directory and do not decode the SVO unless an overlay or snapshot is
+requested. The source file is never modified. A stereo-level restart currently
+requires the stored and requested joint basis counts to match; use
+`observations` when changing the HDF5 spline schema. Full primary runs should
+retain packed masks (`--store-masks`) so every restart level and later visual
+audit remains available.
 
 The performance controls are:
 

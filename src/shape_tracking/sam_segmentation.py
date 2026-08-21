@@ -42,6 +42,12 @@ class SamMaterialResult:
     seed_recall: float
     mask_area_px: int
     yellow_tip_xy: np.ndarray | None
+    marker_centers_xy: np.ndarray | None = None
+    marker_widths_px: np.ndarray | None = None
+    marker_confidence: np.ndarray | None = None
+    marker_observed: np.ndarray | None = None
+    marker_raw_cluster_count: int = 0
+    tip_source: str = "yellow_color"
 
 
 @dataclass(frozen=True)

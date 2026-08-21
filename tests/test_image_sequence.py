@@ -4,15 +4,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import h5py
+import cv2
 import numpy as np
 
 from shape_tracking.image_sequence import (
+    _build_parser,
+    _bridge_short_good_gaps,
     ImageProcessingConfig,
     ImageSequenceWriter,
+    OverlayWriter,
     PropagatedMaskCache,
     _fuse_distal_length,
     _fitted_curve_reprojection_metrics,
     _project_point_to_polyline_s,
+    _projected_workspace_roi_mask,
     _select_stereo_reference,
     _stereo_candidate_score,
     _stereo_tip_camera_point,
@@ -23,6 +28,73 @@ from shape_tracking.session import FrameRecord
 
 
 class ImageSequenceGeometryTests(unittest.TestCase):
+    def test_resume_cli_exposes_all_persisted_stage_boundaries(self):
+        parser = _build_parser()
+        for stage in ("observations", "stereo", "joint"):
+            args = parser.parse_args([
+                "--session", "/tmp/session", "--resume-from", stage,
+                "--resume-h5", "/tmp/source.h5"])
+            self.assertEqual(args.resume_from, stage)
+            self.assertEqual(args.resume_h5, "/tmp/source.h5")
+
+    def test_workspace_mask_is_projected_box_not_bounding_rectangle(self):
+        registration = SimpleNamespace(
+            K=np.array([[100.0, 0.0, 50.0],
+                        [0.0, 100.0, 50.0],
+                        [0.0, 0.0, 1.0]]),
+            left_camera_T_base=np.eye(4),
+            right_camera_T_base=np.eye(4),
+            roi_left_xywh=(0, 0, 100, 100),
+            roi_right_xywh=(0, 0, 100, 100),
+            workspace_base_m={
+                "x": [-0.1, 0.1], "y": [-0.1, 0.1],
+                "z": [0.5, 1.0], "margin_px": 25},
+        )
+        mask = _projected_workspace_roi_mask(registration, right=False)
+        self.assertEqual(mask[50, 50], 255)
+        self.assertEqual(mask[5, 5], 0)
+
+    def test_workspace_mask_excludes_projected_proximal_z_sheath(self):
+        transform = np.eye(4)
+        transform[2, 3] = 1.0
+        registration = SimpleNamespace(
+            K=np.array([[100.0, 0.0, 50.0],
+                        [0.0, 100.0, 50.0],
+                        [0.0, 0.0, 1.0]]),
+            left_camera_T_base=transform,
+            right_camera_T_base=transform,
+            roi_left_xywh=(0, 0, 100, 100),
+            roi_right_xywh=(0, 0, 100, 100),
+            workspace_base_m={
+                "x": [-0.1, 0.1], "y": [-0.1, 0.1],
+                "z": [0.0, 0.5], "margin_px": 25},
+        )
+        mask = _projected_workspace_roi_mask(
+            registration, right=False,
+            sheath_exclusion_radius_mm=20.0,
+            sheath_exclusion_length_mm=60.0)
+        self.assertEqual(mask[50, 50], 0)
+        self.assertEqual(mask[50, 58], 255)
+
+    def test_snapshot_writer_emits_selected_full_resolution_png(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            writer = OverlayWriter(
+                output, fps=10.0, scale=0.5, video_enabled=False,
+                snapshots_enabled=True, snapshot_indices={2})
+            image = np.zeros((40, 60, 3), dtype=np.uint8)
+            writer.write(
+                "left", image, None, None, None, "test",
+                frame_index=1, svo_frame=100)
+            writer.write(
+                "left", image, None, None, None, "test",
+                frame_index=2, svo_frame=101)
+            writer.close()
+            path = output / "overlay_snapshots/left/frame_000002_svo_000101.png"
+            self.assertTrue(path.exists())
+            saved = cv2.imread(str(path))
+            self.assertEqual(saved.shape, image.shape)
+
     def test_final_curve_reprojection_is_measured_after_fitting(self):
         registration = SimpleNamespace(
             K=np.array([[100.0, 0.0, 0.0],
@@ -133,6 +205,17 @@ class ImageSequenceGeometryTests(unittest.TestCase):
             previous, current, tolerance_px=5.0)
         self.assertLess(coverage, 0.4)
         self.assertGreater(p95, 50.0)
+
+    def test_final_quality_bridges_only_short_bounded_good_islands(self):
+        rejected = np.array(
+            [False, True, False, False, True, False, True, False])
+        valid = np.ones(len(rejected), dtype=bool)
+        timestamps = np.arange(len(rejected), dtype=np.int64) * 30_000_000
+        stabilized = _bridge_short_good_gaps(
+            rejected, valid, timestamps, maximum_gap_ms=100.0)
+        np.testing.assert_array_equal(
+            stabilized,
+            [False, True, True, True, True, True, True, False])
 
     def test_completed_image_h5_can_be_used_as_mask_cache(self):
         with tempfile.TemporaryDirectory() as directory:

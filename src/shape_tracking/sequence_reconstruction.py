@@ -325,7 +325,13 @@ def reconstruct_disparity_anchored(
         terminal_refinement_smoothness_scale: float = 0.10,
         terminal_refinement_observation_weight: float = 4.0,
         terminal_refinement_tip_weight: float = 20.0,
-        terminal_refinement_max_p95_degradation_px: float = 0.25) -> dict:
+        terminal_refinement_max_p95_degradation_px: float = 0.25,
+        marker_left_px: np.ndarray | None = None,
+        marker_right_px: np.ndarray | None = None,
+        marker_confidence_left: np.ndarray | None = None,
+        marker_confidence_right: np.ndarray | None = None,
+        marker_disparity_weight: float = 8.0,
+        max_marker_epipolar_error_px: float = 6.0) -> dict:
     """Lift a 2D shaft centerline with robust locally regularized disparity.
 
     The registered base depth strongly constrains the proximal end. When an EM
@@ -373,6 +379,43 @@ def reconstruct_disparity_anchored(
         anchors.append((
             n_samples - 1, centerline_tip_disparity_px,
             float(centerline_tip_depth_weight)))
+    marker_anchor_count = 0
+    marker_epipolar_errors: list[float] = []
+    if marker_left_px is not None and marker_right_px is not None:
+        marker_left = np.asarray(marker_left_px, dtype=np.float64).reshape(-1, 2)
+        marker_right = np.asarray(marker_right_px, dtype=np.float64).reshape(-1, 2)
+        count = min(len(marker_left), len(marker_right))
+        confidence_left = (
+            np.ones(count, dtype=np.float64)
+            if marker_confidence_left is None else
+            np.asarray(marker_confidence_left, dtype=np.float64)[:count])
+        confidence_right = (
+            np.ones(count, dtype=np.float64)
+            if marker_confidence_right is None else
+            np.asarray(marker_confidence_right, dtype=np.float64)[:count])
+        for index in range(count):
+            left_marker, right_marker = marker_left[index], marker_right[index]
+            if not (np.all(np.isfinite(left_marker))
+                    and np.all(np.isfinite(right_marker))):
+                continue
+            epipolar_error = float(abs(left_marker[1] - right_marker[1]))
+            marker_epipolar_errors.append(epipolar_error)
+            disparity_value = float(left_marker[0] - right_marker[0])
+            confidence = float(np.sqrt(max(
+                confidence_left[index] * confidence_right[index], 0.0)))
+            if (epipolar_error > float(max_marker_epipolar_error_px)
+                    or disparity_value <= 0.25 or confidence <= 0.0):
+                continue
+            reference_marker = (
+                left_marker if reference_view == "left" else right_marker)
+            sample = int(np.argmin(np.linalg.norm(
+                reference - reference_marker, axis=1)))
+            # These are direct image correspondences.  Their finite weight is a
+            # soft disparity observation; no inter-marker length is imposed.
+            anchors.append((
+                sample, disparity_value,
+                float(marker_disparity_weight) * confidence))
+            marker_anchor_count += 1
     mask_candidates, mask_costs, ambiguous_rows = _mask_epipolar_candidates(
         reference, other_centerline, reference_view,
         row_search_px=overlap_row_search_px)
@@ -551,6 +594,10 @@ def reconstruct_disparity_anchored(
         "reference_eye_self_overlap_fraction": reference_self_overlap_fraction,
         "centerline_tip_anchor_used": int(centerline_tip_anchor_used),
         "centerline_tip_epipolar_error_px": centerline_tip_epipolar_error_px,
+        "marker_anchor_count": int(marker_anchor_count),
+        "marker_epipolar_error_max_px": (
+            float(max(marker_epipolar_errors))
+            if marker_epipolar_errors else float("nan")),
         "terminal_refinement_used": int(terminal_refinement_used),
         "terminal_refinement_improvement_px": float(
             terminal_refinement_improvement_px),

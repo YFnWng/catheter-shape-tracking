@@ -69,14 +69,27 @@ def _common_basis(sample_count: int, basis_count: int, degree: int = 3):
 
 
 def _fit_coefficients(points: np.ndarray, design: np.ndarray) -> np.ndarray:
-    """Fit the same soft-endpoint spline basis independently to each frame."""
+    """Fit the common basis while preserving each observed curve endpoint."""
     # The source has already received its spatial spline regularization.  This
-    # solve changes representation only, so use a tiny ridge rather than
-    # smoothing it for a second time.  In particular, the clamped endpoint
-    # coefficients remain observations rather than exact raw endpoint copies.
-    normal = design.T @ design + 1e-9 * np.eye(design.shape[1])
-    projector = np.linalg.solve(normal, design.T)
-    return np.einsum("ks,tsd->tkd", projector, points)
+    # solve changes representation only.  Clamped endpoint coefficients are
+    # direct observations and are then zero-phase filtered like every other
+    # coefficient.  Solving only the interior prevents a least-squares
+    # representation change from pulling the near-tip segment off an otherwise
+    # accurate observed endpoint.
+    basis_count = design.shape[1]
+    fixed = np.array([0, basis_count - 1])
+    free = np.arange(1, basis_count - 1)
+    coefficients = np.zeros(
+        (len(points), basis_count, points.shape[2]), dtype=np.float64)
+    coefficients[:, 0] = points[:, 0]
+    coefficients[:, -1] = points[:, -1]
+    adjusted = points - np.einsum(
+        "sf,tfd->tsd", design[:, fixed], coefficients[:, fixed])
+    free_design = design[:, free]
+    normal = free_design.T @ free_design + 1e-9 * np.eye(len(free))
+    projector = np.linalg.solve(normal, free_design.T)
+    coefficients[:, free] = np.einsum("ks,tsd->tkd", projector, adjusted)
+    return coefficients
 
 
 def _evaluate_geometry(
@@ -172,7 +185,10 @@ def smooth_distal_spline_coefficients_hdf5(
         outlier_floor_mm: float = 0.75,
         frame_outlier_fraction: float = 0.5,
         terminal_outlier_sample_count: int = 4,
-        max_learning_mask_width_px: float = 20.0) -> dict[str, float]:
+        max_learning_mask_width_px: float = 20.0,
+        observation_blend: float = 0.35,
+        terminal_observation_blend: float = 0.65,
+        reject_recovered_outliers: bool = True) -> dict[str, float]:
     """Filter distal shape trajectories in a fixed material spline basis.
 
     A preliminary robust coefficient trajectory supplies a leave-no-phase
@@ -207,6 +223,14 @@ def smooth_distal_spline_coefficients_hdf5(
             observed_points[valid], design)
 
         reprojection = output["quality/reprojection_p95_px"][:].astype(float)
+        # For joint two-view reconstruction the disparity curve is only an
+        # initializer. Weight the observed coefficient trajectory using the
+        # actual per-frame joint fit whenever that diagnostic is available.
+        if "quality/fitted_reprojection_p95_px" in output:
+            fitted_reprojection = output[
+                "quality/fitted_reprojection_p95_px"][:].astype(float)
+            use_fitted = np.isfinite(fitted_reprojection)
+            reprojection[use_fitted] = fitted_reprojection[use_fitted]
         condition = output["quality/stereo_condition"][:].astype(float)
         frame_weight = (
             np.exp(-np.clip(reprojection, 0.0, 50.0) / 12.0)
@@ -271,6 +295,31 @@ def smooth_distal_spline_coefficients_hdf5(
             observed_coefficients, timestamps, final_valid, final_weights,
             cutoff_hz, huber_delta_mm, iterations, maximum_gap_ms,
             terminal_cutoff_hz, terminal_basis_count)
+        # Robust low-pass filtering removes coefficient jitter, but it can also
+        # pull a genuinely observed curve away from both image centerlines. Add
+        # a bounded measurement update after the zero-phase solve. Local
+        # coefficient confidence makes this update vanish for snap outliers;
+        # well-supported terminal coefficients receive more authority because
+        # small near-tip errors are especially visible after projection.
+        measurement_gain = (
+            np.clip(float(observation_blend), 0.0, 1.0)
+            * frame_weight[:, None] * coefficient_confidence)
+        terminal_basis = int(np.clip(
+            terminal_basis_count, 0, design.shape[1]))
+        if terminal_basis:
+            measurement_gain[:, -terminal_basis:] = (
+                np.clip(float(terminal_observation_blend), 0.0, 1.0)
+                * frame_weight[:, None]
+                * coefficient_confidence[:, -terminal_basis:])
+        measurement_gain = np.clip(measurement_gain, 0.0, 1.0)
+        measurement_supported = (
+            final_valid[:, None, None]
+            & np.isfinite(observed_coefficients)
+            & np.isfinite(final_coefficients))
+        corrected = final_coefficients + measurement_gain[:, :, None] * (
+            observed_coefficients - final_coefficients)
+        final_coefficients[measurement_supported] = corrected[
+            measurement_supported]
 
         def dataset(name: str, shape, dtype=np.float32, fillvalue=np.nan):
             if name in output:
@@ -342,8 +391,14 @@ def smooth_distal_spline_coefficients_hdf5(
         rejection_flags[~valid] |= LEARNING_REJECT_RECONSTRUCTION
         rejection_flags[temporal_unsupported] |= (
             LEARNING_REJECT_TEMPORAL_UNSUPPORTED)
-        rejection_flags[frame_outlier] |= LEARNING_REJECT_SHAPE_OUTLIER
-        rejection_flags[terminal_outlier] |= LEARNING_REJECT_TERMINAL_OUTLIER
+        # A direct joint two-view fit may move substantially from its disparity
+        # initializer and therefore look like an observation outlier.  If the
+        # zero-phase coefficient solve recovers it and the final two-view
+        # geometry check passes, that innovation is diagnostic rather than a
+        # reason to discard an otherwise image-supported learning sample.
+        if reject_recovered_outliers:
+            rejection_flags[frame_outlier] |= LEARNING_REJECT_SHAPE_OUTLIER
+            rejection_flags[terminal_outlier] |= LEARNING_REJECT_TERMINAL_OUTLIER
         rejection_flags[mask_width_rejected] |= LEARNING_REJECT_MASK_WIDTH
         rejection_flags_ds[:] = rejection_flags
         learning_valid_ds[:] = (rejection_flags == 0).astype(np.uint8)
@@ -381,6 +436,10 @@ def smooth_distal_spline_coefficients_hdf5(
             terminal_cutoff_hz)
         output.attrs["distal_temporal_terminal_basis_count"] = int(
             terminal_basis_count)
+        output.attrs["distal_temporal_observation_blend"] = float(
+            observation_blend)
+        output.attrs["distal_temporal_terminal_observation_blend"] = float(
+            terminal_observation_blend)
         output.attrs["distal_temporal_huber_delta_mm"] = float(huber_delta_mm)
         output.attrs["distal_temporal_outlier_sigma"] = float(outlier_sigma)
         output.attrs["distal_temporal_outlier_floor_mm"] = float(
@@ -432,6 +491,9 @@ def main(argv=None) -> None:
     parser.add_argument("--frame-outlier-fraction", type=float, default=0.5)
     parser.add_argument("--terminal-outlier-samples", type=int, default=4)
     parser.add_argument("--max-learning-mask-width-px", type=float, default=20.0)
+    parser.add_argument("--observation-blend", type=float, default=0.35)
+    parser.add_argument(
+        "--terminal-observation-blend", type=float, default=0.65)
     args = parser.parse_args(argv)
     summary = smooth_distal_spline_coefficients_hdf5(
         args.h5, cutoff_hz=args.cutoff_hz,
@@ -443,7 +505,9 @@ def main(argv=None) -> None:
         outlier_floor_mm=args.outlier_floor_mm,
         frame_outlier_fraction=args.frame_outlier_fraction,
         terminal_outlier_sample_count=args.terminal_outlier_samples,
-        max_learning_mask_width_px=args.max_learning_mask_width_px)
+        max_learning_mask_width_px=args.max_learning_mask_width_px,
+        observation_blend=args.observation_blend,
+        terminal_observation_blend=args.terminal_observation_blend)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 

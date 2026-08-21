@@ -14,6 +14,7 @@ from shape_tracking.sam_segmentation import (
 )
 from shape_tracking.image_sequence import (
     _BackgroundPrefetch,
+    _centerline_outside_mask_fraction,
     _centerline_prompt,
     _mask_effective_width,
     _stereo_guided_retry_result,
@@ -206,6 +207,10 @@ class SamSegmentationUtilitiesTests(unittest.TestCase):
         self.assertLess(_mask_effective_width(restricted), 18.0)
         self.assertLess(
             np.median(np.abs(restricted.material.points[:, 0] - 110.0)), 2.0)
+        local = np.rint(restricted.material.points).astype(int)
+        self.assertTrue(np.all(
+            restricted.material.mask[local[:, 1], local[:, 0]] > 0))
+        self.assertEqual(_centerline_outside_mask_fraction(restricted), 0.0)
 
     def test_temporal_prompt_covers_entire_previous_centerline(self):
         mask = np.ones((100, 200), dtype=np.uint8) * 255
