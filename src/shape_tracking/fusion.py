@@ -1,8 +1,9 @@
 """Fuse processed catheter shape, EM tip tracking, and robot actuation.
 
-The command stream is the canonical timeline.  Image observations are matched
-by nearest timestamp (never interpolated), while the two EM coils are
-interpolated and fused by :class:`shape_tracking.session.EmSynchronizer`.
+The output can use either the command stream or image frames as its canonical
+timeline. Image observations are matched by nearest timestamp (never
+interpolated), while robot feedback and the two EM coils are synchronized onto
+that timeline.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from .session import EmSynchronizer, TipPose, load_session_registration
 
 @dataclass(frozen=True)
 class FusionConfig:
+    timeline: str = "actuation"
     max_image_offset_ms: float = 25.0
     max_command_age_ms: float = 30.0
     max_feedback_gap_ms: float = 30.0
@@ -62,6 +64,47 @@ def select_actuation_timestamps(
     if len(selected) == 0:
         raise ValueError(
             "no actuation samples selected; verify collection markers/time bounds")
+    return selected
+
+
+def select_image_timestamps(
+        image_h5: os.PathLike | str,
+        markers: dict[str, dict],
+        window: str = "run_and_return",
+        start_ns: int | None = None,
+        end_ns: int | None = None,
+        stride: int = 1,
+        max_samples: int | None = None) -> np.ndarray:
+    """Select unique processed-image timestamps for a training-rate export."""
+    import h5py
+
+    if window not in ("trajectory", "run_and_return", "recording"):
+        raise ValueError(f"unsupported window: {window}")
+    if start_ns is None and window in ("trajectory", "run_and_return"):
+        start_ns = (markers.get("run_start") or {}).get("stamp_ns")
+    if end_ns is None and window == "trajectory":
+        end_ns = (markers.get("return_start") or {}).get("stamp_ns")
+    if end_ns is None and window == "run_and_return":
+        end_ns = (markers.get("run_end") or {}).get("stamp_ns")
+    path = Path(image_h5).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    with h5py.File(path, "r") as source:
+        if "frames/timestamp_ns" not in source:
+            raise ValueError("image HDF5 lacks frames/timestamp_ns")
+        timestamps = np.asarray(source["frames/timestamp_ns"], dtype=np.int64)
+    keep = timestamps > 0
+    if start_ns is not None:
+        keep &= timestamps >= int(start_ns)
+    if end_ns is not None:
+        keep &= timestamps < int(end_ns)
+    selected = timestamps[keep][::max(1, int(stride))]
+    if max_samples is not None:
+        selected = selected[:max(0, int(max_samples))]
+    if len(selected) == 0:
+        raise ValueError("no image samples selected; verify image/time bounds")
+    if np.any(np.diff(selected) <= 0):
+        raise ValueError("selected image timestamps must be strictly increasing")
     return selected
 
 
@@ -175,6 +218,13 @@ def _write_image(
             "learning_valid": source_learning_valid,
             "valid": valid,
         }
+        for frame_name in (
+                "observation_valid", "pre_interpolation_valid",
+                "curve_temporally_interpolated"):
+            source_name = f"frames/{frame_name}"
+            if source_name in source:
+                scalar[frame_name] = _gather_dataset(
+                    source[source_name], index).astype(np.uint8)
         if "frames/learning_rejection_flags" in source:
             scalar["learning_rejection_flags"] = _gather_dataset(
                 source["frames/learning_rejection_flags"], index)
@@ -207,6 +257,12 @@ def _write_image(
                     _create_numeric_dataset(destination, name, values)
         group.attrs["source_path"] = str(image_h5.resolve())
         group.attrs["source_schema_version"] = source.attrs.get("schema_version", -1)
+        # Preserve every source-level processing/smoothing attribute under a
+        # namespace. This includes exact configuration/provenance and the
+        # interpolation/filter representation, without making the fused file
+        # pretend that those attributes describe EM or robot signals.
+        for attribute, value in source.attrs.items():
+            group.attrs[f"source_{attribute}"] = value
     return valid
 
 
@@ -269,12 +325,16 @@ def write_fused_dataset(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     with h5py.File(output_path, "w") as output:
-        output.attrs["schema_version"] = 1
-        output.attrs["mode"] = "actuation_clock_sensor_fusion"
+        output.attrs["schema_version"] = 2
+        if config.timeline not in ("actuation", "image"):
+            raise ValueError(f"unsupported fusion timeline: {config.timeline}")
+        output.attrs["mode"] = f"{config.timeline}_clock_sensor_fusion"
         output.attrs["coordinate_frame"] = "robot_base"
         output.attrs["position_units"] = "mm"
         output.attrs["curvature_units"] = "1/mm"
-        output.attrs["master_clock"] = "rosbag_joint_velocity_command"
+        output.attrs["master_clock"] = (
+            "processed_image_frame" if config.timeline == "image"
+            else "rosbag_joint_velocity_command")
         output.attrs["robot_joint_order_json"] = json.dumps([
             "catheter_lin", "catheter_rot", "catheter_bend",
             "sheath_lin", "sheath_rot", "sheath_bend"])
@@ -360,8 +420,14 @@ def fuse_session(
 
     streams = load_robot_streams(session)
     markers = load_collection_markers(session)
-    query_ns = select_actuation_timestamps(
-        streams, markers, window, start_ns, end_ns, stride, max_samples)
+    if config.timeline == "image":
+        if not use_image:
+            raise ValueError("the image timeline requires --image-data")
+        query_ns = select_image_timestamps(
+            image_path, markers, window, start_ns, end_ns, stride, max_samples)
+    else:
+        query_ns = select_actuation_timestamps(
+            streams, markers, window, start_ns, end_ns, stride, max_samples)
     aligned = align_robot_streams(
         streams, query_ns, config.max_command_age_ms,
         config.max_feedback_gap_ms)
@@ -383,6 +449,7 @@ def fuse_session(
         "start_ns": int(query_ns[0]),
         "end_ns": int(query_ns[-1]),
         "stride": int(stride),
+        "timeline": config.timeline,
         "collection_markers": markers,
         "image_path": str(image_path) if use_image else None,
         "em_csv_path": str(em_path) if use_em else None,
@@ -418,6 +485,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-ns", type=int, default=None)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--timeline", choices=("actuation", "image"), default="actuation",
+        help=("canonical output clock; image avoids repeated shapes and is "
+              "recommended for image-based dynamics learning"))
     parser.add_argument("--max-image-offset-ms", type=float, default=25.0)
     parser.add_argument("--max-command-age-ms", type=float, default=30.0)
     parser.add_argument("--max-feedback-gap-ms", type=float, default=30.0)
@@ -429,6 +500,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> None:
     args = _build_parser().parse_args(argv)
     config = FusionConfig(
+        timeline=args.timeline,
         max_image_offset_ms=args.max_image_offset_ms,
         max_command_age_ms=args.max_command_age_ms,
         max_feedback_gap_ms=args.max_feedback_gap_ms,

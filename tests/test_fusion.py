@@ -9,6 +9,7 @@ from shape_tracking.fusion import (
     FusionConfig,
     nearest_sample_indices,
     select_actuation_timestamps,
+    select_image_timestamps,
     write_fused_dataset,
 )
 from shape_tracking.robot_data import RobotStreams, TimedJointSeries, align_robot_streams
@@ -57,6 +58,9 @@ class FusionTests(unittest.TestCase):
             frames["valid"] = np.array([1, 0], np.uint8)
             frames["learning_valid"] = np.array([1, 0], np.uint8)
             frames["learning_rejection_flags"] = np.array([0, 1], np.uint16)
+            frames["observation_valid"] = np.array([1, 1], np.uint8)
+            frames["pre_interpolation_valid"] = np.array([1, 0], np.uint8)
+            frames["curve_temporally_interpolated"] = np.array([0, 1], np.uint8)
             frames["svo_frame"] = np.array([3, 4], np.int32)
             frames.create_dataset(
                 "status", data=np.array(["valid", "bad"], object),
@@ -86,6 +90,16 @@ class FusionTests(unittest.TestCase):
             {"run_start": {"stamp_ns": 10}, "run_end": {"stamp_ns": 30}},
             stride=2)
         self.assertEqual(selected.tolist(), [10])
+
+    def test_run_window_can_use_unique_image_clock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "image.h5"
+            self._write_image(image_path)
+            selected = select_image_timestamps(
+                image_path,
+                {"run_start": {"stamp_ns": 9_000_000},
+                 "run_end": {"stamp_ns": 30_000_000}})
+            self.assertEqual(selected.tolist(), [9_000_000, 29_000_000])
 
     def test_image_only_em_only_and_both(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -120,6 +134,9 @@ class FusionTests(unittest.TestCase):
                         self.assertEqual(
                             output["image/learning_rejection_flags"][:].tolist(),
                             [0, 1, 1])
+                        self.assertEqual(
+                            output["image/curve_temporally_interpolated"][:]
+                            .tolist(), [0, 1, 1])
                     expected = [1, 1, 1]
                     if use_image:
                         expected[1:] = [0, 0]
@@ -146,6 +163,27 @@ class FusionTests(unittest.TestCase):
                     output["image/valid"][:].tolist(), [0, 0, 0])
                 self.assertEqual(
                     output["frames/fusion_valid"][:].tolist(), [0, 0, 0])
+
+    def test_image_clock_metadata_and_exact_image_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            image_path = directory / "image.h5"
+            self._write_image(image_path)
+            query = np.array([9_000_000, 29_000_000], np.int64)
+            streams = RobotStreams(
+                _series(query), _series(query), _series(query))
+            robot = align_robot_streams(streams, query)
+            output_path = directory / "fused.h5"
+            write_fused_dataset(
+                output_path, query, robot, image_h5=image_path,
+                use_image=True, config=FusionConfig(timeline="image"))
+            with h5py.File(output_path, "r") as output:
+                self.assertEqual(output.attrs["master_clock"],
+                                 "processed_image_frame")
+                self.assertEqual(output["image/source_index"][:].tolist(),
+                                 [0, 1])
+                self.assertEqual(output["image/is_new_sample"][:].tolist(),
+                                 [1, 1])
 
 
 if __name__ == "__main__":

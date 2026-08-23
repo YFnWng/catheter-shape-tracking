@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -51,8 +52,13 @@ from .marked_segmentation import (
     catheter_color_likelihood,
     extract_marked_chromatic_result,
     refine_marked_stereo_pair,
+    reroute_marked_centerline,
+    enforce_stereo_epipolar_sweep,
+    center_marked_route_on_mask,
+    _smooth_marker_route,
 )
 from .robot_data import AlignedRobotData, align_robot_streams, load_robot_streams
+from .temporal_markers import repair_stereo_marker_tracks
 from .sam_segmentation import (
     AutomaticPromptResult,
     PromptSet,
@@ -65,11 +71,13 @@ from .sam_segmentation import (
 from .segmentation import Centerline, resample_arclength
 from .sequence import load_collection_markers, select_frame_records
 from .sequence_reconstruction import (
+    epipolar_mask_ambiguity_fraction,
     project_camera_points,
     reconstruct_disparity_anchored,
 )
 from .stereo_smoothing import smooth_stereo_disparity_hdf5
 from .spline_temporal_smoothing import (
+    interpolate_short_spline_gaps_hdf5,
     smooth_distal_spline_coefficients_hdf5,
 )
 from .session import (
@@ -137,12 +145,21 @@ class ImageProcessingConfig:
     spline_temporal_terminal_outlier_samples: int = 4
     spline_temporal_observation_blend: float = 0.35
     spline_temporal_terminal_observation_blend: float = 0.65
+    spline_interpolation_max_gap_ms: float = 650.0
+    spline_interpolation_max_good_island_frames: int = 2
     distal_boundary_search_half_width_mm: float = 12.0
     curvature_smoothing_mm: float = 0.25
     curvature_spline_bases: int = 20
     max_base_endpoint_distance_mm: float = 15.0
     max_stereo_centerline_length_ratio: float = 1.8
     marked_stereo_guided_retry_ratio: float = 1.23
+    marked_ill_epipolar_ambiguity_fraction: float = 0.30
+    stereo_ill_switch_confirm_frames: int = 5
+    max_inferred_centerline_temporal_p95_px: float = 8.0
+    max_inferred_centerline_temporal_max_px: float = 14.0
+    max_inferred_sharp_turn_clusters: int = 1
+    ill_eye_min_observation_weight: float = 0.20
+    ill_eye_temporal_shape_sigma_mm: float = 6.0
     stereo_reference_switch_ratio: float = 1.15
     min_centerline_points: int = 20
     min_sam_iou: float = 0.25
@@ -155,12 +172,18 @@ class ImageProcessingConfig:
     max_p95_reprojection_px: float = 12.0
     max_tip_epipolar_error_px: float = 5.0
     max_tip_endpoint_error_px: float = 8.0
+    marker_tip_endpoint_width_scale: float = 0.40
+    marker_tip_endpoint_width_cap_px: float = 12.0
+    max_final_mask_outside_fraction: float = 0.20
+    max_final_mask_distance_p95_px: float = 6.0
     chromatic_min_saturation: int = 55
     chromatic_min_value: int = 30
     chromatic_background_subtraction: bool = True
     chromatic_background_samples: int = 21
     chromatic_background_difference: int = 18
     marker_min_confidence: float = 0.50
+    marked_epipolar_sweep_deficit_px: float = 4.0
+    marked_epipolar_sweep_row_half_width_px: int = 3
     marker_disparity_weight: float = 8.0
     marker_interface_weight_scale: float = 2.0
     marker_tip_weight_scale: float = 3.0
@@ -180,6 +203,7 @@ class ImageProcessingConfig:
     sam_frame_batch_size: int = 1
     sam_postprocess_workers: int = 2
     prompt_workers: int = 4
+    chromatic_eye_workers: int = 2
     preprocess_chunk_size: int = 16
     prefetch_frames: int = 16
     hdf_buffer_frames: int = 128
@@ -334,6 +358,19 @@ def _external_mask_result(
         yellow_tip_xy=tip)
 
 
+def _ordered_material_boundary_index(
+        points_xy: np.ndarray, boundary_point_xy: np.ndarray,
+        boundary_fraction: float) -> int:
+    """Map an interface to route order without cross-branch nearest snapping."""
+    points = np.asarray(points_xy, dtype=float)
+    if np.isfinite(boundary_fraction):
+        return int(np.clip(round(
+            float(boundary_fraction) * max(len(points) - 1, 1)),
+            0, len(points) - 1))
+    return int(np.argmin(np.linalg.norm(
+        points - np.asarray(boundary_point_xy, dtype=float), axis=1)))
+
+
 class PropagatedMaskCache:
     """Read propagation masks or masks from a completed image HDF5."""
 
@@ -354,6 +391,58 @@ class PropagatedMaskCache:
             self.file.close()
             raise ValueError("mask cache does not contain the requested frame sequence")
         self.source_indices = safe.astype(np.int64)
+        self.temporal_marker_tracks = None
+        self.temporal_marker_reroute = np.zeros(len(actual), dtype=bool)
+        if (self.layout == "processed_image"
+                and "frames/timestamp_ns" in self.file
+                and all(
+                    f"images/{view}/marker_centers_px" in self.file
+                    for view in ("left", "right"))):
+            self.temporal_marker_tracks = repair_stereo_marker_tracks(
+                {view: self.file[
+                    f"images/{view}/marker_centers_px"][:]
+                 for view in ("left", "right")},
+                {view: self.file[
+                    f"images/{view}/marker_widths_px"][:]
+                 for view in ("left", "right")},
+                {view: self.file[
+                    f"images/{view}/marker_confidence"][:]
+                 for view in ("left", "right")},
+                {view: self.file[
+                    f"images/{view}/marker_observed"][:]
+                 for view in ("left", "right")},
+                self.file["frames/timestamp_ns"][:])
+            changed = np.zeros(len(actual), dtype=bool)
+            for view in ("left", "right"):
+                prefix = f"images/{view}"
+                original_centers = np.asarray(
+                    self.file[f"{prefix}/marker_centers_px"][:], float)
+                original_observed = np.asarray(
+                    self.file[f"{prefix}/marker_observed"][:], bool)
+                repaired = self.temporal_marker_tracks[view]
+                repaired_centers = np.asarray(repaired["centers"], float)
+                repaired_observed = np.asarray(repaired["observed"], bool)
+                both = (np.all(np.isfinite(original_centers), axis=2)
+                        & np.all(np.isfinite(repaired_centers), axis=2))
+                displacement = np.zeros(both.shape, dtype=float)
+                displacement[both] = np.linalg.norm(
+                    original_centers[both] - repaired_centers[both], axis=1)
+                changed |= np.any(
+                    (original_observed != repaired_observed)
+                    | np.asarray(repaired["interpolated"], bool)
+                    | (displacement > 0.25), axis=1)
+            # Routing is temporally regularized, so also revisit a short halo
+            # around every repaired marker instead of creating a seam at the
+            # exact repair boundary.
+            changed_indices = np.flatnonzero(changed)
+            for offset in range(-2, 3):
+                indices = changed_indices + offset
+                indices = indices[(indices >= 0) & (indices < len(changed))]
+                self.temporal_marker_reroute[indices] = True
+
+    def marker_track_requires_reroute(self, index: int) -> bool:
+        """Whether repaired marker evidence warrants rebuilding the 2D path."""
+        return bool(self.temporal_marker_reroute[self.source_indices[index]])
 
     def result(
             self, index: int, view: str, image: np.ndarray,
@@ -378,16 +467,72 @@ class PropagatedMaskCache:
                 and f"images/{view}/marker_centers_px" in self.file):
             source_index = self.source_indices[index]
             prefix = f"images/{view}"
+            observation_name = (
+                f"{prefix}/observed_centerline_px"
+                if f"{prefix}/observed_centerline_px" in self.file
+                else f"{prefix}/centerline_px")
             points = np.asarray(
-                self.file[f"{prefix}/centerline_px"][source_index],
-                dtype=np.float64)
+                self.file[observation_name][source_index], dtype=np.float64)
+            finite_points = points[np.all(np.isfinite(points), axis=1)]
+            track = (
+                None if self.temporal_marker_tracks is None
+                else self.temporal_marker_tracks[view])
+            marker_confidence = np.asarray(
+                track["confidence"][source_index] if track is not None
+                else self.file[f"{prefix}/marker_confidence"][source_index])
+            if len(finite_points) < 2:
+                # A failed source reconstruction can still contain a complete
+                # packed chromatic mask. Rebuild only the initial image route;
+                # repaired markers and the normal marked rerouting stages will
+                # subsequently recover material order. This preserves useful
+                # image evidence instead of forcing the 3D gap bridge to work
+                # from masks that were never exposed to reconstruction.
+                rebuilt = _external_mask_result(
+                    image, roi, base_point, mask,
+                    source="cached_mask_route_rebuilt", confidence=1.0)
+                stored_tip = np.asarray(
+                    self.file[f"{prefix}/yellow_tip_px"][source_index])
+                return replace(
+                    rebuilt,
+                    prompt=replace(
+                        rebuilt.prompt,
+                        source=rebuilt.prompt.source + "+temporal_markers"),
+                    yellow_tip_xy=(
+                        stored_tip if np.all(np.isfinite(stored_tip)) else None),
+                    marker_centers_xy=np.asarray(
+                        track["centers"][source_index] if track is not None
+                        else self.file[
+                            f"{prefix}/marker_centers_px"][source_index]),
+                    marker_widths_px=np.asarray(
+                        track["widths"][source_index] if track is not None
+                        else self.file[
+                            f"{prefix}/marker_widths_px"][source_index]),
+                    marker_confidence=marker_confidence,
+                    marker_observed=np.asarray(
+                        track["observed"][source_index] if track is not None
+                        else self.file[
+                            f"{prefix}/marker_observed"][source_index]),
+                    marker_interpolated=(
+                        np.asarray(track["interpolated"][source_index])
+                        if track is not None else np.zeros(4, dtype=np.uint8)),
+                    marker_raw_cluster_count=int(self.file[
+                        f"{prefix}/marker_raw_cluster_count"][source_index]),
+                    tip_source="stored_marked_observation")
+            points = finite_points
             boundary_point = np.asarray(
                 self.file[f"{prefix}/distal_boundary_px"][source_index],
                 dtype=np.float64)
-            boundary = int(np.argmin(np.linalg.norm(
-                points - boundary_point, axis=1)))
-            marker_confidence = np.asarray(
-                self.file[f"{prefix}/marker_confidence"][source_index])
+            # In a projected V, the interface and a distal branch can occupy
+            # nearly the same pixel. Euclidean nearest-point lookup can then
+            # place the color split at the tip and draw the whole catheter as
+            # proximal blue. The stored material fraction preserves route
+            # order and is the correct coordinate for the observed overlay.
+            fraction_name = "quality/material_boundary_fraction"
+            boundary_fraction = (
+                float(self.file[fraction_name][source_index])
+                if fraction_name in self.file else float("nan"))
+            boundary = _ordered_material_boundary_index(
+                points, boundary_point, boundary_fraction)
             confidence = float(marker_confidence[0])
             material = MaterialCenterline(
                 centerline=Centerline(
@@ -419,6 +564,9 @@ class PropagatedMaskCache:
             stored_tip = np.asarray(
                 self.file[f"{prefix}/yellow_tip_px"][source_index])
             tip = stored_tip if np.all(np.isfinite(stored_tip)) else None
+            if track is not None:
+                prompt = replace(
+                    prompt, source=prompt.source + "+temporal_markers")
             return SamMaterialResult(
                 material=material,
                 prompt=prompt,
@@ -428,13 +576,19 @@ class PropagatedMaskCache:
                 seed_recall=float(self.file[f"{prefix}/seed_recall"][source_index]),
                 mask_area_px=int(np.count_nonzero(mask)),
                 yellow_tip_xy=tip,
-                marker_centers_xy=np.asarray(self.file[
-                    f"{prefix}/marker_centers_px"][source_index]),
-                marker_widths_px=np.asarray(self.file[
-                    f"{prefix}/marker_widths_px"][source_index]),
+                marker_centers_xy=np.asarray(
+                    track["centers"][source_index] if track is not None
+                    else self.file[f"{prefix}/marker_centers_px"][source_index]),
+                marker_widths_px=np.asarray(
+                    track["widths"][source_index] if track is not None
+                    else self.file[f"{prefix}/marker_widths_px"][source_index]),
                 marker_confidence=marker_confidence,
-                marker_observed=np.asarray(self.file[
-                    f"{prefix}/marker_observed"][source_index]),
+                marker_observed=np.asarray(
+                    track["observed"][source_index] if track is not None
+                    else self.file[f"{prefix}/marker_observed"][source_index]),
+                marker_interpolated=(
+                    np.asarray(track["interpolated"][source_index])
+                    if track is not None else np.zeros(4, dtype=np.uint8)),
                 marker_raw_cluster_count=int(self.file[
                     f"{prefix}/marker_raw_cluster_count"][source_index]),
                 tip_source="stored_marked_observation")
@@ -497,6 +651,39 @@ def _sam_provenance(checkpoint: Path, config: str) -> dict:
     }
 
 
+def _repository_provenance() -> dict:
+    """Identify the exact local processing source, including dirty edits."""
+    root = Path(__file__).resolve().parents[2]
+    commit = "unknown"
+    status: list[str] = []
+    try:
+        commit_result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True)
+        commit = commit_result.stdout.strip()
+        status_result = subprocess.run(
+            ["git", "-C", str(root), "status", "--short"], check=True,
+            capture_output=True, text=True)
+        status = status_result.stdout.splitlines()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    digest = hashlib.sha256()
+    source_root = root / "src" / "shape_tracking"
+    for path in sorted(source_root.rglob("*.py")):
+        digest.update(str(path.relative_to(root)).encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    return {
+        "repository_root": str(root),
+        "git_commit": commit,
+        "git_dirty": bool(status),
+        "git_status_short": status,
+        "shape_tracking_source_sha256": digest.hexdigest(),
+    }
+
+
 def _camera_point_from_base(camera_T_base: np.ndarray, point_base_mm: np.ndarray) -> np.ndarray:
     return transform_points(
         camera_T_base, np.asarray(point_base_mm, dtype=np.float64) * 1e-3)
@@ -514,6 +701,546 @@ def _project_base_points(registration, points_base_mm: np.ndarray, right: bool =
     camera = transform_points(transform, np.asarray(points_base_mm) * 1e-3)
     return project_camera_points(
         camera, registration.K, registration.baseline_m, right=False)
+
+
+def _joint_temporal_stereo_prior(
+        registration, points_base_mm: np.ndarray,
+        sample_count: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return material-indexed disparity and left-camera points for time t+1.
+
+    The disparity initializer is followed by a two-view joint optimization.
+    Carrying the pre-joint disparity forward can therefore preserve a branch
+    that the joint fit just corrected.  Resampling the finalized 3D curve here
+    makes the next frame's temporal prior describe the actual stored shape.
+    """
+    points = np.asarray(points_base_mm, dtype=np.float64)
+    source_s = cumulative_arclength(points)
+    if len(points) < 2 or source_s[-1] <= 1e-9:
+        raise ValueError("joint temporal prior has zero arc length")
+    target_s = np.linspace(0.0, source_s[-1], int(sample_count))
+    sampled = np.column_stack([
+        np.interp(target_s, source_s, points[:, coordinate])
+        for coordinate in range(3)])
+    left = _project_base_points(registration, sampled, right=False)
+    right = _project_base_points(registration, sampled, right=True)
+    disparity = left[:, 0] - right[:, 0]
+    camera = transform_points(
+        registration.left_camera_T_base, sampled * 1e-3)
+    if (not np.all(np.isfinite(disparity))
+            or np.any(disparity <= 0.25)
+            or not np.all(np.isfinite(camera))):
+        raise ValueError("joint temporal prior is not projectable")
+    return disparity, camera
+
+
+def _replace_material_path(
+        result: SamMaterialResult,
+        ordered_points_xy: np.ndarray) -> SamMaterialResult:
+    """Replace a collapsed cyan route with an inferred mask-supported route."""
+    material = result.material
+    points = np.asarray(ordered_points_xy, dtype=np.float64)
+    if len(points) < 2 or not np.all(np.isfinite(points)):
+        raise ValueError("inferred material path is invalid")
+    mask = np.asarray(material.mask) > 0
+    support_rows, support_columns = np.where(mask)
+    if not len(support_columns):
+        raise ValueError("inferred material path has no target-mask support")
+    roi_x, roi_y, _, _ = material.roi
+    support = np.column_stack([
+        support_columns + roi_x, support_rows + roi_y]).astype(np.float64)
+    local = np.rint(points - [roi_x, roi_y]).astype(int)
+    in_bounds = (
+        (local[:, 0] >= 0) & (local[:, 0] < mask.shape[1])
+        & (local[:, 1] >= 0) & (local[:, 1] < mask.shape[0]))
+    supported = np.zeros(len(points), dtype=bool)
+    supported[in_bounds] = mask[
+        local[in_bounds, 1], local[in_bounds, 0]]
+    support_tree = cKDTree(support)
+    for index in np.flatnonzero(~supported):
+        # Complete a missing DP row on that same epipolar line whenever
+        # possible. A global nearest-mask snap can cross to the other V arm.
+        row = int(np.rint(points[index, 1] - roi_y))
+        columns = (
+            np.flatnonzero(mask[row])
+            if 0 <= row < mask.shape[0] else np.empty(0, dtype=int))
+        if len(columns):
+            column = int(columns[np.argmin(np.abs(
+                columns + roi_x - points[index, 0]))])
+            points[index] = [column + roi_x, row + roi_y]
+        else:
+            points[index] = support[int(support_tree.query(
+                points[index], k=1)[1])]
+    # Do not resample/smooth/snap the inferred corridor here. Those operations
+    # are not topology-aware and previously undid the DP branch choices. The
+    # downstream 3D B-spline supplies spatial smoothness in material order.
+    old_boundary = material.points[int(np.clip(
+        material.distal_boundary_index, 0, len(material.points) - 1))]
+    boundary = int(np.argmin(np.linalg.norm(points - old_boundary, axis=1)))
+    old_profile = np.asarray(material.brightness_profile, dtype=np.float64)
+    if len(old_profile) >= 2:
+        brightness = np.interp(
+            np.linspace(0.0, 1.0, len(points)),
+            np.linspace(0.0, 1.0, len(old_profile)), old_profile)
+    else:
+        brightness = np.full(len(points), np.nan)
+    inferred = MaterialCenterline(
+        centerline=Centerline(
+            points, material.roi, material.mask,
+            material.centerline.radius_px),
+        distal_boundary_index=boundary,
+        distal_boundary_fraction=float(boundary / max(len(points) - 1, 1)),
+        boundary_confidence=material.boundary_confidence,
+        boundary_contrast=material.boundary_contrast,
+        material_valid=material.material_valid,
+        brightness_profile=brightness)
+    return replace(result, material=inferred)
+
+
+def _distal_medial_ridge_evidence(
+        image: np.ndarray,
+        result: SamMaterialResult,
+        max_points: int = 1200) -> np.ndarray:
+    """Return unordered distal-color medial support in full-image pixels.
+
+    The final topology optimizer must see the alternative arm of a tight V;
+    feeding it the already ordered cyan curve would merely preserve that
+    curve's branch decision.  These samples therefore come directly from the
+    independently formed chromatic mask.  Dark proximal blue is excluded by
+    channel direction, while cyan, red rings, and the small yellow end remain.
+    """
+    material = result.material
+    roi_x, roi_y, width, height = material.roi
+    crop = np.asarray(image[roi_y:roi_y + height, roi_x:roi_x + width])
+    mask = np.asarray(material.mask) > 0
+    if crop.shape[:2] != mask.shape:
+        raise ValueError("ridge evidence image/mask shape mismatch")
+    b, g, r = [crop[:, :, channel].astype(np.int16) for channel in range(3)]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    chromatic = (hsv[:, :, 1] >= 38) & (hsv[:, :, 2] >= 25)
+    cyan = (b - r >= 24) & (g - r >= 18) & (g >= 42)
+    red_ring = (r - g >= 20) & (r >= 48)
+    yellow = (r - b >= 20) & (g - b >= 12) & (g >= 45)
+    distal_support = mask & chromatic & (cyan | red_ring | yellow)
+    # Centering must be defined by the complete silhouette.  Using the
+    # thresholded paint subset makes the ridge follow whichever side is more
+    # illuminated, which produced the persistent upper-edge bias.  Color is
+    # retained only to remove clearly proximal ridge samples below.
+    distance = cv2.distanceTransform(np.uint8(mask), cv2.DIST_L2, 5)
+    local_maximum = cv2.dilate(
+        distance, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    ridge = mask & (distance >= 0.9) & (
+        distance >= local_maximum - 0.20)
+    if np.count_nonzero(distal_support) >= 12:
+        color_distance = cv2.distanceTransform(
+            np.uint8(~distal_support), cv2.DIST_L2, 5)
+        ridge &= color_distance <= 5.0
+    rows, columns = np.where(ridge)
+    if len(columns) < 12:
+        # Retain operation under glare/color dropout.  This fallback is still
+        # mask-derived and is used only as a point-to-support term, so proximal
+        # samples cannot impose ordering on the distal spline.
+        distance = cv2.distanceTransform(np.uint8(mask), cv2.DIST_L2, 5)
+        local_maximum = cv2.dilate(
+            distance, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        rows, columns = np.where(
+            mask & (distance >= 0.9) & (distance >= local_maximum - 0.20))
+    if not len(columns):
+        raise ValueError("distal medial ridge evidence is empty")
+    if len(columns) > int(max_points):
+        selected = np.linspace(
+            0, len(columns) - 1, int(max_points)).round().astype(int)
+        rows, columns = rows[selected], columns[selected]
+    return np.column_stack([
+        columns + roi_x, rows + roi_y]).astype(np.float64)
+
+
+def _resample_material_corridor(
+        points_xy: np.ndarray, sample_count: int,
+        material_s: np.ndarray | None = None) -> np.ndarray:
+    """Resample stereo observations at uniform reconstructed arclength."""
+    points = np.asarray(points_xy, dtype=np.float64)
+    if material_s is None:
+        source = np.linspace(0.0, 1.0, len(points))
+    else:
+        source = np.asarray(material_s, dtype=np.float64)
+        if len(source) != len(points) or not np.all(np.isfinite(source)):
+            raise ValueError("corridor material coordinate is invalid")
+        source = source - source[0]
+        if source[-1] <= 1e-9 or np.any(np.diff(source) < 0.0):
+            raise ValueError("corridor material coordinate is not monotone")
+        source /= source[-1]
+        # Consecutive triangulated samples can coincide. np.interp requires a
+        # strictly increasing abscissa for a well-defined material mapping.
+        keep = np.r_[True, np.diff(source) > 1e-9]
+        source = source[keep]
+        points = points[keep]
+    target = np.linspace(0.0, 1.0, int(sample_count))
+    corridor = np.column_stack([
+        np.interp(target, source, points[:, coordinate])
+        for coordinate in range(2)])
+    corridor = gaussian_filter1d(
+        corridor, sigma=0.7, axis=0, mode="nearest")
+    corridor[0], corridor[-1] = points[0], points[-1]
+    return corridor
+
+
+def _center_ordered_mask_corridor(
+        points_xy: np.ndarray,
+        result: SamMaterialResult,
+        sample_count: int,
+        material_s: np.ndarray | None = None,
+        maximum_shift_px: float = 9.0) -> np.ndarray:
+    """Center one ordered topology inside its contiguous mask branch."""
+    corridor = _resample_material_corridor(
+        points_xy, sample_count, material_s)
+    tangent = np.gradient(corridor, axis=0)
+    tangent /= np.maximum(
+        np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9)
+    normal = np.column_stack([-tangent[:, 1], tangent[:, 0]])
+    mask = np.asarray(result.material.mask) > 0
+    distance = cv2.distanceTransform(np.uint8(mask), cv2.DIST_L2, 5)
+    roi_x, roi_y, width, height = result.material.roi
+    offsets = np.arange(-12.0, 12.01, 0.5)
+    centered = corridor.copy()
+    for index, (point, direction) in enumerate(zip(corridor, normal)):
+        samples = point + offsets[:, None] * direction
+        pixel = np.rint(samples - [roi_x, roi_y]).astype(int)
+        inside = (
+            (pixel[:, 0] >= 0) & (pixel[:, 0] < width)
+            & (pixel[:, 1] >= 0) & (pixel[:, 1] < height))
+        supported = np.zeros(len(offsets), dtype=bool)
+        supported[inside] = mask[pixel[inside, 1], pixel[inside, 0]]
+        supported_indices = np.flatnonzero(supported)
+        if not len(supported_indices):
+            continue
+        # Split the normal slice into mask runs and retain the run nearest the
+        # incoming ordered topology. This projects small off-mask errors back
+        # onto their chosen arm without switching across a V-shaped gap.
+        breaks = np.flatnonzero(np.diff(supported_indices) > 1) + 1
+        runs = np.split(supported_indices, breaks)
+        run = min(runs, key=lambda values: float(np.min(
+            np.abs(offsets[values]))))
+        if float(np.min(np.abs(offsets[run]))) > maximum_shift_px:
+            continue
+        lower, upper = int(run[0]), int(run[-1])
+        run_width = float(offsets[upper] - offsets[lower])
+        # A normal slice wider than the catheter is probably a merged V lobe.
+        if run_width > 20.0:
+            continue
+        run_pixels = pixel[run]
+        run_distance = distance[run_pixels[:, 1], run_pixels[:, 0]]
+        maximum_distance = float(np.max(run_distance))
+        medial = run[np.flatnonzero(
+            run_distance >= maximum_distance - 0.15)]
+        midpoint = 0.5 * (offsets[lower] + offsets[upper])
+        selected = int(medial[np.argmin(np.abs(offsets[medial] - midpoint))])
+        shift = float(np.clip(
+            offsets[selected], -maximum_shift_px, maximum_shift_px))
+        centered[index] = point + shift * direction
+    return centered
+
+
+def _center_paired_mask_corridors(
+        left_points_xy: np.ndarray,
+        right_points_xy: np.ndarray,
+        left_result: SamMaterialResult,
+        right_result: SamMaterialResult,
+        sample_count: int,
+        material_s: np.ndarray,
+        maximum_shift_px: float = 9.0,
+        epipolar_tolerance_px: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
+    """Move paired routes to mask medial support without breaking epipolarity."""
+    left = _resample_material_corridor(
+        left_points_xy, sample_count, material_s)
+    right = _resample_material_corridor(
+        right_points_xy, sample_count, material_s)
+    offsets = np.arange(-12.0, 12.01, 0.5)
+
+    def geometry(points, result):
+        tangent = np.gradient(points, axis=0)
+        tangent /= np.maximum(
+            np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9)
+        normal = np.column_stack([-tangent[:, 1], tangent[:, 0]])
+        mask = np.asarray(result.material.mask) > 0
+        distance = cv2.distanceTransform(np.uint8(mask), cv2.DIST_L2, 5)
+        roi = np.asarray(result.material.roi[:2], dtype=float)
+        height, width = mask.shape
+        return normal, mask, distance, roi, width, height
+
+    left_geometry = geometry(left, left_result)
+    right_geometry = geometry(right, right_result)
+
+    def candidates(point, direction, values):
+        _, mask, distance, roi, width, height = values
+        samples = point + offsets[:, None] * direction
+        pixel = np.rint(samples - roi).astype(int)
+        inside = (
+            (pixel[:, 0] >= 0) & (pixel[:, 0] < width)
+            & (pixel[:, 1] >= 0) & (pixel[:, 1] < height))
+        supported = np.zeros(len(offsets), dtype=bool)
+        supported[inside] = mask[pixel[inside, 1], pixel[inside, 0]]
+        indices = np.flatnonzero(supported)
+        if not len(indices):
+            return None
+        breaks = np.flatnonzero(np.diff(indices) > 1) + 1
+        runs = np.split(indices, breaks)
+        run = min(runs, key=lambda values: float(np.min(
+            np.abs(offsets[values]))))
+        if (float(np.min(np.abs(offsets[run]))) > maximum_shift_px
+                or offsets[run[-1]] - offsets[run[0]] > 20.0):
+            return None
+        pixels = pixel[run]
+        return (
+            samples[run], offsets[run],
+            distance[pixels[:, 1], pixels[:, 0]])
+
+    centered_left = left.copy()
+    centered_right = right.copy()
+    for index in range(len(left)):
+        left_candidates = candidates(
+            left[index], left_geometry[0][index], left_geometry)
+        right_candidates = candidates(
+            right[index], right_geometry[0][index], right_geometry)
+        if left_candidates is None or right_candidates is None:
+            continue
+        left_samples, left_offsets, left_distance = left_candidates
+        right_samples, right_offsets, right_distance = right_candidates
+        row_error = np.abs(
+            left_samples[:, None, 1] - right_samples[None, :, 1])
+        feasible = row_error <= float(epipolar_tolerance_px)
+        if not np.any(feasible):
+            continue
+        # Prefer thick medial support, with small displacement and residual
+        # row mismatch only as tie-breakers. The feasibility constraint keeps
+        # every selected pair triangulatable by the calibrated stereo model.
+        cost = (
+            -(left_distance[:, None] + right_distance[None, :])
+            + 0.02 * (
+                np.square(left_offsets[:, None])
+                + np.square(right_offsets[None, :]))
+            + 0.5 * np.square(row_error))
+        cost[~feasible] = np.inf
+        left_index, right_index = np.unravel_index(
+            int(np.argmin(cost)), cost.shape)
+        centered_left[index] = left_samples[left_index]
+        centered_right[index] = right_samples[right_index]
+    return centered_left, centered_right
+
+
+def _stored_material_result(output, index: int, view: str):
+    """Expose persisted mask geometry to the corridor centering helper."""
+    dataset = output[f"images/{view}/mask_packbits"]
+    shape = tuple(int(value) for value in dataset.attrs["unpacked_shape"])
+    mask = np.unpackbits(
+        np.asarray(dataset[index]), bitorder="little",
+        count=shape[0] * shape[1]).reshape(shape).astype(bool)
+    roi = tuple(int(value) for value in dataset.attrs["roi_xywh"])
+    return SimpleNamespace(material=SimpleNamespace(mask=mask, roi=roi))
+
+
+def _projected_turn_fraction(points_xy: np.ndarray) -> tuple[float | None, float]:
+    """Locate the sole strong projected fold without constructing routes."""
+    points = resample_arclength(points_xy, 96, smooth_window=1)
+    points = gaussian_filter1d(points, sigma=1.2, axis=0, mode="nearest")
+    span = 4
+    before = points[span:-span] - points[:-2 * span]
+    after = points[2 * span:] - points[span:-span]
+    denominator = np.linalg.norm(before, axis=1) * np.linalg.norm(after, axis=1)
+    cosine = np.divide(
+        np.sum(before * after, axis=1), denominator,
+        out=np.ones_like(denominator), where=denominator > 1e-6)
+    angle = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+    if not len(angle):
+        return None, 0.0
+    fractions = (np.arange(len(angle)) + span) / (len(points) - 1)
+    interior = (fractions >= 0.12) & (fractions <= 0.88)
+    if not np.any(interior):
+        return None, 0.0
+    candidates = np.flatnonzero(interior)
+    index = int(candidates[np.argmax(angle[candidates])])
+    maximum = float(angle[index])
+    if maximum < 28.0:
+        return None, maximum
+    return float((index + span) / (len(points) - 1)), maximum
+
+
+def _epipolar_sweep_extremum_fraction(
+        points_xy: np.ndarray) -> float | None:
+    """Return the material coordinate of the farthest epipolar image row.
+
+    ZED images are rectified, so corresponding epipolar lines have equal
+    image y.  In an end-on view the distal route can reverse at the material
+    sample whose row is farthest from the interface.  The well-conditioned
+    eye identifies that sample without needing to exhibit a visible cusp.
+    An endpoint extremum means the sweep is monotone and needs no interior
+    turn window.
+    """
+    points = np.asarray(points_xy, dtype=np.float64)
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if len(points) < 3:
+        return None
+    source = np.linspace(0.0, 1.0, len(points))
+    target = np.linspace(0.0, 1.0, 96)
+    points = np.column_stack([
+        np.interp(target, source, points[:, coordinate])
+        for coordinate in range(2)])
+    displacement = np.abs(points[:, 1] - points[0, 1])
+    index = int(np.argmax(displacement))
+    fraction = float(index / max(len(points) - 1, 1))
+    if fraction < 0.08 or fraction > 0.92:
+        return None
+    return fraction
+
+
+def _replace_distal_with_joint_projection(
+        result: SamMaterialResult,
+        projected_distal_xy: np.ndarray) -> SamMaterialResult:
+    """Make the final joint 3D topology the displayed/stored distal cyan path."""
+    material = result.material
+    projected = np.asarray(projected_distal_xy, dtype=np.float64)
+    projected = projected[np.all(np.isfinite(projected), axis=1)]
+    if len(projected) < 2:
+        raise ValueError("joint distal projection is empty")
+    boundary = int(np.clip(
+        material.distal_boundary_index, 0, len(material.points) - 1))
+    proximal = np.asarray(material.points[:boundary], dtype=np.float64)
+    points = np.vstack([proximal, projected]) if len(proximal) else projected
+    new_boundary = len(proximal)
+    old_profile = np.asarray(material.brightness_profile, dtype=np.float64)
+    if len(old_profile) >= 2:
+        brightness = np.interp(
+            np.linspace(0.0, 1.0, len(points)),
+            np.linspace(0.0, 1.0, len(old_profile)), old_profile)
+    else:
+        brightness = np.full(len(points), np.nan)
+    unified = MaterialCenterline(
+        centerline=Centerline(
+            points, material.roi, material.mask,
+            material.centerline.radius_px),
+        distal_boundary_index=new_boundary,
+        distal_boundary_fraction=float(
+            new_boundary / max(len(points) - 1, 1)),
+        boundary_confidence=material.boundary_confidence,
+        boundary_contrast=material.boundary_contrast,
+        material_valid=material.material_valid,
+        brightness_profile=brightness)
+    return replace(
+        result, material=unified,
+        prompt=replace(
+            result.prompt,
+            source=f"{result.prompt.source}+unified_stereo_topology"))
+
+
+def _inferred_material_path_quality(
+        observed_result: SamMaterialResult,
+        inferred_points_xy: np.ndarray,
+        previous_observed_points_xy: np.ndarray | None,
+        max_temporal_p95_px: float,
+        max_temporal_max_px: float,
+        max_sharp_turn_clusters: int,
+) -> tuple[SamMaterialResult, bool, dict[str, float | int]]:
+    """Validate a stereo-inferred cyan path before it replaces an observation.
+
+    Marker overlap may make indices equal, but their material order may never
+    reverse. Temporal motion is measured after removing the median image
+    translation, so normal rigid motion does not look like a topology change.
+    """
+    candidate = _replace_material_path(observed_result, inferred_points_xy)
+    topology = _marked_centerline_topology_metrics(candidate)
+    rejection_code = 0
+    # 1 marker reversal, 2 terminal mismatch, 4 excess turns,
+    # 8 temporal p95, 16 temporal maximum, 32 mask support, 64 non-medial.
+    markers = observed_result.marker_centers_xy
+    observed = observed_result.marker_observed
+    confidence = observed_result.marker_confidence
+    points = np.asarray(candidate.material.points, dtype=np.float64)
+    marker_order_valid = True
+    terminal_error = float("nan")
+    if markers is not None and observed is not None:
+        marker_points = np.asarray(markers, dtype=np.float64)
+        usable = np.asarray(observed, dtype=bool)
+        if confidence is not None:
+            usable &= np.asarray(confidence, dtype=np.float64) >= 0.25
+        usable &= np.all(np.isfinite(marker_points), axis=1)
+        ids = np.flatnonzero(usable)
+        indices = np.asarray([
+            int(np.argmin(np.linalg.norm(points - marker_points[index], axis=1)))
+            for index in ids], dtype=int)
+        # Up to two resampled indices of uncertainty permits coincident rings
+        # in the ill projection without permitting an interval reversal.
+        marker_order_valid = bool(
+            len(indices) < 2 or np.all(np.diff(indices) >= -2))
+        if not marker_order_valid:
+            rejection_code |= 1
+        if 3 in ids:
+            terminal_error = float(np.linalg.norm(
+                points[-1] - marker_points[3]))
+            widths = observed_result.marker_widths_px
+            width = (
+                float(np.asarray(widths)[3])
+                if widths is not None and np.isfinite(np.asarray(widths)[3])
+                else 12.0)
+            if terminal_error > max(12.0, 0.85 * width):
+                rejection_code |= 2
+    sharp_turn_clusters = int(round(
+        topology["centerline_sharp_turn_cluster_count"]))
+    if sharp_turn_clusters > min(max(int(max_sharp_turn_clusters), 0), 1):
+        rejection_code |= 4
+
+    temporal_p95 = float("nan")
+    temporal_max = float("nan")
+    if previous_observed_points_xy is not None:
+        previous = resample_arclength(
+            np.asarray(previous_observed_points_xy, dtype=np.float64),
+            len(points), smooth_window=1)
+        displacement = points - previous
+        displacement -= np.median(displacement, axis=0, keepdims=True)
+        magnitude = np.linalg.norm(displacement, axis=1)
+        temporal_p95 = float(np.percentile(magnitude, 95))
+        temporal_max = float(np.max(magnitude))
+        if temporal_p95 > float(max_temporal_p95_px):
+            rejection_code |= 8
+        if temporal_max > float(max_temporal_max_px):
+            rejection_code |= 16
+    outside = _centerline_outside_mask_fraction(candidate)
+    if outside > 0.02:
+        rejection_code |= 32
+    mask = np.asarray(candidate.material.mask > 0, dtype=np.uint8)
+    medial = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    roi_x, roi_y, width, height = candidate.material.roi
+    candidate_local = np.rint(points - [roi_x, roi_y]).astype(int)
+    candidate_local[:, 0] = np.clip(candidate_local[:, 0], 0, width - 1)
+    candidate_local[:, 1] = np.clip(candidate_local[:, 1], 0, height - 1)
+    candidate_radius = float(np.median(medial[
+        candidate_local[:, 1], candidate_local[:, 0]]))
+    observed_points = np.asarray(
+        observed_result.material.points, dtype=np.float64)
+    observed_local = np.rint(observed_points - [roi_x, roi_y]).astype(int)
+    observed_local[:, 0] = np.clip(observed_local[:, 0], 0, width - 1)
+    observed_local[:, 1] = np.clip(observed_local[:, 1], 0, height - 1)
+    observed_radius = float(np.median(medial[
+        observed_local[:, 1], observed_local[:, 0]]))
+    medial_ratio = candidate_radius / max(observed_radius, 1.0)
+    if candidate_radius < 1.5 or medial_ratio < 0.55:
+        rejection_code |= 64
+    accepted = rejection_code == 0
+    if accepted:
+        candidate = replace(
+            candidate,
+            prompt=replace(
+                candidate.prompt,
+                source=candidate.prompt.source
+                + "+validated_stereo_topology"))
+    return candidate, accepted, {
+        "stereo_inferred_rejection_code": rejection_code,
+        "stereo_inferred_marker_order_valid": int(marker_order_valid),
+        "stereo_inferred_terminal_error_px": terminal_error,
+        "stereo_inferred_sharp_turn_clusters": sharp_turn_clusters,
+        "stereo_inferred_temporal_p95_px": temporal_p95,
+        "stereo_inferred_temporal_max_px": temporal_max,
+        "stereo_inferred_outside_mask_fraction": outside,
+        "stereo_inferred_medial_radius_ratio": medial_ratio,
+    }
 
 
 def _fitted_curve_reprojection_metrics(
@@ -675,10 +1402,20 @@ def _stereo_candidate_score(
 def _select_stereo_reference(
         candidates: dict[str, tuple[float, dict]],
         previous_reference_view: str | None,
-        hysteresis_score: float) -> str:
+        hysteresis_score: float,
+        ill_view: str | None = None) -> str:
     """Choose a non-overlapped reference and suppress score chatter."""
     if not candidates:
         raise ValueError("stereo_both_reference_candidates_failed")
+    # Once one projection is observably shortened, it is not a valid source of
+    # material order.  It remains an image observation for the subsequent joint
+    # fit, but must not win merely because a shortcut has a low reprojection
+    # cost or because reference-view hysteresis keeps the previous choice.
+    observable = {
+        view: value for view, value in candidates.items()
+        if view != ill_view}
+    if observable:
+        candidates = observable
     eligible = {
         view: value for view, value in candidates.items()
         if (value[1]["reference_eye_self_overlap_fraction"]
@@ -785,6 +1522,79 @@ def _temporal_centerline_metrics(
             np.percentile(current_to_previous, 95))))
 
 
+def _ill_eye_observation_weights(
+        active_ill_view: str | None,
+        shorter_view: str,
+        left_length_px: float,
+        right_length_px: float,
+        minimum_weight: float) -> tuple[float, float, str | None]:
+    """Downweight only when the hysteretic label matches current evidence."""
+    if active_ill_view not in ("left", "right"):
+        return 1.0, 1.0, None
+    if active_ill_view != shorter_view:
+        # During a pending switch/release, suppress neither eye. Applying the
+        # current short/long ratio to yesterday's label downweights the good
+        # eye and was the direct cause of branch alternation.
+        return 1.0, 1.0, None
+    short_length = min(float(left_length_px), float(right_length_px))
+    long_length = max(float(left_length_px), float(right_length_px))
+    weight = float(np.clip(max(
+        float(minimum_weight),
+        (short_length / max(long_length, 1e-9)) ** 4), 0.0, 1.0))
+    return (
+        (weight, 1.0, "left") if active_ill_view == "left"
+        else (1.0, weight, "right"))
+
+
+def _update_ill_view_hysteresis(
+        active: str | None,
+        pending: str | None,
+        pending_count: int,
+        observed: str | None,
+        confirmation_frames: int,
+) -> tuple[str | None, str | None, int]:
+    """Confirm entry, release, and eye switches with the same persistence.
+
+    A single ambiguity-threshold crossing must not replace an independently
+    well-conditioned image route. The previous implementation confirmed only
+    release/switches but entered recovery immediately, which made marginal
+    ambiguity noise toggle the reconstruction objective.
+    """
+    required = max(1, int(confirmation_frames))
+    if observed == active:
+        return active, None, 0
+    if observed == pending:
+        count = int(pending_count) + 1
+    else:
+        pending = observed
+        count = 1
+    if count >= required:
+        return observed, None, 0
+    return active, pending, count
+
+
+def _joint_fit_supports_bijective_stereo(result) -> bool:
+    """Accept an image-supported ordinary fit before topology recovery.
+
+    The active ill-eye label has release hysteresis and can persist for several
+    frames after both cyan observations become bijective again. At that point
+    low two-view model and coverage errors are direct evidence that ordinary
+    stereo has recovered. A projected-turn counter is diagnostic here; using
+    it as an additional hard gate caused accurate post-ill fits to disappear.
+    """
+    values = np.asarray([
+        result.left_model_mean_px, result.right_model_mean_px,
+        result.left_model_p95_px, result.right_model_p95_px,
+        result.left_coverage_mean_px, result.right_coverage_mean_px,
+    ], dtype=float)
+    return bool(
+        result.optimizer_success
+        and np.all(np.isfinite(values))
+        and max(values[:2]) <= 3.0
+        and max(values[2:4]) <= 8.0
+        and max(values[4:]) <= 5.0)
+
+
 class ImageSequenceWriter:
     """Fixed-shape output written as bounded contiguous background batches."""
 
@@ -804,8 +1614,8 @@ class ImageSequenceWriter:
         self.hdf_buffer_frames = max(1, int(config.hdf_buffer_frames))
         self.file = h5py.File(path, "w")
         self.string_type = h5py.string_dtype(encoding="utf-8")
-        self.file.attrs["schema_version"] = 13
-        self.file.attrs["mode"] = "image_only_sam2"
+        self.file.attrs["schema_version"] = 15
+        self.file.attrs["mode"] = "image_only_shape_tracking"
         self.file.attrs["coordinate_frame"] = "robot_base"
         self.file.attrs["position_units"] = "mm"
         self.file.attrs["curvature_units"] = "1/mm"
@@ -858,11 +1668,30 @@ class ImageSequenceWriter:
         return self.file.create_dataset(name, **kwargs)
 
     def _create(self, count: int, config: ImageProcessingConfig, registration) -> None:
+        calibration = self.file.create_group("calibration")
+        calibration["camera_matrix"] = np.asarray(registration.K, np.float64)
+        calibration["distortion"] = np.asarray(
+            getattr(registration, "distortion", np.empty(0)), np.float64)
+        calibration["left_camera_T_base"] = np.asarray(
+            registration.left_camera_T_base, np.float64)
+        calibration["right_camera_T_base"] = np.asarray(
+            registration.right_camera_T_base, np.float64)
+        calibration["roi_left_xywh"] = np.asarray(
+            registration.roi_left_xywh, np.int32)
+        calibration["roi_right_xywh"] = np.asarray(
+            registration.roi_right_xywh, np.int32)
+        calibration.attrs["baseline_m"] = float(registration.baseline_m)
+        calibration.attrs["zed_serial"] = str(
+            getattr(registration, "zed_serial", "unknown"))
+        calibration.attrs["resolution"] = str(
+            getattr(registration, "resolution", "unknown"))
         frames = self.file.create_group("frames")
         frames.create_dataset("svo_frame", shape=(count,), dtype=np.int32)
         frames.create_dataset("timestamp_ns", shape=(count,), dtype=np.int64)
         frames.create_dataset("svo_timestamp_ns", shape=(count,), dtype=np.int64)
         frames.create_dataset("valid", shape=(count,), dtype=np.uint8)
+        frames.create_dataset(
+            "observation_valid", shape=(count,), dtype=np.uint8)
         frames.create_dataset("status", shape=(count,), dtype=self.string_type)
 
         for view, roi in (
@@ -880,6 +1709,9 @@ class ImageSequenceWriter:
                 mask.attrs["packbits_bitorder"] = "little"
             self._dataset(
                 f"images/{view}/centerline_px",
+                (count, config.image_centerline_samples, 2), fillvalue=np.nan)
+            self._dataset(
+                f"images/{view}/observed_centerline_px",
                 (count, config.image_centerline_samples, 2), fillvalue=np.nan)
             self._dataset(
                 f"images/{view}/distal_boundary_px", (count, 2), fillvalue=np.nan)
@@ -912,6 +1744,9 @@ class ImageSequenceWriter:
                 fillvalue=np.nan)
             self._dataset(
                 f"images/{view}/marker_observed", (count, 4),
+                dtype=np.uint8, fillvalue=0)
+            self._dataset(
+                f"images/{view}/marker_interpolated", (count, 4),
                 dtype=np.uint8, fillvalue=0)
             self._dataset(
                 f"images/{view}/marker_raw_cluster_count", (count,),
@@ -983,7 +1818,8 @@ class ImageSequenceWriter:
                 "stereo_epipolar_ambiguity_right",
                 "stereo_other_eye_self_overlap_left",
                 "stereo_other_eye_self_overlap_right",
-                "overlap_aware_used",
+                "overlap_aware_used", "overlap_one_turn_enforced",
+                "overlap_expected_turn_index",
                 "centerline_tip_anchor_used",
                 "centerline_tip_epipolar_error_px",
                 "terminal_reprojection_left_px",
@@ -991,7 +1827,24 @@ class ImageSequenceWriter:
                 "terminal_refinement_used",
                 "terminal_refinement_improvement_px",
                 "terminal_refinement_start_fraction",
-                "marker_anchor_count", "marker_epipolar_error_max_px",
+                "marker_anchor_count", "marker_interval_boundary_count",
+                "marker_epipolar_error_max_px",
+                "marker_interval_route_used_left",
+                "marker_interval_route_used_right",
+                "marker_path_order_valid_left",
+                "marker_path_order_valid_right",
+                "marker_path_max_centroid_distance_left_px",
+                "marker_path_max_centroid_distance_right_px",
+                "marker_path_observed_count_left",
+                "marker_path_observed_count_right",
+                "centerline_sharp_turn_cluster_count_left",
+                "centerline_sharp_turn_cluster_count_right",
+                "centerline_max_local_turn_left_deg",
+                "centerline_max_local_turn_right_deg",
+                "epipolar_sweep_left_px", "epipolar_sweep_right_px",
+                "epipolar_sweep_deficit_px",
+                "epipolar_sweep_enforced_view",
+                "epipolar_sweep_anchor_used",
                 "temporal_centerline_coverage_left",
                 "temporal_centerline_coverage_right",
                 "temporal_centerline_p95_left_px",
@@ -1019,7 +1872,28 @@ class ImageSequenceWriter:
                 "stereo_centerline_length_ratio_initial",
                 "stereo_centerline_length_ratio",
                 "stereo_retry_used", "stereo_retry_view",
+                "stereo_retry_attempted", "stereo_retry_status_code",
                 "stereo_reference_view",
+                "stereo_ill_view", "stereo_observation_weight_left",
+                "stereo_observation_weight_right",
+                "overlap_aware_forced", "stereo_inferred_view",
+                "stereo_raw_ill_view", "stereo_ill_view_switch_pending",
+                "stereo_inferred_candidate_view",
+                "stereo_inferred_accepted",
+                "stereo_inferred_rejection_code",
+                "stereo_inferred_marker_order_valid",
+                "stereo_inferred_terminal_error_px",
+                "stereo_inferred_sharp_turn_clusters",
+                "stereo_inferred_temporal_p95_px",
+                "stereo_inferred_temporal_max_px",
+                "stereo_inferred_outside_mask_fraction",
+                "stereo_inferred_medial_radius_ratio",
+                "stereo_ill_detection_ambiguity",
+                "temporal_mask_inconsistency_bypassed_view",
+                "final_mask_outside_fraction_left",
+                "final_mask_outside_fraction_right",
+                "final_mask_distance_p95_left_px",
+                "final_mask_distance_p95_right_px",
                 "matched_epipolar", "disparity_robust_inlier_count",
                 "full_spline_basis_count", "full_spline_internal_knot_count",
                 "full_spline_rms_residual_mm", "distal_spline_basis_count",
@@ -1034,7 +1908,11 @@ class ImageSequenceWriter:
                 "joint_final_symmetric_mean_px",
                 "joint_arc_length_mm", "joint_length_residual_mm",
                 "joint_optimizer_cost", "joint_optimizer_evaluations",
-                "joint_optimizer_success"):
+                "joint_optimizer_success", "joint_turn_fraction",
+                "joint_left_turn_angle_deg", "joint_right_turn_angle_deg",
+                "joint_topology_recovery_used",
+                "joint_left_sharp_turn_clusters",
+                "joint_right_sharp_turn_clusters"):
             self._dataset(f"quality/{name}", (count,), fillvalue=np.nan)
         self._dataset(
             "quality/material_boundary_observed", (count,),
@@ -1192,8 +2070,19 @@ class ImageSequenceWriter:
         if result.marker_observed is not None:
             output[f"images/{view}/marker_observed"] = np.asarray(
                 result.marker_observed, dtype=np.uint8).copy()
+        if result.marker_interpolated is not None:
+            output[f"images/{view}/marker_interpolated"] = np.asarray(
+                result.marker_interpolated, dtype=np.uint8).copy()
         output[f"images/{view}/marker_raw_cluster_count"] = int(
             result.marker_raw_cluster_count)
+
+    def write_observed_centerline(
+            self, index: int, view: str, result: SamMaterialResult) -> None:
+        """Preserve independent image evidence before unified 3D projection."""
+        self._record(index)[f"images/{view}/observed_centerline_px"] = (
+            resample_arclength(
+                result.material.points, self.image_centerline_samples,
+                smooth_window=1))
 
     def write_success(
             self,
@@ -1247,6 +2136,7 @@ class ImageSequenceWriter:
             output["markers/stereo_observed"] = np.asarray(
                 marker_stereo_observed, dtype=np.uint8).copy()
         self.write_metrics(index, metrics)
+        output["frames/observation_valid"] = 1
         output["frames/valid"] = 1
         output["frames/status"] = "valid"
         self._finalize_record(index)
@@ -1258,12 +2148,31 @@ class ImageSequenceWriter:
             if path in self.dataset_paths:
                 output[path] = self._copy_value(value)
 
+    def mark_observation_valid(self, index: int) -> None:
+        self._record(index)["frames/observation_valid"] = 1
+
     def write_failure(self, index: int, status: str, metrics: dict | None = None) -> None:
         output = self._record(index)
         if metrics:
             self.write_metrics(index, metrics)
         output["frames/valid"] = 0
         output["frames/status"] = status
+        self._finalize_record(index)
+
+    def write_observations(
+            self, index: int, left: SamMaterialResult,
+            right: SamMaterialResult, metrics: dict | None = None) -> None:
+        """Finalize a mask/centerline/marker cache without running 3D stages."""
+        self.write_observed_centerline(index, "left", left)
+        self.write_observed_centerline(index, "right", right)
+        self.write_view(index, "left", left)
+        self.write_view(index, "right", right)
+        if metrics:
+            self.write_metrics(index, metrics)
+        output = self._record(index)
+        output["frames/observation_valid"] = 1
+        output["frames/valid"] = 0
+        output["frames/status"] = "observations_only"
         self._finalize_record(index)
 
     def close(self) -> None:
@@ -1418,9 +2327,16 @@ def _write_final_overlays(
                 shapes["quality/shape_temporal_supported"][:].astype(bool)
                 if "quality/shape_temporal_supported" in shapes
                 else valid.copy())
+            if "frames/curve_temporally_interpolated" in shapes:
+                interpolated = shapes[
+                    "frames/curve_temporally_interpolated"][:].astype(bool)
+                shape_supported |= interpolated
+            else:
+                interpolated = np.zeros(len(valid), dtype=bool)
             if "frames/learning_valid" in shapes:
-                shape_supported &= shapes[
-                    "frames/learning_valid"][:].astype(bool)
+                shape_supported &= (
+                    shapes["frames/learning_valid"][:].astype(bool)
+                    | interpolated)
             statuses = shapes["frames/status"][:]
             for index, record in enumerate(records):
                 _, left_image, right_image = svo.read(record.svo_frame)
@@ -1430,6 +2346,8 @@ def _write_final_overlays(
                     else str(status_value))
                 if valid[index] and not shape_supported[index]:
                     status = "learning_rejected_final_geometry"
+                elif interpolated[index]:
+                    status = "temporally_interpolated_3d"
                 for view, image, roi, base_point in (
                         ("left", left_image, registration.roi_left_xywh,
                          base_left),
@@ -1446,14 +2364,8 @@ def _write_final_overlays(
                         projected = _project_base_points(
                             registration, points, view == "right")
                         boundary = projected[0]
-                        boundary_index = int(np.argmin(np.linalg.norm(
-                            result.material.points - boundary, axis=1)))
-                        result = replace(result, material=replace(
-                            result.material,
-                            distal_boundary_index=boundary_index,
-                            distal_boundary_fraction=float(
-                                boundary_index
-                                / max(len(result.material.points) - 1, 1))))
+                        result = _replace_distal_with_joint_projection(
+                            result, projected)
                     overlay.write(
                         view, image, result, projected, boundary, status,
                         frame_index=index, svo_frame=record.svo_frame)
@@ -1469,8 +2381,12 @@ def _refresh_final_geometry_metrics(path: Path, registration) -> None:
     with h5py.File(path, "r+") as output:
         valid = output["frames/valid"][:].astype(bool)
         if "quality/shape_temporal_supported" in output:
-            valid &= output[
+            supported = output[
                 "quality/shape_temporal_supported"][:].astype(bool)
+            if "frames/curve_temporally_interpolated" in output:
+                supported |= output[
+                    "frames/curve_temporally_interpolated"][:].astype(bool)
+            valid &= supported
         count = len(valid)
 
         def dataset(name: str):
@@ -1484,6 +2400,12 @@ def _refresh_final_geometry_metrics(path: Path, registration) -> None:
             "quality/final_terminal_reprojection_left_px")
         terminal_right = dataset(
             "quality/final_terminal_reprojection_right_px")
+        mask_outside = {
+            view: dataset(f"quality/final_mask_outside_fraction_{view}")
+            for view in ("left", "right")}
+        mask_p95 = {
+            view: dataset(f"quality/final_mask_distance_p95_{view}_px")
+            for view in ("left", "right")}
         for index in np.flatnonzero(valid):
             points = output["distal/points_base_mm"][index]
             projected_views = []
@@ -1493,22 +2415,62 @@ def _refresh_final_geometry_metrics(path: Path, registration) -> None:
             for view, right in (("left", False), ("right", True)):
                 projected = _project_base_points(
                     registration, points, right=right)
-                centerline = output[f"images/{view}/centerline_px"][index]
+                observed_name = f"images/{view}/observed_centerline_px"
+                centerline = output[
+                    observed_name
+                    if observed_name in output
+                    else f"images/{view}/centerline_px"][index]
                 centerline = centerline[np.all(np.isfinite(centerline), axis=1)]
-                distance = np.min(np.linalg.norm(
-                    projected[:, None, :] - centerline[None, :, :], axis=2),
-                    axis=1)
+                distance = (
+                    np.min(np.linalg.norm(
+                        projected[:, None, :] - centerline[None, :, :], axis=2),
+                        axis=1)
+                    if len(centerline) else np.full(len(projected), np.nan))
                 projected_views.append(projected)
                 distances.append(distance)
                 means.append(float(np.mean(distance)))
                 terminal.append(float(np.mean(distance[-8:])))
+                mask_name = f"images/{view}/mask_packbits"
+                if mask_name in output:
+                    mask_ds = output[mask_name]
+                    mask_shape = tuple(int(value) for value in
+                                       mask_ds.attrs["unpacked_shape"])
+                    roi = tuple(int(value) for value in
+                                mask_ds.attrs["roi_xywh"])
+                    mask = np.unpackbits(
+                        np.asarray(mask_ds[index]), bitorder="little",
+                        count=mask_shape[0] * mask_shape[1]
+                    ).reshape(mask_shape).astype(bool)
+                    local = projected - np.asarray(roi[:2], dtype=float)
+                    pixel = np.rint(local).astype(int)
+                    inside = (
+                        (pixel[:, 0] >= 0)
+                        & (pixel[:, 0] < mask_shape[1])
+                        & (pixel[:, 1] >= 0)
+                        & (pixel[:, 1] < mask_shape[0]))
+                    supported = np.zeros(len(pixel), dtype=bool)
+                    supported[inside] = mask[
+                        pixel[inside, 1], pixel[inside, 0]]
+                    distance_to_mask = np.full(len(pixel), np.inf)
+                    if np.any(mask):
+                        distance_field = cv2.distanceTransform(
+                            np.uint8(~mask), cv2.DIST_L2, 5)
+                        distance_to_mask[inside] = distance_field[
+                            pixel[inside, 1], pixel[inside, 0]]
+                    mask_outside[view][index] = float(
+                        1.0 - np.mean(supported))
+                    mask_p95[view][index] = float(np.percentile(
+                        distance_to_mask, 95))
             combined = np.concatenate(distances)
+            finite_combined = combined[np.isfinite(combined)]
             output["quality/fitted_reprojection_left_px"][index] = means[0]
             output["quality/fitted_reprojection_right_px"][index] = means[1]
-            output["quality/fitted_reprojection_max_px"][index] = float(
-                np.max(combined))
-            output["quality/fitted_reprojection_p95_px"][index] = float(
-                np.percentile(combined, 95))
+            output["quality/fitted_reprojection_max_px"][index] = (
+                float(np.max(finite_combined)) if len(finite_combined)
+                else float("nan"))
+            output["quality/fitted_reprojection_p95_px"][index] = (
+                float(np.percentile(finite_combined, 95))
+                if len(finite_combined) else float("nan"))
             terminal_left[index], terminal_right[index] = terminal
             for view_index, view in enumerate(("left", "right")):
                 terminal_observation = output[
@@ -1527,6 +2489,32 @@ def _refresh_final_geometry_metrics(path: Path, registration) -> None:
                     if np.all(np.isfinite(terminal_observation))
                     else float("nan"))
                 output[f"quality/tip_endpoint_{view}_px"][index] = error
+
+                # Schema 14 keeps the independent image route separately, so
+                # it is safe to make centerline_px represent the temporally
+                # finalized, unified topology.  This prevents final overlays
+                # (and downstream consumers) from mixing a causal cyan route
+                # with a zero-phase-filtered yellow 3D curve.  Older files do
+                # not have observed_centerline_px and remain read-only here.
+                evidence_name = f"images/{view}/observed_centerline_px"
+                if evidence_name in output:
+                    view_projected = projected_views[view_index]
+                    stored_ds = output[f"images/{view}/centerline_px"]
+                    stored = np.asarray(stored_ds[index], dtype=float)
+                    stored = stored[np.all(np.isfinite(stored), axis=1)]
+                    if len(stored) >= 2:
+                        old_boundary = np.asarray(output[
+                            f"images/{view}/distal_boundary_px"][index], float)
+                        boundary_index = int(np.argmin(np.linalg.norm(
+                            stored - old_boundary, axis=1)))
+                        proximal = stored[:boundary_index]
+                        unified = (
+                            np.vstack([proximal, view_projected])
+                            if len(proximal) else view_projected)
+                        stored_ds[index] = resample_arclength(
+                            unified, stored_ds.shape[1], smooth_window=1)
+                        output[f"images/{view}/distal_boundary_px"][index] = (
+                            view_projected[0])
         output.flush()
 
 
@@ -1534,7 +2522,11 @@ def _apply_final_learning_quality(
         path: Path,
         max_mean_reprojection_px: float,
         max_p95_reprojection_px: float,
-        max_tip_endpoint_error_px: float) -> tuple[int, int]:
+        max_tip_endpoint_error_px: float,
+        marker_tip_width_scale: float = 0.40,
+        marker_tip_width_cap_px: float = 12.0,
+        max_mask_outside_fraction: float = 0.20,
+        max_mask_distance_p95_px: float = 6.0) -> tuple[int, int]:
     """Reject temporally finalized curves that no longer fit the 2D evidence."""
     import h5py
 
@@ -1546,30 +2538,83 @@ def _apply_final_learning_quality(
         p95 = output["quality/fitted_reprojection_p95_px"][:]
         left_tip = output["quality/tip_endpoint_left_px"][:]
         right_tip = output["quality/tip_endpoint_right_px"][:]
+        left_tip_threshold = np.full(
+            len(valid), float(max_tip_endpoint_error_px))
+        right_tip_threshold = left_tip_threshold.copy()
+        for view, threshold in (
+                ("left", left_tip_threshold),
+                ("right", right_tip_threshold)):
+            width_name = f"images/{view}/marker_widths_px"
+            observed_name = f"images/{view}/marker_observed"
+            if width_name not in output:
+                continue
+            widths = output[width_name][:, 3].astype(float)
+            observed = (
+                output[observed_name][:, 3].astype(bool)
+                if observed_name in output else np.isfinite(widths))
+            uncertainty = np.minimum(
+                float(marker_tip_width_cap_px),
+                float(marker_tip_width_scale) * widths)
+            use = observed & np.isfinite(uncertainty)
+            threshold[use] = np.maximum(threshold[use], uncertainty[use])
         bad_tip = (
             (np.isfinite(left_tip)
-             & (left_tip > float(max_tip_endpoint_error_px)))
+             & (left_tip > left_tip_threshold))
             | (np.isfinite(right_tip)
-               & (right_tip > float(max_tip_endpoint_error_px))))
-        rejected = valid & (
+               & (right_tip > right_tip_threshold)))
+        bad_mask = np.zeros(len(valid), dtype=bool)
+        for view in ("left", "right"):
+            outside_name = f"quality/final_mask_outside_fraction_{view}"
+            distance_name = f"quality/final_mask_distance_p95_{view}_px"
+            if outside_name in output and distance_name in output:
+                outside = output[outside_name][:]
+                mask_distance = output[distance_name][:]
+                bad_mask |= (
+                    (np.isfinite(outside)
+                     & (outside > float(max_mask_outside_fraction)))
+                    | (np.isfinite(mask_distance)
+                       & (mask_distance > float(max_mask_distance_p95_px))))
+        image_rejected = valid & (
             (left_mean > float(max_mean_reprojection_px))
             | (right_mean > float(max_mean_reprojection_px))
             | (p95 > float(max_p95_reprojection_px))
-            | bad_tip)
+            | bad_tip | bad_mask)
         # A single barely-good frame inside a rejected interval is not useful
         # for dynamics learning and produces distracting good/bad overlay
         # chatter. Bridge only short, bounded good gaps; never turn a rejected
         # observation into an accepted one.
         timestamps_ns = output["frames/timestamp_ns"][:]
-        rejected = _bridge_short_good_gaps(
-            rejected, valid, timestamps_ns, maximum_gap_ms=100.0)
+        image_rejected = _bridge_short_good_gaps(
+            image_rejected, valid, timestamps_ns, maximum_gap_ms=100.0)
+        interpolated = (
+            output["frames/curve_temporally_interpolated"][:].astype(bool)
+            if "frames/curve_temporally_interpolated" in output
+            else np.zeros(len(valid), dtype=bool))
+        # Current masks are least trustworthy in the short V-overlap interval
+        # for which this time-symmetric bridge exists. The bridge has already
+        # passed duration, finite-anchor, point-step and arc-length checks, so
+        # retain it even when the contaminated per-frame mask disagrees.
+        overridden = image_rejected & interpolated
+        rejected = image_rejected & ~interpolated
+        override_name = "quality/interpolated_curve_image_qc_overridden"
+        if override_name in output:
+            override_ds = output[override_name]
+        else:
+            override_ds = output.create_dataset(
+                override_name, shape=(len(valid),), dtype=np.uint8,
+                fillvalue=0, compression="gzip", compression_opts=1,
+                shuffle=True)
+        override_ds[:] = overridden.astype(np.uint8)
         flags = output["frames/learning_rejection_flags"][:].astype(np.uint16)
+        # Final metrics are recomputed after downstream interpolation/resumes;
+        # do not retain a stale final-image-fit bit from the preceding pass.
+        flags &= np.uint16(~int(final_reprojection_flag) & 0xffff)
         flags[rejected] |= final_reprojection_flag
         output["frames/learning_rejection_flags"][:] = flags
         output["frames/learning_valid"][:] = (flags == 0).astype(np.uint8)
         mapping = json.loads(output.attrs.get(
             "learning_rejection_flags_json", "{}"))
-        mapping["32"] = "final_curve_reprojection_or_tip"
+        mapping["32"] = "final_curve_reprojection_tip_or_mask"
         output.attrs["learning_rejection_flags_json"] = json.dumps(
             mapping, separators=(",", ":"))
         output.flush()
@@ -1580,11 +2625,15 @@ def _apply_final_learning_quality(
 
 def _resume_joint_fit_from_stereo(
         path: Path, registration, config: ImageProcessingConfig,
-        marker_backend_active: bool) -> dict[str, int]:
+        marker_backend_active: bool) -> dict[str, object]:
     """Refit per-frame joint splines from persisted 2D/stereo observations."""
     import h5py
 
     fitted = failed = 0
+    failure_reasons: dict[str, int] = {}
+    previous_points: np.ndarray | None = None
+    previous_timestamp_ns: int | None = None
+    previous_turn_fraction: float | None = None
     nominal_length_mm = (
         config.marked_distal_length_mm
         if marker_backend_active else config.distal_length_mm)
@@ -1613,7 +2662,17 @@ def _resume_joint_fit_from_stereo(
             "joint_initial_symmetric_mean_px",
             "joint_final_symmetric_mean_px", "joint_arc_length_mm",
             "joint_length_residual_mm", "joint_optimizer_cost",
-            "joint_optimizer_evaluations", "joint_optimizer_success")
+            "joint_optimizer_evaluations", "joint_optimizer_success",
+            "joint_topology_recovery_used",
+            "joint_left_sharp_turn_clusters",
+            "joint_right_sharp_turn_clusters")
+        for name in metric_names:
+            full_name = f"quality/{name}"
+            if full_name not in output:
+                output.create_dataset(
+                    full_name, shape=(len(valid),), dtype=np.float32,
+                    fillvalue=np.nan, compression="gzip",
+                    compression_opts=1, shuffle=True)
 
         for index in np.flatnonzero(valid):
             try:
@@ -1642,10 +2701,16 @@ def _resume_joint_fit_from_stereo(
                         float(visible_s[-1] - interface_s), 1e-3)
                 ).distal_points_mm
 
-                left_centerline = np.asarray(
-                    output["images/left/centerline_px"][index], float)
-                right_centerline = np.asarray(
-                    output["images/right/centerline_px"][index], float)
+                left_name = (
+                    "images/left/observed_centerline_px"
+                    if "images/left/observed_centerline_px" in output
+                    else "images/left/centerline_px")
+                right_name = (
+                    "images/right/observed_centerline_px"
+                    if "images/right/observed_centerline_px" in output
+                    else "images/right/centerline_px")
+                left_centerline = np.asarray(output[left_name][index], float)
+                right_centerline = np.asarray(output[right_name][index], float)
                 left_centerline = left_centerline[
                     np.all(np.isfinite(left_centerline), axis=1)]
                 right_centerline = right_centerline[
@@ -1674,24 +2739,82 @@ def _resume_joint_fit_from_stereo(
                     endpoint(right_markers, 3, right_centerline[-1]),
                     count=max(64, config.stereo_samples))
 
-                def axial_markers(centerline, markers, endpoints):
-                    axial = np.full((4, 2), np.nan, dtype=np.float64)
-                    axial[0], axial[3] = endpoints
-                    for marker_index in (1, 2):
-                        marker = markers[marker_index]
-                        if np.all(np.isfinite(marker)):
-                            axial[marker_index] = project_point_to_polyline(
-                                centerline, marker)[0]
-                    return axial
+                left_observation_weight = 1.0
+                right_observation_weight = 1.0
+                observation_ill_view = None
+                if marker_backend_active:
+                    left_image_length = float(cumulative_arclength(
+                        left_centerline)[-1])
+                    right_image_length = float(cumulative_arclength(
+                        right_centerline)[-1])
+                    image_length_ratio = max(
+                        left_image_length, right_image_length) / max(
+                            min(left_image_length, right_image_length), 1e-9)
+                    if (image_length_ratio
+                            > config.marked_stereo_guided_retry_ratio):
+                        shorter_view = (
+                            "left" if left_image_length < right_image_length
+                            else "right")
+                        active_code = int(output[
+                            "quality/stereo_ill_view"][index]) if (
+                                "quality/stereo_ill_view" in output) else 0
+                        active_view = (
+                            "left" if active_code == 1 else
+                            "right" if active_code == 2 else shorter_view)
+                        (left_observation_weight,
+                         right_observation_weight,
+                         observation_ill_view) = (
+                            _ill_eye_observation_weights(
+                                active_view, shorter_view,
+                                left_image_length, right_image_length,
+                                config.ill_eye_min_observation_weight))
 
-                result = fit_joint_two_view_spline(
-                    initial, left_distal, right_distal, registration.K,
-                    registration.left_camera_T_base,
-                    registration.right_camera_T_base, nominal_length_mm,
-                    left_axial_markers_xy=axial_markers(
-                        left_centerline, left_markers, left_endpoints),
-                    right_axial_markers_xy=axial_markers(
-                        right_centerline, right_markers, right_endpoints),
+                ordered_left = np.asarray(
+                    output["stereo/ordered_left_px"][index], float)
+                ordered_right = np.asarray(
+                    output["stereo/ordered_right_px"][index], float)
+                boundary_sample = int(np.clip(round(
+                    target_fraction * (len(ordered_left) - 1)),
+                    1, len(ordered_left) - 2))
+                left_corridor = ordered_left[boundary_sample:]
+                right_corridor = ordered_right[boundary_sample:]
+                corridor_s = visible_s[boundary_sample:]
+                left_corridor, right_corridor = _center_paired_mask_corridors(
+                    left_corridor, right_corridor,
+                    _stored_material_result(output, index, "left"),
+                    _stored_material_result(output, index, "right"),
+                    config.distal_samples, corridor_s)
+                left_turn, left_angle = _projected_turn_fraction(left_corridor)
+                right_turn, right_angle = _projected_turn_fraction(right_corridor)
+                if observation_ill_view == "left":
+                    turn_fraction = _epipolar_sweep_extremum_fraction(
+                        right_corridor)
+                elif observation_ill_view == "right":
+                    turn_fraction = _epipolar_sweep_extremum_fraction(
+                        left_corridor)
+                else:
+                    turn_fraction = None
+                timestamp_ns = int(output["frames/timestamp_ns"][index])
+                temporal_adjacent = bool(
+                    previous_points is not None
+                    and previous_timestamp_ns is not None
+                    and 0 < (timestamp_ns - previous_timestamp_ns) * 1e-6
+                    <= config.max_temporal_prompt_gap_ms)
+                if turn_fraction is None and observation_ill_view is not None:
+                    turn_fraction = (
+                        previous_turn_fraction if temporal_adjacent else None)
+                elif (turn_fraction is not None and temporal_adjacent
+                      and previous_turn_fraction is not None):
+                    turn_fraction = float(
+                        0.75 * np.clip(
+                            turn_fraction,
+                            previous_turn_fraction - 0.08,
+                            previous_turn_fraction + 0.08)
+                        + 0.25 * previous_turn_fraction)
+
+                common_fit = dict(
+                    left_axial_markers_xy=left_markers,
+                    right_axial_markers_xy=right_markers,
                     output_samples=config.distal_samples,
                     basis_count=config.joint_spline_basis_count,
                     fit_samples=config.distal_samples,
@@ -1699,7 +2822,44 @@ def _resume_joint_fit_from_stereo(
                         config.marked_distal_length_prior_sigma_mm
                         if marker_backend_active
                         else config.distal_length_prior_sigma_mm),
+                    temporal_prior_points_base_mm=(
+                        previous_points if temporal_adjacent else None),
+                    temporal_prior_sigma_mm=max(
+                        2.5, 0.65 * config.ill_eye_temporal_shape_sigma_mm),
                     max_nfev=config.joint_spline_max_nfev)
+                result = None
+                topology_recovery_used = False
+                if observation_ill_view is not None:
+                    ordinary = fit_joint_two_view_spline(
+                        initial, left_distal, right_distal, registration.K,
+                        registration.left_camera_T_base,
+                        registration.right_camera_T_base, nominal_length_mm,
+                        left_observation_weight=1.0,
+                        right_observation_weight=1.0,
+                        coverage_weight=0.30, **common_fit)
+                    if _joint_fit_supports_bijective_stereo(ordinary):
+                        result = ordinary
+                if result is None:
+                    topology_recovery_used = observation_ill_view is not None
+                    result = fit_joint_two_view_spline(
+                        initial, left_distal, right_distal, registration.K,
+                        registration.left_camera_T_base,
+                        registration.right_camera_T_base, nominal_length_mm,
+                        left_ordered_corridor_xy=(
+                            left_corridor if topology_recovery_used else None),
+                        right_ordered_corridor_xy=(
+                            right_corridor if topology_recovery_used else None),
+                        left_observation_weight=left_observation_weight,
+                        right_observation_weight=right_observation_weight,
+                        turn_fraction=(
+                            turn_fraction if topology_recovery_used else None),
+                        coverage_weight=(
+                            0.0 if topology_recovery_used else 0.30),
+                        **common_fit)
+                if (topology_recovery_used
+                        and (result.left_sharp_turn_clusters > 1
+                             or result.right_sharp_turn_clusters > 1)):
+                    raise ValueError("stored joint fit violates one-turn rule")
                 geometry = curve_geometry(
                     result.points_base_mm, config.curvature_smoothing_mm,
                     config.curvature_spline_bases)
@@ -1722,15 +2882,29 @@ def _resume_joint_fit_from_stereo(
                     result.final_symmetric_mean_px, result.arc_length_mm,
                     result.length_residual_mm, result.optimizer_cost,
                     result.optimizer_evaluations,
-                    int(result.optimizer_success))
+                    int(result.optimizer_success),
+                    int(topology_recovery_used),
+                    result.left_sharp_turn_clusters,
+                    result.right_sharp_turn_clusters)
                 for name, value in zip(metric_names, values):
                     output[f"quality/{name}"][index] = value
                 fitted += 1
+                previous_points = result.points_base_mm.copy()
+                previous_timestamp_ns = timestamp_ns
+                previous_turn_fraction = turn_fraction
             except (ArithmeticError, RuntimeError, ValueError,
-                    np.linalg.LinAlgError):
+                    np.linalg.LinAlgError) as error:
                 failed += 1
+                reason = str(error).split(":", 1)[0].strip()
+                if not reason:
+                    reason = type(error).__name__
+                failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
         output.flush()
-    return {"joint_refit_count": fitted, "joint_refit_failed_count": failed}
+    return {
+        "joint_refit_count": fitted,
+        "joint_refit_failed_count": failed,
+        "joint_refit_failure_reasons": failure_reasons,
+    }
 
 
 def resume_image_session(
@@ -1825,7 +2999,32 @@ def resume_image_session(
     _refresh_final_geometry_metrics(destination, registration)
     rejected, learning_valid = _apply_final_learning_quality(
         destination, config.max_mean_reprojection_px,
-        config.max_p95_reprojection_px, config.max_tip_endpoint_error_px)
+        config.max_p95_reprojection_px, config.max_tip_endpoint_error_px,
+        config.marker_tip_endpoint_width_scale,
+        config.marker_tip_endpoint_width_cap_px,
+        config.max_final_mask_outside_fraction,
+        config.max_final_mask_distance_p95_px)
+    interpolation = (
+        interpolate_short_spline_gaps_hdf5(
+            destination,
+            maximum_gap_ms=config.spline_interpolation_max_gap_ms,
+            maximum_good_island_frames=(
+                config.spline_interpolation_max_good_island_frames))
+        if config.spline_temporal_cutoff_hz > 0.0 else {
+            "interpolated_frame_count": 0,
+            "interpolated_runs": [],
+            "maximum_gap_ms": config.spline_interpolation_max_gap_ms})
+    if interpolation["interpolated_frame_count"]:
+        _refresh_final_geometry_metrics(destination, registration)
+        rejected, learning_valid = _apply_final_learning_quality(
+            destination, config.max_mean_reprojection_px,
+            config.max_p95_reprojection_px,
+            config.max_tip_endpoint_error_px,
+            config.marker_tip_endpoint_width_scale,
+            config.marker_tip_endpoint_width_cap_px,
+            config.max_final_mask_outside_fraction,
+            config.max_final_mask_distance_p95_px)
+    summary["spline_gap_interpolation"] = interpolation
     summary["final_reprojection_rejected_count"] = rejected
     summary["learning_valid_count"] = learning_valid
 
@@ -2039,6 +3238,51 @@ def _centerline_outside_mask_fraction(result: SamMaterialResult) -> float:
     supported[in_bounds] = mask[
         points[in_bounds, 1], points[in_bounds, 0]]
     return float(1.0 - np.mean(supported))
+
+
+def _marked_centerline_topology_metrics(
+        result: SamMaterialResult) -> dict[str, float]:
+    """Summarize marker order and separated sharp turns in one cyan path."""
+    points = resample_arclength(
+        result.material.points, 128, smooth_window=1)
+    span = 4
+    incoming = points[span:-span] - points[:-2 * span]
+    outgoing = points[2 * span:] - points[span:-span]
+    incoming /= np.maximum(
+        np.linalg.norm(incoming, axis=1, keepdims=True), 1e-9)
+    outgoing /= np.maximum(
+        np.linalg.norm(outgoing, axis=1, keepdims=True), 1e-9)
+    turn = np.degrees(np.arccos(np.clip(
+        np.sum(incoming * outgoing, axis=1), -1.0, 1.0)))
+    sharp = np.flatnonzero(turn >= 35.0)
+    clusters = (
+        np.split(sharp, np.flatnonzero(np.diff(sharp) > 8) + 1)
+        if len(sharp) else [])
+    marker_order_valid = float("nan")
+    marker_max_distance = float("nan")
+    observed_count = 0
+    if (result.marker_centers_xy is not None
+            and result.marker_observed is not None):
+        markers = np.asarray(result.marker_centers_xy, dtype=np.float64)
+        observed = np.asarray(result.marker_observed, dtype=bool)
+        usable = observed & np.all(np.isfinite(markers), axis=1)
+        observed_count = int(np.count_nonzero(usable))
+        if observed_count:
+            tree = cKDTree(points)
+            distance, indices = tree.query(markers[usable])
+            marker_max_distance = float(np.max(distance))
+            marker_order_valid = float(
+                np.all(np.diff(indices) > 0) if len(indices) >= 2 else True)
+    return {
+        "marker_interval_route_used": float(
+            "+marker_interval_route" in result.prompt.source),
+        "marker_path_order_valid": marker_order_valid,
+        "marker_path_max_centroid_distance_px": marker_max_distance,
+        "marker_path_observed_count": float(observed_count),
+        "centerline_sharp_turn_cluster_count": float(len(clusters)),
+        "centerline_max_local_turn_deg": (
+            float(np.max(turn)) if len(turn) else 0.0),
+    }
 
 
 def _basic_segmentation_error(
@@ -2502,6 +3746,10 @@ def _projected_workspace_roi_mask(
     return mask
 
 
+class _ObservationsOnlyFrame(Exception):
+    """Internal control flow after a frame-local observation is committed."""
+
+
 def process_image_session(
         session_path: os.PathLike | str,
         sam_checkpoint: os.PathLike | str | None,
@@ -2522,7 +3770,8 @@ def process_image_session(
         segmentation_backend: str = "sam",
         reconstruction_backend: str = "disparity",
         propagated_mask_h5: os.PathLike | str | None = None,
-        cached_mask_h5: os.PathLike | str | None = None) -> dict:
+        cached_mask_h5: os.PathLike | str | None = None,
+        observations_only: bool = False) -> dict:
     initialization_started = time.perf_counter()
     config = config or ImageProcessingConfig()
     session = Path(session_path).resolve()
@@ -2557,6 +3806,11 @@ def process_image_session(
     if reconstruction_backend not in ("disparity", "joint_spline"):
         raise ValueError(
             "reconstruction_backend must be disparity or joint_spline")
+    if observations_only and segmentation_backend != "chromatic_markers":
+        raise ValueError(
+            "--observations-only currently requires chromatic_markers")
+    if observations_only and not config.store_masks:
+        raise ValueError("--observations-only requires --store-masks")
     if segmentation_backend == "propagated" and propagated_mask_h5 is None:
         raise ValueError("propagated backend requires propagated_mask_h5")
     if segmentation_backend == "cached" and cached_mask_h5 is None:
@@ -2571,7 +3825,7 @@ def process_image_session(
     median_period_s = (
         float(np.median(np.diff(query_ns))) * 1e-9 if len(query_ns) > 1 else 1 / 30)
     output_fps = float(np.clip(1.0 / max(median_period_s, 1e-6), 1.0, 60.0))
-    defer_final_overlay = bool(
+    defer_final_overlay = bool(not observations_only and
         (write_video or write_snapshots) and (
             config.interface_offline_cutoff_hz > 0.0
             or config.stereo_offline_cutoff_hz > 0.0)
@@ -2599,6 +3853,7 @@ def process_image_session(
         "device": device,
         "segmentation_backend": segmentation_backend,
         "reconstruction_backend": reconstruction_backend,
+        "observations_only": bool(observations_only),
         "write_snapshots": bool(write_snapshots),
         "snapshot_count": int(snapshot_count),
         "snapshot_frames": sorted(snapshot_indices),
@@ -2609,6 +3864,7 @@ def process_image_session(
             None if cached_mask_h5 is None
             else str(Path(cached_mask_h5).resolve())),
         "collection_markers": markers,
+        "code_provenance": _repository_provenance(),
     }
     with (output / "processing_config.json").open("w", encoding="utf-8") as stream:
         json.dump({"metadata": metadata, "config": asdict(config)}, stream,
@@ -2676,12 +3932,20 @@ def process_image_session(
     previous_valid_results: tuple[SamMaterialResult, SamMaterialResult] | None = None
     previous_valid_timestamp_ns: int | None = None
     previous_stereo_reference_view: str | None = None
+    active_ill_view: str | None = None
+    pending_ill_view: str | None = None
+    pending_ill_view_count = 0
     previous_fitted_disparity_px: np.ndarray | None = None
     previous_reconstructed_camera_m: np.ndarray | None = None
     previous_interface_base_mm: np.ndarray | None = None
     previous_distal_length_mm: float | None = None
     previous_filtered_distal_points: np.ndarray | None = None
+    previous_joint_turn_fraction: float | None = None
     background_prefetch: _BackgroundPrefetch | None = None
+    chromatic_executor = (
+        ThreadPoolExecutor(max_workers=config.chromatic_eye_workers)
+        if (segmentation_backend == "chromatic_markers"
+            and config.chromatic_eye_workers > 1) else None)
     interface_smoothing_summary: dict[str, float] = {}
     stereo_smoothing_summary: dict[str, float] = {}
     spline_temporal_smoothing_summary: dict[str, float] = {}
@@ -2724,7 +3988,13 @@ def process_image_session(
                             return
                         yield (*item, None, None, {
                             "svo_decode": time.perf_counter() - decode_started})
-                frame_iterator = decoded_frames()
+                decoded = decoded_frames()
+                if config.prefetch_frames > 0:
+                    background_prefetch = _BackgroundPrefetch(
+                        decoded, config.prefetch_frames)
+                    frame_iterator = background_prefetch
+                else:
+                    frame_iterator = decoded
             for index in range(len(records)):
                 try:
                     (record, svo_timestamp_ns, left_image, right_image,
@@ -2820,24 +4090,36 @@ def process_image_session(
                                 previous_valid_results[0].material.points)
                             previous_right_points = (
                                 previous_valid_results[1].material.points)
-                        left_result = extract_marked_chromatic_result(
-                            left_image, registration.roi_left_xywh, base_left,
-                            config.chromatic_min_saturation,
-                            config.chromatic_min_value,
-                            previous_points_xy=previous_left_points,
-                            background_bgr=chromatic_background_left,
-                            minimum_background_difference=(
-                                config.chromatic_background_difference),
-                            workspace_mask=workspace_mask_left)
-                        right_result = extract_marked_chromatic_result(
-                            right_image, registration.roi_right_xywh, base_right,
-                            config.chromatic_min_saturation,
-                            config.chromatic_min_value,
-                            previous_points_xy=previous_right_points,
-                            background_bgr=chromatic_background_right,
-                            minimum_background_difference=(
-                                config.chromatic_background_difference),
-                            workspace_mask=workspace_mask_right)
+                        extraction_arguments = (
+                            (left_image, registration.roi_left_xywh, base_left,
+                             previous_left_points, chromatic_background_left,
+                             workspace_mask_left),
+                            (right_image, registration.roi_right_xywh, base_right,
+                             previous_right_points, chromatic_background_right,
+                             workspace_mask_right))
+
+                        def extract_eye(arguments):
+                            image, roi, base, previous, background, workspace = arguments
+                            return extract_marked_chromatic_result(
+                                image, roi, base,
+                                config.chromatic_min_saturation,
+                                config.chromatic_min_value,
+                                previous_points_xy=previous,
+                                background_bgr=background,
+                                minimum_background_difference=(
+                                    config.chromatic_background_difference),
+                                workspace_mask=workspace)
+
+                        if chromatic_executor is None:
+                            left_result, right_result = map(
+                                extract_eye, extraction_arguments)
+                        else:
+                            left_future = chromatic_executor.submit(
+                                extract_eye, extraction_arguments[0])
+                            right_future = chromatic_executor.submit(
+                                extract_eye, extraction_arguments[1])
+                            left_result, right_result = (
+                                left_future.result(), right_future.result())
                         left_result, right_result = refine_marked_stereo_pair(
                             left_image, right_image,
                             left_result, right_result,
@@ -2865,6 +4147,103 @@ def process_image_session(
                         right_result = _external_mask_result(
                             right_image, registration.roi_right_xywh, base_right,
                             right_seed, "hsv_baseline")
+                    reroute_marked_observation = bool(
+                        marker_backend_active
+                        and (segmentation_backend != "cached"
+                             or propagated_cache is None
+                             or propagated_cache.layout != "processed_image"
+                             or propagated_cache.marker_track_requires_reroute(
+                                 index)))
+                    if reroute_marked_observation:
+                        marker_routing_started = time.perf_counter()
+                        previous_left_points = previous_right_points = None
+                        if (previous_valid_results is not None
+                                and 0.0 < temporal_gap_ms
+                                <= config.max_temporal_prompt_gap_ms):
+                            previous_left_points = (
+                                previous_valid_results[0].material.points)
+                            previous_right_points = (
+                                previous_valid_results[1].material.points)
+                        def reroute_eye(result, image, roi, previous):
+                            return reroute_marked_centerline(
+                                result, image, roi,
+                                previous_points_xy=previous,
+                                minimum_marker_confidence=(
+                                    config.marker_min_confidence))
+
+                        if chromatic_executor is None:
+                            left_result = reroute_eye(
+                                left_result, left_image,
+                                registration.roi_left_xywh,
+                                previous_left_points)
+                            right_result = reroute_eye(
+                                right_result, right_image,
+                                registration.roi_right_xywh,
+                                previous_right_points)
+                        else:
+                            left_future = chromatic_executor.submit(
+                                reroute_eye, left_result, left_image,
+                                registration.roi_left_xywh,
+                                previous_left_points)
+                            right_future = chromatic_executor.submit(
+                                reroute_eye, right_result, right_image,
+                                registration.roi_right_xywh,
+                                previous_right_points)
+                            left_result, right_result = (
+                                left_future.result(), right_future.result())
+                        left_result, right_result, sweep_metrics = (
+                            enforce_stereo_epipolar_sweep(
+                                left_result, right_result,
+                                left_image, right_image,
+                                registration.roi_left_xywh,
+                                registration.roi_right_xywh,
+                                base_left, base_right,
+                                previous_left_points_xy=previous_left_points,
+                                previous_right_points_xy=previous_right_points,
+                                minimum_marker_confidence=(
+                                    config.marker_min_confidence),
+                                minimum_sweep_deficit_px=(
+                                    config.marked_epipolar_sweep_deficit_px),
+                                row_half_width_px=(
+                                    config.marked_epipolar_sweep_row_half_width_px)))
+                        metrics.update(sweep_metrics)
+                        # Local normal centering is independent of marker
+                        # availability. Rings select order/topology; they must
+                        # not decide whether a fallback route receives basic
+                        # medial refinement.
+                        if chromatic_executor is None:
+                            left_result = center_marked_route_on_mask(left_result)
+                            right_result = center_marked_route_on_mask(right_result)
+                        else:
+                            left_future = chromatic_executor.submit(
+                                center_marked_route_on_mask, left_result)
+                            right_future = chromatic_executor.submit(
+                                center_marked_route_on_mask, right_result)
+                            left_result, right_result = (
+                                left_future.result(), right_future.result())
+                        for view, result in (
+                                ("left", left_result),
+                                ("right", right_result)):
+                            topology = _marked_centerline_topology_metrics(
+                                result)
+                            metrics.update({
+                                f"marker_interval_route_used_{view}": (
+                                    topology["marker_interval_route_used"]),
+                                f"marker_path_order_valid_{view}": (
+                                    topology["marker_path_order_valid"]),
+                                f"marker_path_max_centroid_distance_{view}_px": (
+                                    topology[
+                                        "marker_path_max_centroid_distance_px"]),
+                                f"marker_path_observed_count_{view}": (
+                                    topology["marker_path_observed_count"]),
+                                f"centerline_sharp_turn_cluster_count_{view}": (
+                                    topology[
+                                        "centerline_sharp_turn_cluster_count"]),
+                                f"centerline_max_local_turn_{view}_deg": (
+                                    topology["centerline_max_local_turn_deg"]),
+                            })
+                        frame_timing_s["marker_routing"] = (
+                            time.perf_counter() - marker_routing_started)
                     frame_timing_s.setdefault("sam_mask_postprocess", 0.0)
 
                     # Batched inference uses frame-local prompts so it is not
@@ -2951,6 +4330,30 @@ def process_image_session(
                         left_length_px, right_length_px) / max(
                             min(left_length_px, right_length_px), 1e-9)
                     initial_centerline_length_ratio = centerline_length_ratio
+                    if observations_only:
+                        metrics.update({
+                            "centerline_length_left_px": left_length_px,
+                            "centerline_length_right_px": right_length_px,
+                            "centerline_outside_mask_fraction_left": (
+                                left_outside_mask_fraction),
+                            "centerline_outside_mask_fraction_right": (
+                                right_outside_mask_fraction),
+                            "stereo_centerline_length_ratio_initial": (
+                                initial_centerline_length_ratio),
+                            "stereo_centerline_length_ratio": (
+                                centerline_length_ratio),
+                            "material_boundary_fraction": float(np.mean([
+                                left_result.material.distal_boundary_fraction,
+                                right_result.material.distal_boundary_fraction])),
+                        })
+                        frame_timing_s["quality_control"] = (
+                            time.perf_counter() - stage_started)
+                        writer.write_observations(
+                            index, left_result, right_result, metrics)
+                        previous_valid_results = (left_result, right_result)
+                        previous_valid_timestamp_ns = record.timestamp_ns
+                        status = "observations_only"
+                        raise _ObservationsOnlyFrame()
                     if (centerline_length_ratio
                             > config.max_stereo_centerline_length_ratio
                             and can_temporal_retry):
@@ -2994,6 +4397,12 @@ def process_image_session(
                     frame_timing_s["quality_control"] = (
                         time.perf_counter() - stage_started)
                     stereo_retry_view = 0
+                    stereo_retry_attempted = 0
+                    # 0: not attempted, 1: accepted, 2: ridge construction
+                    # failed, 3: candidate failed quality, 4: no geometric
+                    # improvement.  Numeric codes keep the buffered HDF5 path
+                    # compact while making failed recovery attempts auditable.
+                    stereo_retry_status_code = 0
                     guided_retry_ratio = (
                         config.marked_stereo_guided_retry_ratio
                         if marker_backend_active
@@ -3007,6 +4416,7 @@ def process_image_session(
                     if ((segmenter is not None or marker_backend_active)
                             and (centerline_length_ratio > guided_retry_ratio
                                  or outside_retry)):
+                        stereo_retry_attempted = 1
                         if (abs(left_outside_mask_fraction
                                - right_outside_mask_fraction) > 0.05):
                             retry_is_left = (
@@ -3067,6 +4477,7 @@ def process_image_session(
                                 allow_temporal_completion=marker_backend_active)
                         except ValueError:
                             retry_result = None
+                            stereo_retry_status_code = 2
                         if retry_result is not None:
                             # A cross-view prompt can recover the complete path
                             # while SAM also includes a broad adjacent surface.
@@ -3119,6 +4530,68 @@ def process_image_session(
                                         retry_outside_mask_fraction)
                                     stereo_retry_view = 2
                                 centerline_length_ratio = retry_ratio
+                                stereo_retry_status_code = 1
+                            elif not retry_quality_ok:
+                                stereo_retry_status_code = 3
+                            else:
+                                stereo_retry_status_code = 4
+                    ill_view = None
+                    observation_ill_view = None
+                    observation_weight_left = 1.0
+                    observation_weight_right = 1.0
+                    ill_detection_ambiguity = float("nan")
+                    if marker_backend_active:
+                        shorter_view = (
+                            "left" if left_length_px < right_length_px
+                            else "right")
+                        longer_view = (
+                            "right" if shorter_view == "left" else "left")
+                        if (centerline_length_ratio
+                                > config.marked_stereo_guided_retry_ratio):
+                            ill_view = shorter_view
+                        elif (centerline_length_ratio
+                                > config.stereo_reference_switch_ratio):
+                            longer_result = (
+                                left_result if longer_view == "left"
+                                else right_result)
+                            shorter_result = (
+                                left_result if shorter_view == "left"
+                                else right_result)
+                            ill_detection_ambiguity = (
+                                epipolar_mask_ambiguity_fraction(
+                                    longer_result.material.centerline,
+                                    shorter_result.material.centerline,
+                                    longer_view,
+                                    n_samples=config.stereo_samples,
+                                    smooth_2d=config.smooth_2d,
+                                    row_search_px=config.overlap_row_search_px))
+                            if (ill_detection_ambiguity
+                                    >= config.marked_ill_epipolar_ambiguity_fraction):
+                                ill_view = shorter_view
+                        raw_ill_view = ill_view
+                        # Entry, release, and left/right switches all require
+                        # persistent evidence. A one-frame ambiguity excursion
+                        # must not replace a usable independent cyan route.
+                        (active_ill_view, pending_ill_view,
+                         pending_ill_view_count) = (
+                            _update_ill_view_hysteresis(
+                                active_ill_view, pending_ill_view,
+                                pending_ill_view_count, raw_ill_view,
+                                config.stereo_ill_switch_confirm_frames))
+                        ill_view = active_ill_view
+                        metrics.update({
+                            "stereo_raw_ill_view": (
+                                1 if raw_ill_view == "left" else
+                                2 if raw_ill_view == "right" else 0),
+                            "stereo_ill_view_switch_pending": int(
+                                pending_ill_view_count > 0),
+                        })
+                        (observation_weight_left,
+                         observation_weight_right,
+                         observation_ill_view) = _ill_eye_observation_weights(
+                            ill_view, shorter_view,
+                            left_length_px, right_length_px,
+                            config.ill_eye_min_observation_weight)
                     stage_started = time.perf_counter()
                     left_effective_width_px = _mask_effective_width(left_result)
                     right_effective_width_px = _mask_effective_width(right_result)
@@ -3136,7 +4609,12 @@ def process_image_session(
                         "stereo_centerline_length_ratio": centerline_length_ratio,
                         "stereo_retry_used": int(stereo_retry_view != 0),
                         "stereo_retry_view": stereo_retry_view,
+                        "stereo_retry_attempted": stereo_retry_attempted,
+                        "stereo_retry_status_code": stereo_retry_status_code,
+                        "stereo_ill_detection_ambiguity": (
+                            ill_detection_ambiguity),
                     })
+                    temporal_mask_bypassed_view = 0
                     if (previous_valid_results is not None
                             and 0.0 < temporal_gap_ms
                             <= config.max_temporal_prompt_gap_ms):
@@ -3164,10 +4642,16 @@ def process_image_session(
                                     or temporal_p95
                                     > config.max_temporal_centerline_p95_px))
                                     or displaced):
+                                if marker_backend_active and view == ill_view:
+                                    temporal_mask_bypassed_view = (
+                                        1 if view == "left" else 2)
+                                    continue
                                 raise ValueError(
                                     f"temporal_{view}_mask_inconsistent:"
                                     f"coverage={coverage:.2f},"
                                     f"length_ratio={length / max(previous_length, 1e-9):.2f}")
+                    metrics["temporal_mask_inconsistency_bypassed_view"] = (
+                        temporal_mask_bypassed_view)
                     frame_timing_s["quality_control"] += (
                         time.perf_counter() - stage_started)
                     if (not marker_backend_active and centerline_length_ratio
@@ -3175,6 +4659,11 @@ def process_image_session(
                         raise ValueError(
                             "stereo_centerline_length_mismatch:"
                             f"ratio={centerline_length_ratio:.2f}")
+                    # Preserve independently extracted observations. A later
+                    # overlap solve may provide a better displayed/inference
+                    # path, but it must never become the next frame's image
+                    # segmentation prior without passing a separate gate.
+                    observed_results = (left_result, right_result)
                     stage_started = time.perf_counter()
                     tip_camera_m, tip_epipolar_error_px = (
                         _stereo_tip_camera_point(
@@ -3221,6 +4710,9 @@ def process_image_session(
                         if disparity_prior_available else 0.0)
                     for candidate_view in ("left", "right"):
                         try:
+                            force_overlap = bool(
+                                ill_view is not None
+                                and candidate_view != ill_view)
                             candidate = reconstruct_disparity_anchored(
                                 left_result.material.centerline,
                                 right_result.material.centerline,
@@ -3243,7 +4735,9 @@ def process_image_session(
                                     disparity_prior_weight),
                                 overlap_aware=(
                                     config.overlap_aware_reconstruction
-                                    and not marker_backend_active),
+                                    and (not marker_backend_active
+                                         or force_overlap)),
+                                force_overlap_aware=force_overlap,
                                 overlap_row_search_px=(
                                     config.overlap_row_search_px),
                                 overlap_self_fraction_threshold=(
@@ -3292,7 +4786,8 @@ def process_image_session(
                             continue
                     reference_view = _select_stereo_reference(
                         candidates, previous_stereo_reference_view,
-                        config.stereo_reference_hysteresis_score)
+                        config.stereo_reference_hysteresis_score,
+                        ill_view=ill_view)
                     reconstruction = candidates[reference_view][1]
                     left_score = (
                         candidates["left"][0] if "left" in candidates
@@ -3307,6 +4802,13 @@ def process_image_session(
                             abs(left_score - right_score)
                             if np.isfinite(left_score) and np.isfinite(right_score)
                             else float("nan")),
+                        "stereo_ill_view": (
+                            1 if ill_view == "left" else
+                            2 if ill_view == "right" else 0),
+                        "stereo_observation_weight_left": (
+                            observation_weight_left),
+                        "stereo_observation_weight_right": (
+                            observation_weight_right),
                         "stereo_candidate_temporal_rms_left_mm": (
                             candidate_details.get("left", {}).get(
                                 "temporal_rms_mm", float("nan"))),
@@ -3330,12 +4832,20 @@ def process_image_session(
                         1 if reference_view == "left" else 2)
                     metrics["overlap_aware_used"] = int(
                         reconstruction["overlap_aware_used"])
+                    metrics["overlap_aware_forced"] = int(
+                        reconstruction.get("overlap_aware_forced", 0))
+                    metrics["overlap_one_turn_enforced"] = int(
+                        reconstruction.get("overlap_one_turn_enforced", 0))
+                    metrics["overlap_expected_turn_index"] = int(
+                        reconstruction.get("overlap_expected_turn_index", -1))
                     metrics["centerline_tip_anchor_used"] = int(
                         reconstruction["centerline_tip_anchor_used"])
                     metrics["centerline_tip_epipolar_error_px"] = (
                         reconstruction["centerline_tip_epipolar_error_px"])
                     metrics["marker_anchor_count"] = int(
                         reconstruction["marker_anchor_count"])
+                    metrics["marker_interval_boundary_count"] = int(
+                        reconstruction.get("marker_interval_boundary_count", 0))
                     metrics["marker_epipolar_error_max_px"] = (
                         reconstruction["marker_epipolar_error_max_px"])
                     metrics["terminal_refinement_used"] = int(
@@ -3348,6 +4858,86 @@ def process_image_session(
                         reconstruction["terminal_reprojection_left_px"])
                     metrics["terminal_reprojection_right_px"] = (
                         reconstruction["terminal_reprojection_right_px"])
+                    inferred_view = 0
+                    inferred_candidate_view = 0
+                    inferred_accepted = 0
+                    inferred_metrics: dict[str, float | int] = {
+                        "stereo_inferred_rejection_code": 0,
+                        "stereo_inferred_marker_order_valid": np.nan,
+                        "stereo_inferred_terminal_error_px": np.nan,
+                        "stereo_inferred_sharp_turn_clusters": np.nan,
+                        "stereo_inferred_temporal_p95_px": np.nan,
+                        "stereo_inferred_temporal_max_px": np.nan,
+                        "stereo_inferred_outside_mask_fraction": np.nan,
+                        "stereo_inferred_medial_radius_ratio": np.nan,
+                    }
+                    if reconstruction.get("overlap_aware_forced", 0):
+                        if ill_view == "left":
+                            inferred_candidate_view = 1
+                            previous_observed = (
+                                None if previous_valid_results is None else
+                                previous_valid_results[0].material.points)
+                            (candidate_result, accepted,
+                             inferred_metrics) = _inferred_material_path_quality(
+                                left_result,
+                                reconstruction["ordered_left_px"],
+                                previous_observed,
+                                config.max_inferred_centerline_temporal_p95_px,
+                                config.max_inferred_centerline_temporal_max_px,
+                                config.max_inferred_sharp_turn_clusters)
+                            if accepted:
+                                left_result = candidate_result
+                                inferred_view = 1
+                                inferred_accepted = 1
+                        elif ill_view == "right":
+                            inferred_candidate_view = 2
+                            previous_observed = (
+                                None if previous_valid_results is None else
+                                previous_valid_results[1].material.points)
+                            (candidate_result, accepted,
+                             inferred_metrics) = _inferred_material_path_quality(
+                                right_result,
+                                reconstruction["ordered_right_px"],
+                                previous_observed,
+                                config.max_inferred_centerline_temporal_p95_px,
+                                config.max_inferred_centerline_temporal_max_px,
+                                config.max_inferred_sharp_turn_clusters)
+                            if accepted:
+                                right_result = candidate_result
+                                inferred_view = 2
+                                inferred_accepted = 1
+                    metrics.update(inferred_metrics)
+                    metrics.update({
+                        "stereo_inferred_candidate_view": inferred_candidate_view,
+                        "stereo_inferred_accepted": inferred_accepted,
+                        "stereo_inferred_view": inferred_view,
+                    })
+                    # These diagnostics describe the actual cyan paths written
+                    # to HDF5/overlay, including any accepted stereo repair.
+                    for view, result in (
+                            ("left", left_result), ("right", right_result)):
+                        topology = _marked_centerline_topology_metrics(result)
+                        metrics.update({
+                            f"marker_interval_route_used_{view}": (
+                                topology["marker_interval_route_used"]),
+                            f"marker_path_order_valid_{view}": (
+                                topology["marker_path_order_valid"]),
+                            f"marker_path_max_centroid_distance_{view}_px": (
+                                topology[
+                                    "marker_path_max_centroid_distance_px"]),
+                            f"marker_path_observed_count_{view}": (
+                                topology["marker_path_observed_count"]),
+                            f"centerline_sharp_turn_cluster_count_{view}": (
+                                topology[
+                                    "centerline_sharp_turn_cluster_count"]),
+                            f"centerline_max_local_turn_{view}_deg": (
+                                topology["centerline_max_local_turn_deg"]),
+                            f"centerline_outside_mask_fraction_{view}": (
+                                _centerline_outside_mask_fraction(result)),
+                            f"centerline_length_{view}_px": float(
+                                cumulative_arclength(
+                                    result.material.points)[-1]),
+                        })
                     metrics["tip_stereo_observed"] = int(
                         tip_camera_m is not None)
                     metrics["tip_epipolar_error_px"] = (
@@ -3610,34 +5200,59 @@ def process_image_session(
                                 right_interface_observation,
                                 right_tip_observation,
                                 count=max(64, config.stereo_samples)))
-
-                        def axial_markers(centerline, markers, endpoints):
-                            axial = np.full((4, 2), np.nan, dtype=np.float64)
-                            axial[0], axial[3] = endpoints
-                            for marker_index in (1, 2):
-                                marker = markers[marker_index]
-                                if np.all(np.isfinite(marker)):
-                                    axial[marker_index] = (
-                                        project_point_to_polyline(
-                                            centerline, marker)[0])
-                            return axial
-
-                        left_axial = axial_markers(
-                            left_result.material.points, left_markers,
-                            left_endpoint_axial)
-                        right_axial = axial_markers(
-                            right_result.material.points, right_markers,
-                            right_endpoint_axial)
-                        joint_reconstruction = fit_joint_two_view_spline(
-                            distal_geometry.points_mm,
-                            left_distal_observation,
-                            right_distal_observation,
-                            registration.K,
-                            registration.left_camera_T_base,
-                            registration.right_camera_T_base,
-                            nominal_distal_length_mm,
-                            left_axial_markers_xy=left_axial,
-                            right_axial_markers_xy=right_axial,
+                        (left_ordered_corridor,
+                         right_ordered_corridor) = (
+                            _center_paired_mask_corridors(
+                                reconstruction[
+                                    "ordered_left_px"][boundary_sample:],
+                                reconstruction[
+                                    "ordered_right_px"][boundary_sample:],
+                                left_result, right_result,
+                                config.distal_samples,
+                                reconstructed_s_mm[boundary_sample:]))
+                        left_ridge_evidence = _distal_medial_ridge_evidence(
+                            left_image, left_result)
+                        right_ridge_evidence = _distal_medial_ridge_evidence(
+                            right_image, right_result)
+                        left_turn, left_turn_angle = _projected_turn_fraction(
+                            left_ordered_corridor)
+                        right_turn, right_turn_angle = _projected_turn_fraction(
+                            right_ordered_corridor)
+                        # The well-conditioned eye defines the shared turn.
+                        # Its farthest epipolar row, rather than a visible
+                        # corner, transfers the material location at which the
+                        # ill eye is allowed to reverse.
+                        if observation_ill_view == "left":
+                            turn_fraction = _epipolar_sweep_extremum_fraction(
+                                right_ordered_corridor)
+                        elif observation_ill_view == "right":
+                            turn_fraction = _epipolar_sweep_extremum_fraction(
+                                left_ordered_corridor)
+                        else:
+                            turn_fraction = None
+                        if (turn_fraction is None
+                                and observation_ill_view is not None):
+                            turn_fraction = previous_joint_turn_fraction
+                        elif (turn_fraction is not None
+                              and previous_joint_turn_fraction is not None
+                              and temporal_gap_ms
+                              <= config.max_temporal_prompt_gap_ms):
+                            # This state controls only where curvature is cheap;
+                            # it does not blend curve positions or introduce
+                            # image-space lag.
+                            bounded_turn = float(np.clip(
+                                turn_fraction,
+                                previous_joint_turn_fraction - 0.08,
+                                previous_joint_turn_fraction + 0.08))
+                            turn_fraction = float(
+                                0.75 * bounded_turn
+                                + 0.25 * previous_joint_turn_fraction)
+                        common_fit = dict(
+                            # Ring centroids remain soft observations.
+                            left_axial_markers_xy=left_markers,
+                            right_axial_markers_xy=right_markers,
+                            left_ridge_evidence_xy=left_ridge_evidence,
+                            right_ridge_evidence_xy=right_ridge_evidence,
                             output_samples=config.distal_samples,
                             basis_count=config.joint_spline_basis_count,
                             fit_samples=config.distal_samples,
@@ -3645,10 +5260,72 @@ def process_image_session(
                                 config.marked_distal_length_prior_sigma_mm
                                 if marker_backend_active else
                                 config.distal_length_prior_sigma_mm),
+                            temporal_prior_points_base_mm=(
+                                previous_filtered_distal_points
+                                if (previous_filtered_distal_points is not None
+                                    and temporal_gap_ms
+                                    <= config.max_temporal_prompt_gap_ms)
+                                else None),
+                            temporal_prior_sigma_mm=max(
+                                2.5, 0.65
+                                * config.ill_eye_temporal_shape_sigma_mm),
                             max_nfev=config.joint_spline_max_nfev)
+                        joint_reconstruction = None
+                        topology_recovery_used = False
+                        if observation_ill_view is not None:
+                            ordinary = fit_joint_two_view_spline(
+                                distal_geometry.points_mm,
+                                left_distal_observation,
+                                right_distal_observation,
+                                registration.K,
+                                registration.left_camera_T_base,
+                                registration.right_camera_T_base,
+                                nominal_distal_length_mm,
+                                left_observation_weight=1.0,
+                                right_observation_weight=1.0,
+                                coverage_weight=0.30, **common_fit)
+                            if _joint_fit_supports_bijective_stereo(ordinary):
+                                joint_reconstruction = ordinary
+                        if joint_reconstruction is None:
+                            topology_recovery_used = (
+                                observation_ill_view is not None)
+                            joint_reconstruction = fit_joint_two_view_spline(
+                                distal_geometry.points_mm,
+                                left_distal_observation,
+                                right_distal_observation,
+                                registration.K,
+                                registration.left_camera_T_base,
+                                registration.right_camera_T_base,
+                                nominal_distal_length_mm,
+                                left_ordered_corridor_xy=(
+                                    left_ordered_corridor
+                                    if topology_recovery_used else None),
+                                right_ordered_corridor_xy=(
+                                    right_ordered_corridor
+                                    if topology_recovery_used else None),
+                                left_observation_weight=(
+                                    observation_weight_left),
+                                right_observation_weight=(
+                                    observation_weight_right),
+                                turn_fraction=(
+                                    turn_fraction
+                                    if topology_recovery_used else None),
+                                coverage_weight=(
+                                    0.0 if topology_recovery_used else 0.30),
+                                **common_fit)
                         if not np.all(np.isfinite(
                                 joint_reconstruction.points_base_mm)):
                             raise ValueError("joint_spline_nonfinite")
+                        if (topology_recovery_used
+                                and (
+                                    joint_reconstruction.
+                                    left_sharp_turn_clusters > 1
+                                    or joint_reconstruction.
+                                    right_sharp_turn_clusters > 1)):
+                            raise ValueError(
+                                "joint_multiple_projected_turns:"
+                                f"left={joint_reconstruction.left_sharp_turn_clusters},"
+                                f"right={joint_reconstruction.right_sharp_turn_clusters}")
                         distal_geometry = curve_geometry(
                             joint_reconstruction.points_base_mm,
                             config.curvature_smoothing_mm,
@@ -3680,6 +5357,17 @@ def process_image_session(
                                 joint_reconstruction.optimizer_evaluations),
                             "joint_optimizer_success": int(
                                 joint_reconstruction.optimizer_success),
+                            "joint_turn_fraction": (
+                                float("nan") if turn_fraction is None
+                                else turn_fraction),
+                            "joint_left_turn_angle_deg": left_turn_angle,
+                            "joint_right_turn_angle_deg": right_turn_angle,
+                            "joint_topology_recovery_used": int(
+                                topology_recovery_used),
+                            "joint_left_sharp_turn_clusters": (
+                                joint_reconstruction.left_sharp_turn_clusters),
+                            "joint_right_sharp_turn_clusters": (
+                                joint_reconstruction.right_sharp_turn_clusters),
                         })
                         frame_timing_s["joint_spline_reconstruction"] = (
                             time.perf_counter() - joint_started)
@@ -3701,13 +5389,48 @@ def process_image_session(
                             filtered_distal,
                             config.curvature_smoothing_mm,
                             config.curvature_spline_bases)
+                    if joint_reconstruction is not None:
+                        # The paired spline is the sole final distal topology.
+                        # Both cyan projections now come from the same 3D
+                        # material coordinate as the yellow reconstruction.
+                        left_result = _replace_distal_with_joint_projection(
+                            left_result,
+                            _project_base_points(
+                                registration, distal_geometry.points_mm,
+                                right=False))
+                        right_result = _replace_distal_with_joint_projection(
+                            right_result,
+                            _project_base_points(
+                                registration, distal_geometry.points_mm,
+                                right=True))
+                        for view, result in (
+                                ("left", left_result),
+                                ("right", right_result)):
+                            topology = _marked_centerline_topology_metrics(result)
+                            metrics.update({
+                                f"marker_path_order_valid_{view}": topology[
+                                    "marker_path_order_valid"],
+                                f"marker_path_max_centroid_distance_{view}_px":
+                                    topology[
+                                        "marker_path_max_centroid_distance_px"],
+                                f"centerline_sharp_turn_cluster_count_{view}":
+                                    topology[
+                                        "centerline_sharp_turn_cluster_count"],
+                                f"centerline_max_local_turn_{view}_deg":
+                                    topology["centerline_max_local_turn_deg"],
+                                f"centerline_outside_mask_fraction_{view}":
+                                    _centerline_outside_mask_fraction(result),
+                                f"centerline_length_{view}_px": float(
+                                    cumulative_arclength(
+                                        result.material.points)[-1]),
+                            })
                     stereo_score = min(
                         stereo_condition_score(left_result.material.points),
                         stereo_condition_score(right_result.material.points))
                     fitted_reprojection = _fitted_curve_reprojection_metrics(
                         registration, distal_geometry.points_mm,
-                        left_result.material.points,
-                        right_result.material.points)
+                        observed_results[0].material.points,
+                        observed_results[1].material.points)
                     fitted_tip_left = _project_base_points(
                         registration, distal_geometry.points_mm[-1:], False)[0]
                     fitted_tip_right = _project_base_points(
@@ -3821,6 +5544,10 @@ def process_image_session(
                         time.perf_counter() - stage_started)
 
                     stage_started = time.perf_counter()
+                    writer.write_observed_centerline(
+                        index, "left", observed_results[0])
+                    writer.write_observed_centerline(
+                        index, "right", observed_results[1])
                     writer.write_view(index, "left", left_result)
                     writer.write_view(index, "right", right_result)
                     writer.write_success(
@@ -3833,18 +5560,39 @@ def process_image_session(
                         marker_stereo_observed=marker_stereo_observed)
                     frame_timing_s["hdf5_write"] += (
                         time.perf_counter() - stage_started)
-                    previous_valid_results = (left_result, right_result)
+                    # Keep stereo-inferred correspondences out of the next
+                    # frame's image-routing prior. They are valid 3D evidence,
+                    # not independent 2D observations.
+                    previous_valid_results = observed_results
                     previous_valid_timestamp_ns = record.timestamp_ns
                     previous_stereo_reference_view = reference_view
-                    previous_fitted_disparity_px = reconstruction[
-                        "fitted_disparity_px"].copy()
-                    previous_reconstructed_camera_m = reconstruction[
-                        "points_camera_m"].copy()
+                    if joint_reconstruction is not None:
+                        try:
+                            (previous_fitted_disparity_px,
+                             previous_reconstructed_camera_m) = (
+                                _joint_temporal_stereo_prior(
+                                    registration,
+                                    joint_reconstruction.points_base_mm,
+                                    config.stereo_samples))
+                        except ValueError:
+                            previous_fitted_disparity_px = reconstruction[
+                                "fitted_disparity_px"].copy()
+                            previous_reconstructed_camera_m = reconstruction[
+                                "points_camera_m"].copy()
+                    else:
+                        previous_fitted_disparity_px = reconstruction[
+                            "fitted_disparity_px"].copy()
+                        previous_reconstructed_camera_m = reconstruction[
+                            "points_camera_m"].copy()
                     previous_interface_base_mm = (
                         distal_geometry.points_mm[0].copy())
                     previous_distal_length_mm = filtered_distal_length_mm
                     previous_filtered_distal_points = (
                         distal_geometry.points_mm.copy())
+                    if joint_reconstruction is not None:
+                        previous_joint_turn_fraction = turn_fraction
+                except _ObservationsOnlyFrame:
+                    pass
                 except (ArithmeticError, RuntimeError, ValueError,
                         np.linalg.LinAlgError) as exc:
                     status = str(exc)
@@ -3857,6 +5605,7 @@ def process_image_session(
                             and isinstance(right_result, SamMaterialResult)):
                         writer.write_view(index, "left", left_result)
                         writer.write_view(index, "right", right_result)
+                        writer.mark_observation_valid(index)
                     writer.write_failure(index, status, metrics)
                     frame_timing_s["hdf5_write"] += (
                         time.perf_counter() - stage_started)
@@ -3932,7 +5681,8 @@ def process_image_session(
             background_prefetch.close()
         try:
             writer.close()
-            if (reconstruction_backend == "disparity"
+            if (not observations_only
+                    and reconstruction_backend == "disparity"
                     and config.stereo_offline_cutoff_hz > 0.0):
                 smoothing_started = time.perf_counter()
                 stereo_smoothing_summary = smooth_stereo_disparity_hdf5(
@@ -3944,7 +5694,8 @@ def process_image_session(
                     curvature_spline_bases=config.curvature_spline_bases)
                 timing_totals_s["stereo_offline_smoothing"] = (
                     time.perf_counter() - smoothing_started)
-            if (reconstruction_backend == "disparity"
+            if (not observations_only
+                    and reconstruction_backend == "disparity"
                     and config.interface_offline_cutoff_hz > 0.0):
                 smoothing_started = time.perf_counter()
                 interface_smoothing_summary = smooth_interface_hdf5(
@@ -3965,7 +5716,8 @@ def process_image_session(
                         else config.interface_session_prior_relative_weight))
                 timing_totals_s["interface_offline_smoothing"] = (
                     time.perf_counter() - smoothing_started)
-            if config.spline_temporal_cutoff_hz > 0.0:
+            if (not observations_only
+                    and config.spline_temporal_cutoff_hz > 0.0):
                 smoothing_started = time.perf_counter()
                 spline_temporal_smoothing_summary = (
                     smooth_distal_spline_coefficients_hdf5(
@@ -4000,22 +5752,52 @@ def process_image_session(
                             reconstruction_backend == "disparity")))
                 timing_totals_s["spline_temporal_smoothing"] = (
                     time.perf_counter() - smoothing_started)
-            metrics_started = time.perf_counter()
-            _refresh_final_geometry_metrics(
-                output / "processed_shapes.h5", registration)
-            (final_reprojection_rejected,
-             final_learning_valid) = _apply_final_learning_quality(
-                output / "processed_shapes.h5",
-                config.max_mean_reprojection_px,
-                config.max_p95_reprojection_px,
-                config.max_tip_endpoint_error_px)
-            spline_temporal_smoothing_summary[
-                "final_reprojection_rejected_count"] = (
-                    final_reprojection_rejected)
-            spline_temporal_smoothing_summary[
-                "learning_valid_count"] = final_learning_valid
-            timing_totals_s["final_geometry_metrics"] = (
-                time.perf_counter() - metrics_started)
+            if not observations_only:
+                metrics_started = time.perf_counter()
+                _refresh_final_geometry_metrics(
+                    output / "processed_shapes.h5", registration)
+                (final_reprojection_rejected,
+                 final_learning_valid) = _apply_final_learning_quality(
+                    output / "processed_shapes.h5",
+                    config.max_mean_reprojection_px,
+                    config.max_p95_reprojection_px,
+                    config.max_tip_endpoint_error_px,
+                    config.marker_tip_endpoint_width_scale,
+                    config.marker_tip_endpoint_width_cap_px,
+                    config.max_final_mask_outside_fraction,
+                    config.max_final_mask_distance_p95_px)
+                interpolation_summary = (
+                    interpolate_short_spline_gaps_hdf5(
+                        output / "processed_shapes.h5",
+                        maximum_gap_ms=config.spline_interpolation_max_gap_ms,
+                        maximum_good_island_frames=(
+                            config.spline_interpolation_max_good_island_frames))
+                    if config.spline_temporal_cutoff_hz > 0.0 else {
+                        "interpolated_frame_count": 0,
+                        "interpolated_runs": [],
+                        "maximum_gap_ms": config.spline_interpolation_max_gap_ms})
+                if interpolation_summary["interpolated_frame_count"]:
+                    _refresh_final_geometry_metrics(
+                        output / "processed_shapes.h5", registration)
+                    (final_reprojection_rejected,
+                     final_learning_valid) = _apply_final_learning_quality(
+                        output / "processed_shapes.h5",
+                        config.max_mean_reprojection_px,
+                        config.max_p95_reprojection_px,
+                        config.max_tip_endpoint_error_px,
+                        config.marker_tip_endpoint_width_scale,
+                        config.marker_tip_endpoint_width_cap_px,
+                        config.max_final_mask_outside_fraction,
+                        config.max_final_mask_distance_p95_px)
+                spline_temporal_smoothing_summary[
+                    "spline_gap_interpolation"] = interpolation_summary
+                spline_temporal_smoothing_summary[
+                    "final_reprojection_rejected_count"] = (
+                        final_reprojection_rejected)
+                spline_temporal_smoothing_summary[
+                    "learning_valid_count"] = final_learning_valid
+                timing_totals_s["final_geometry_metrics"] = (
+                    time.perf_counter() - metrics_started)
         finally:
             timing_totals_s["hdf5_write_background"] = writer.write_time_s
             overlay.close()
@@ -4023,6 +5805,8 @@ def process_image_session(
                 segmenter.close()
             if propagated_cache is not None:
                 propagated_cache.close()
+            if chromatic_executor is not None:
+                chromatic_executor.shutdown(wait=True)
             timing_totals_s["output_finalize"] = (
                 timing_totals_s.get("output_finalize", 0.0)
                 + time.perf_counter() - finalize_started)
@@ -4098,6 +5882,7 @@ def process_image_session(
     timing_totals_s["output_finalize"] += (
         time.perf_counter() - finalize_started)
     valid_count = counts.get("valid", 0)
+    observation_valid_count = counts.get("observations_only", 0)
     processed_count = len(summary_rows)
     elapsed_s = time.perf_counter() - started
     summary = {
@@ -4107,6 +5892,9 @@ def process_image_session(
         "processed_frame_count": processed_count,
         "valid_frame_count": valid_count,
         "valid_fraction": valid_count / max(len(records), 1),
+        "observation_valid_frame_count": observation_valid_count,
+        "observation_valid_fraction": (
+            observation_valid_count / max(len(records), 1)),
         "status_counts": counts,
         "elapsed_s": elapsed_s,
         "initialization_s": initialization_s,
@@ -4141,9 +5929,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default="sam")
     parser.add_argument(
         "--reconstruction-backend",
-        choices=("disparity", "joint_spline"), default="disparity",
+        choices=("disparity", "joint_spline"), default=None,
         help=("joint_spline refines one 3D B-spline against both cyan "
-              "centerlines without choosing a reference eye"))
+              "centerlines without choosing a reference eye; observation "
+              "resumes inherit the source backend"))
     parser.add_argument("--propagated-mask-h5", default=None)
     parser.add_argument(
         "--cached-mask-h5", default=None,
@@ -4157,6 +5946,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume-h5", default=None,
         help="processed_shapes.h5 used by --resume-from")
+    parser.add_argument(
+        "--observations-only", action="store_true",
+        help=("decode and persist masks, 2D centerlines, and marker tracks, "
+              "then stop before stereo/3D fitting; the output can be reused "
+              "with --resume-from observations"))
     parser.add_argument("--outdir", default=None)
     parser.add_argument("--prompt-json", default=None)
     parser.add_argument(
@@ -4243,6 +6037,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--spline-temporal-terminal-observation-blend",
         type=float, default=0.65)
     parser.add_argument(
+        "--spline-interpolation-max-gap-ms", type=float, default=650.0,
+        help="maximum bracketed invalid interval repaired in the full 3D spline")
+    parser.add_argument(
+        "--spline-interpolation-max-good-island-frames", type=int, default=2,
+        help="accepted frames this short inside a rejected interval are bridged")
+    parser.add_argument(
         "--distal-boundary-search-half-width-mm", type=float, default=12.0)
     parser.add_argument("--curvature-smoothing-mm", type=float, default=0.25)
     parser.add_argument("--curvature-spline-bases", type=int, default=20)
@@ -4253,6 +6053,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "--marked-stereo-guided-retry-ratio", type=float, default=1.23,
         help=("trigger good-eye/temporal reconstruction when marked-view "
               "projected centerline lengths differ by this ratio"))
+    parser.add_argument(
+        "--ill-eye-min-observation-weight", type=float, default=0.20,
+        help=("minimum relative joint-fit weight of an observably shortened "
+              "eye; the good eye and temporal 3D prior retain material order"))
+    parser.add_argument(
+        "--ill-eye-temporal-shape-sigma-mm", type=float, default=6.0,
+        help=("soft coefficient-space uncertainty of the preceding accepted "
+              "3D shape; the unified fit uses 65 percent of this sigma in "
+              "all temporally adjacent frames"))
+    parser.add_argument(
+        "--marked-ill-epipolar-ambiguity-fraction", type=float, default=0.30,
+        help=("activate good-eye ordering before a full length collapse when "
+              "this fraction of epipolar rows has multiple target branches"))
+    parser.add_argument(
+        "--stereo-ill-switch-confirm-frames", type=int, default=5,
+        help=("consecutive frames required to enter, switch, or release an "
+              "ill-eye state"))
+    parser.add_argument(
+        "--max-inferred-centerline-temporal-p95-px", type=float,
+        default=8.0)
+    parser.add_argument(
+        "--max-inferred-centerline-temporal-max-px", type=float,
+        default=14.0)
+    parser.add_argument(
+        "--max-inferred-sharp-turn-clusters", type=int, default=1,
+        help="maximum separated sharp-turn clusters after mask snapping")
     parser.add_argument("--stereo-reference-switch-ratio", type=float, default=1.15)
     parser.add_argument("--max-mask-effective-width-px", type=float, default=20.0)
     parser.add_argument(
@@ -4262,6 +6088,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-p95-reprojection-px", type=float, default=12.0)
     parser.add_argument("--max-tip-epipolar-error-px", type=float, default=5.0)
     parser.add_argument("--max-tip-endpoint-error-px", type=float, default=8.0)
+    parser.add_argument(
+        "--marker-tip-endpoint-width-scale", type=float, default=0.40,
+        help="tip endpoint uncertainty as a fraction of marker-3 image width")
+    parser.add_argument(
+        "--marker-tip-endpoint-width-cap-px", type=float, default=12.0)
+    parser.add_argument(
+        "--max-final-mask-outside-fraction", type=float, default=0.20)
+    parser.add_argument(
+        "--max-final-mask-distance-p95-px", type=float, default=6.0)
     parser.add_argument("--chromatic-min-saturation", type=int, default=55)
     parser.add_argument("--chromatic-min-value", type=int, default=30)
     parser.add_argument(
@@ -4274,6 +6109,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--chromatic-background-difference", type=int, default=18,
         help="minimum max-channel change from the static background")
     parser.add_argument("--marker-min-confidence", type=float, default=0.50)
+    parser.add_argument(
+        "--marked-epipolar-sweep-deficit-px", type=float, default=4.0,
+        help=("minimum rectified-row span mismatch before the good eye "
+              "supplies an epipolar-line turn constraint"))
+    parser.add_argument(
+        "--marked-epipolar-sweep-row-half-width-px", type=int, default=3)
     parser.add_argument("--marker-disparity-weight", type=float, default=8.0)
     parser.add_argument("--joint-spline-basis-count", type=int, default=20)
     parser.add_argument("--joint-spline-max-nfev", type=int, default=35)
@@ -4308,6 +6149,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prompt-workers", type=int, default=4,
         help="CPU workers for frame-local colour/prompt preprocessing")
     parser.add_argument(
+        "--chromatic-eye-workers", type=int, default=2,
+        help=("parallel workers for independent left/right chromatic mask and "
+              "centerline extraction (default: 2)"))
+    parser.add_argument(
         "--sam-postprocess-workers", type=int, default=2,
         help="CPU workers for independent SAM mask finishing")
     parser.add_argument(
@@ -4340,10 +6185,36 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resume_source_reconstruction_backend(path: str | Path) -> str:
+    """Read the 3D backend that produced an observation cache."""
+    import h5py
+
+    with h5py.File(Path(path).resolve(), "r") as source:
+        metadata = json.loads(source.attrs.get("metadata_json", "{}"))
+        backend = metadata.get("reconstruction_backend")
+        if backend in ("disparity", "joint_spline"):
+            return str(backend)
+        if "joint/coefficients_base_mm" in source:
+            coefficients = source["joint/coefficients_base_mm"]
+            for start in range(0, len(coefficients), 256):
+                if np.any(np.isfinite(coefficients[start:start + 256])):
+                    return "joint_spline"
+    return "disparity"
+
+
 def main(argv=None) -> None:
     args = _build_parser().parse_args(argv)
+    if args.observations_only and args.resume_from is not None:
+        raise ValueError(
+            "--observations-only creates a cache and cannot be combined with "
+            "--resume-from")
     if args.resume_from is not None and args.resume_h5 is None:
         raise ValueError("--resume-from requires --resume-h5")
+    if args.reconstruction_backend is None:
+        args.reconstruction_backend = (
+            _resume_source_reconstruction_backend(args.resume_h5)
+            if args.resume_from == "observations"
+            else "disparity")
     if args.resume_from == "observations":
         if args.cached_mask_h5 is not None:
             raise ValueError(
@@ -4420,6 +6291,10 @@ def main(argv=None) -> None:
             args.spline_temporal_observation_blend),
         spline_temporal_terminal_observation_blend=(
             args.spline_temporal_terminal_observation_blend),
+        spline_interpolation_max_gap_ms=(
+            args.spline_interpolation_max_gap_ms),
+        spline_interpolation_max_good_island_frames=(
+            args.spline_interpolation_max_good_island_frames),
         distal_boundary_search_half_width_mm=(
             args.distal_boundary_search_half_width_mm),
         curvature_smoothing_mm=args.curvature_smoothing_mm,
@@ -4429,6 +6304,20 @@ def main(argv=None) -> None:
             args.max_stereo_centerline_length_ratio),
         marked_stereo_guided_retry_ratio=(
             args.marked_stereo_guided_retry_ratio),
+        ill_eye_min_observation_weight=(
+            args.ill_eye_min_observation_weight),
+        ill_eye_temporal_shape_sigma_mm=(
+            args.ill_eye_temporal_shape_sigma_mm),
+        marked_ill_epipolar_ambiguity_fraction=(
+            args.marked_ill_epipolar_ambiguity_fraction),
+        stereo_ill_switch_confirm_frames=(
+            args.stereo_ill_switch_confirm_frames),
+        max_inferred_centerline_temporal_p95_px=(
+            args.max_inferred_centerline_temporal_p95_px),
+        max_inferred_centerline_temporal_max_px=(
+            args.max_inferred_centerline_temporal_max_px),
+        max_inferred_sharp_turn_clusters=(
+            args.max_inferred_sharp_turn_clusters),
         stereo_reference_switch_ratio=args.stereo_reference_switch_ratio,
         max_mask_effective_width_px=args.max_mask_effective_width_px,
         marked_max_mask_effective_width_px=(
@@ -4438,6 +6327,14 @@ def main(argv=None) -> None:
         max_p95_reprojection_px=args.max_p95_reprojection_px,
         max_tip_epipolar_error_px=args.max_tip_epipolar_error_px,
         max_tip_endpoint_error_px=args.max_tip_endpoint_error_px,
+        marker_tip_endpoint_width_scale=(
+            args.marker_tip_endpoint_width_scale),
+        marker_tip_endpoint_width_cap_px=(
+            args.marker_tip_endpoint_width_cap_px),
+        max_final_mask_outside_fraction=(
+            args.max_final_mask_outside_fraction),
+        max_final_mask_distance_p95_px=(
+            args.max_final_mask_distance_p95_px),
         chromatic_min_saturation=args.chromatic_min_saturation,
         chromatic_min_value=args.chromatic_min_value,
         chromatic_background_subtraction=(
@@ -4445,6 +6342,10 @@ def main(argv=None) -> None:
         chromatic_background_samples=args.chromatic_background_samples,
         chromatic_background_difference=args.chromatic_background_difference,
         marker_min_confidence=args.marker_min_confidence,
+        marked_epipolar_sweep_deficit_px=(
+            args.marked_epipolar_sweep_deficit_px),
+        marked_epipolar_sweep_row_half_width_px=(
+            args.marked_epipolar_sweep_row_half_width_px),
         marker_disparity_weight=args.marker_disparity_weight,
         joint_spline_basis_count=args.joint_spline_basis_count,
         joint_spline_max_nfev=args.joint_spline_max_nfev,
@@ -4468,13 +6369,15 @@ def main(argv=None) -> None:
         sam_frame_batch_size=args.sam_frame_batch_size,
         sam_postprocess_workers=args.sam_postprocess_workers,
         prompt_workers=args.prompt_workers,
+        chromatic_eye_workers=args.chromatic_eye_workers,
         preprocess_chunk_size=args.preprocess_chunk_size,
         prefetch_frames=args.prefetch_frames,
         hdf_buffer_frames=args.hdf_buffer_frames,
         hdf_queue_chunks=args.hdf_queue_chunks,
         store_masks=(
             args.store_masks if args.store_masks is not None
-            else args.segmentation_backend != "cached"),
+            else (args.segmentation_backend != "cached"
+                  or args.resume_from == "observations")),
         video_scale=args.video_scale)
     parsed_snapshot_frames = (
         None if not args.snapshot_frames else
@@ -4508,7 +6411,8 @@ def main(argv=None) -> None:
             segmentation_backend=args.segmentation_backend,
             reconstruction_backend=args.reconstruction_backend,
             propagated_mask_h5=args.propagated_mask_h5,
-            cached_mask_h5=args.cached_mask_h5)
+            cached_mask_h5=args.cached_mask_h5,
+            observations_only=args.observations_only)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 

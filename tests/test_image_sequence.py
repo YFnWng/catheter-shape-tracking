@@ -9,25 +9,117 @@ import numpy as np
 
 from shape_tracking.image_sequence import (
     _build_parser,
+    _apply_final_learning_quality,
     _bridge_short_good_gaps,
+    _center_ordered_mask_corridor,
+    _center_paired_mask_corridors,
     ImageProcessingConfig,
     ImageSequenceWriter,
     OverlayWriter,
     PropagatedMaskCache,
     _fuse_distal_length,
     _fitted_curve_reprojection_metrics,
+    _epipolar_sweep_extremum_fraction,
+    _ill_eye_observation_weights,
+    _ordered_material_boundary_index,
     _project_point_to_polyline_s,
     _projected_workspace_roi_mask,
+    _resume_source_reconstruction_backend,
     _select_stereo_reference,
     _stereo_candidate_score,
     _stereo_tip_camera_point,
     _temporal_centerline_metrics,
+    _update_ill_view_hysteresis,
 )
 from shape_tracking.robot_data import AlignedRobotData
 from shape_tracking.session import FrameRecord
 
 
 class ImageSequenceGeometryTests(unittest.TestCase):
+    def test_ill_view_hysteresis_confirms_entry_switch_and_release(self):
+        state = (None, None, 0)
+        state = _update_ill_view_hysteresis(*state, "left", 3)
+        self.assertEqual(state, (None, "left", 1))
+        # A marginal one-frame detection cannot activate topology recovery.
+        state = _update_ill_view_hysteresis(*state, None, 3)
+        self.assertEqual(state, (None, None, 0))
+        for expected in (1, 2):
+            state = _update_ill_view_hysteresis(*state, "left", 3)
+            self.assertEqual(state, (None, "left", expected))
+        state = _update_ill_view_hysteresis(*state, "left", 3)
+        self.assertEqual(state, ("left", None, 0))
+        # Release is subject to the same persistence.
+        state = _update_ill_view_hysteresis(*state, None, 3)
+        state = _update_ill_view_hysteresis(*state, None, 3)
+        self.assertEqual(state, ("left", None, 2))
+        state = _update_ill_view_hysteresis(*state, None, 3)
+        self.assertEqual(state, (None, None, 0))
+
+    def test_material_boundary_uses_route_fraction_across_projected_overlap(self):
+        points = np.array([
+            [0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0],
+            [2.0, 0.1], [1.0, 0.1], [0.0, 0.1]])
+        # The projected interface is spatially closest to the distal return
+        # branch, but its material coordinate is the second sample.
+        index = _ordered_material_boundary_index(
+            points, points[-2], boundary_fraction=1.0 / 6.0)
+        self.assertEqual(index, 1)
+
+    def test_ordered_corridor_uses_3d_material_arclength_and_mask_medial_axis(self):
+        mask = np.zeros((21, 41), dtype=bool)
+        mask[7:14, 1:40] = True
+        result = SimpleNamespace(material=SimpleNamespace(
+            mask=mask, roi=(0, 0, 41, 21)))
+        # Stereo sampling is nonuniform in material arclength and lies on the
+        # upper silhouette boundary. The corridor must fix both properties.
+        points = np.array([[1.0, 7.0], [10.0, 7.0], [20.0, 7.0],
+                           [39.0, 7.0]])
+        material_s = np.array([0.0, 1.0, 4.0, 9.0])
+        centered = _center_ordered_mask_corridor(
+            points, result, 3, material_s=material_s)
+        self.assertAlmostEqual(centered[1, 0], 21.0, delta=1.0)
+        np.testing.assert_allclose(centered[:, 1], 10.0, atol=0.6)
+
+    def test_paired_medial_centering_preserves_epipolar_rows(self):
+        left_mask = np.zeros((31, 51), dtype=bool)
+        right_mask = np.zeros((31, 51), dtype=bool)
+        left_mask[8:15, 1:50] = True
+        right_mask[8:15, 1:50] = True
+        left_result = SimpleNamespace(material=SimpleNamespace(
+            mask=left_mask, roi=(0, 0, 51, 31)))
+        right_result = SimpleNamespace(material=SimpleNamespace(
+            mask=right_mask, roi=(0, 0, 51, 31)))
+        # Original stereo observations share a silhouette-boundary row.
+        x = np.linspace(2.0, 48.0, 12)
+        left = np.column_stack([x, np.full_like(x, 8.0)])
+        right = np.column_stack([x - 3.0, np.full_like(x, 8.0)])
+        material_s = np.linspace(0.0, 57.0, len(x))
+        centered_left, centered_right = _center_paired_mask_corridors(
+            left, right, left_result, right_result, 16, material_s)
+        self.assertLessEqual(np.max(np.abs(
+            centered_left[:, 1] - centered_right[:, 1])), 1.0)
+        self.assertGreater(np.mean(centered_left[:, 1]), 10.0)
+
+    def test_epipolar_extremum_transfers_material_turn_from_good_eye(self):
+        # The good-eye curve is smooth, but its row sweep reverses at u=0.6.
+        u = np.linspace(0.0, 1.0, 101)
+        points = np.column_stack([100.0 * u, -np.square(u - 0.6)])
+        fraction = _epipolar_sweep_extremum_fraction(points)
+        self.assertIsNotNone(fraction)
+        self.assertAlmostEqual(fraction, 0.6, delta=0.02)
+        monotone = np.column_stack([100.0 * u, 30.0 * u])
+        self.assertIsNone(_epipolar_sweep_extremum_fraction(monotone))
+
+    def test_stale_ill_eye_never_downweights_current_good_eye(self):
+        left, right, effective = _ill_eye_observation_weights(
+            "left", "right", 120.0, 80.0, 0.2)
+        self.assertEqual((left, right, effective), (1.0, 1.0, None))
+        left, right, effective = _ill_eye_observation_weights(
+            "right", "right", 120.0, 80.0, 0.2)
+        self.assertEqual(effective, "right")
+        self.assertEqual(left, 1.0)
+        self.assertLess(right, 1.0)
+
     def test_resume_cli_exposes_all_persisted_stage_boundaries(self):
         parser = _build_parser()
         for stage in ("observations", "stereo", "joint"):
@@ -36,6 +128,15 @@ class ImageSequenceGeometryTests(unittest.TestCase):
                 "--resume-h5", "/tmp/source.h5"])
             self.assertEqual(args.resume_from, stage)
             self.assertEqual(args.resume_h5, "/tmp/source.h5")
+
+    def test_observation_resume_inherits_source_reconstruction_backend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.h5"
+            with h5py.File(path, "w") as output:
+                output.attrs["metadata_json"] = (
+                    '{"reconstruction_backend":"joint_spline"}')
+            self.assertEqual(
+                _resume_source_reconstruction_backend(path), "joint_spline")
 
     def test_workspace_mask_is_projected_box_not_bounding_rectangle(self):
         registration = SimpleNamespace(
@@ -180,6 +281,19 @@ class ImageSequenceGeometryTests(unittest.TestCase):
         self.assertEqual(_select_stereo_reference(
             candidates, "left", hysteresis_score=2.0), "left")
 
+    def test_observably_shortened_eye_cannot_be_kept_by_hysteresis(self):
+        candidates = {
+            "left": (8.0, {
+                "reference_eye_self_overlap_fraction": 0.0,
+                "other_eye_self_overlap_fraction": 0.0}),
+            "right": (1.0, {
+                "reference_eye_self_overlap_fraction": 0.0,
+                "other_eye_self_overlap_fraction": 0.0}),
+        }
+        self.assertEqual(_select_stereo_reference(
+            candidates, "right", hysteresis_score=100.0,
+            ill_view="right"), "left")
+
     def test_interface_length_is_softly_fused(self):
         raw, filtered, uncertainty = _fuse_distal_length(
             60.0, [56.0, 58.0], [0.8, 1.0], 59.0,
@@ -216,6 +330,38 @@ class ImageSequenceGeometryTests(unittest.TestCase):
         np.testing.assert_array_equal(
             stabilized,
             [False, True, True, True, True, True, True, False])
+
+    def test_final_quality_rejects_curve_outside_current_mask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "shapes.h5"
+            with h5py.File(path, "w") as output:
+                output["frames/valid"] = np.ones(2, np.uint8)
+                output["frames/timestamp_ns"] = np.array(
+                    [0, 33_333_333], np.int64)
+                output["frames/learning_rejection_flags"] = np.zeros(
+                    2, np.uint16)
+                output["frames/learning_valid"] = np.ones(2, np.uint8)
+                for name in (
+                        "fitted_reprojection_left_px",
+                        "fitted_reprojection_right_px",
+                        "fitted_reprojection_p95_px",
+                        "tip_endpoint_left_px", "tip_endpoint_right_px"):
+                    output[f"quality/{name}"] = np.zeros(2)
+                output["quality/final_mask_outside_fraction_left"] = (
+                    np.array([0.0, 0.5]))
+                output["quality/final_mask_outside_fraction_right"] = (
+                    np.zeros(2))
+                output["quality/final_mask_distance_p95_left_px"] = (
+                    np.array([0.0, 12.0]))
+                output["quality/final_mask_distance_p95_right_px"] = (
+                    np.zeros(2))
+            rejected, accepted = _apply_final_learning_quality(
+                path, 5.0, 12.0, 8.0)
+            self.assertEqual(rejected, 1)
+            self.assertEqual(accepted, 1)
+            with h5py.File(path) as output:
+                self.assertEqual(
+                    int(output["frames/learning_rejection_flags"][1]), 32)
 
     def test_completed_image_h5_can_be_used_as_mask_cache(self):
         with tempfile.TemporaryDirectory() as directory:

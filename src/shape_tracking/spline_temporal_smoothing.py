@@ -20,19 +20,28 @@ LEARNING_REJECT_TEMPORAL_UNSUPPORTED = 1 << 1
 LEARNING_REJECT_SHAPE_OUTLIER = 1 << 2
 LEARNING_REJECT_TERMINAL_OUTLIER = 1 << 3
 LEARNING_REJECT_MASK_WIDTH = 1 << 4
+LEARNING_REJECT_FINAL_IMAGE_FIT = 1 << 5
 
 
 def _long_rejected_runs(
         rejected: np.ndarray,
         valid: np.ndarray,
         timestamps_ns: np.ndarray,
-        maximum_gap_ms: float) -> np.ndarray:
-    """Mark rejected runs too long to replace by temporal interpolation."""
+        maximum_gap_ms: float,
+        minimum_sample_fraction: float = 0.0) -> np.ndarray:
+    """Mark frames with too much long-gap material support missing.
+
+    A local correspondence failure can persist at one material coordinate
+    without making the other spline bases unobservable.  ``minimum_sample_fraction``
+    therefore lets callers require a substantial portion of the curve to be in
+    long rejected runs before invalidating the entire frame.  Zero preserves
+    the historical any-sample behavior for direct callers.
+    """
     rejected = np.asarray(rejected, dtype=bool)
     valid = np.asarray(valid, dtype=bool)
     if rejected.ndim != 2 or rejected.shape[0] != len(valid):
         raise ValueError("rejected observations must have shape (frames, samples)")
-    unsupported = np.zeros(len(valid), dtype=bool)
+    long_rejected = np.zeros_like(rejected, dtype=bool)
     for sample in range(rejected.shape[1]):
         indices = np.flatnonzero(valid & rejected[:, sample])
         if len(indices) == 0:
@@ -51,8 +60,12 @@ def _long_rejected_runs(
                 (timestamps_ns[run[-1]] - timestamps_ns[run[0]]) * 1e-6
                 + frame_ms)
             if duration_ms > float(maximum_gap_ms):
-                unsupported[run] = True
-    return unsupported
+                long_rejected[run, sample] = True
+    fraction = float(np.clip(minimum_sample_fraction, 0.0, 1.0))
+    if fraction <= 0.0:
+        return np.any(long_rejected, axis=1)
+    required = max(1, int(np.ceil(fraction * rejected.shape[1])))
+    return np.count_nonzero(long_rejected, axis=1) >= required
 
 
 def _common_basis(sample_count: int, basis_count: int, degree: int = 3):
@@ -113,6 +126,255 @@ def _evaluate_geometry(
     return points, tangent, curvature, float(cumulative_arclength(points)[-1])
 
 
+def _short_good_islands_as_bad(
+        bad: np.ndarray, timestamps_ns: np.ndarray,
+        maximum_gap_ms: float, maximum_good_frames: int) -> np.ndarray:
+    """Join bad intervals separated only by a tiny accepted island."""
+    result = np.asarray(bad, dtype=bool).copy()
+    good = np.flatnonzero(~result)
+    if not len(good):
+        return result
+    splits = np.flatnonzero(np.diff(good) != 1) + 1
+    for run in np.split(good, splits):
+        if (not len(run) or len(run) > int(maximum_good_frames)
+                or run[0] == 0 or run[-1] == len(result) - 1):
+            continue
+        if not (result[run[0] - 1] and result[run[-1] + 1]):
+            continue
+        duration_ms = (
+            timestamps_ns[run[-1] + 1] - timestamps_ns[run[0] - 1]) * 1e-6
+        if duration_ms <= float(maximum_gap_ms):
+            result[run] = True
+    return result
+
+
+def _hermite_coefficient_bridge(
+        coefficients: np.ndarray, timestamps_ns: np.ndarray,
+        left: int, right: int, targets: np.ndarray) -> np.ndarray:
+    """Symmetric cubic interpolation of every coefficient in one operation."""
+    t0 = float(timestamps_ns[left]) * 1e-9
+    t1 = float(timestamps_ns[right]) * 1e-9
+    duration = max(t1 - t0, 1e-9)
+    p0 = coefficients[left]
+    p1 = coefficients[right]
+    v0 = (p1 - p0) / duration
+    v1 = v0.copy()
+    previous = left - 1
+    if previous >= 0 and np.all(np.isfinite(coefficients[previous])):
+        dt = t0 - float(timestamps_ns[previous]) * 1e-9
+        if dt > 0.0:
+            v0 = (p0 - coefficients[previous]) / dt
+    following = right + 1
+    if following < len(coefficients) and np.all(
+            np.isfinite(coefficients[following])):
+        dt = float(timestamps_ns[following]) * 1e-9 - t1
+        if dt > 0.0:
+            v1 = (coefficients[following] - p1) / dt
+    alpha = np.clip(
+        (timestamps_ns[targets].astype(float) * 1e-9 - t0) / duration,
+        0.0, 1.0)[:, None, None]
+    h00 = 2.0 * alpha**3 - 3.0 * alpha**2 + 1.0
+    h10 = alpha**3 - 2.0 * alpha**2 + alpha
+    h01 = -2.0 * alpha**3 + 3.0 * alpha**2
+    h11 = alpha**3 - alpha**2
+    bridged = (
+        h00 * p0[None] + h10 * duration * v0[None]
+        + h01 * p1[None] + h11 * duration * v1[None])
+    # Neighboring velocities can be noisy.  Keep the cubic within a modest
+    # envelope of its two anchors; this retains smooth velocity without a
+    # spatial overshoot during a short unobserved interval.
+    span = np.abs(p1 - p0)
+    margin = 0.25 * span + 0.5
+    lower = np.minimum(p0, p1) - margin
+    upper = np.maximum(p0, p1) + margin
+    return np.clip(bridged, lower[None], upper[None])
+
+
+def interpolate_short_spline_gaps_hdf5(
+        path: str | Path, maximum_gap_ms: float = 650.0,
+        maximum_good_island_frames: int = 2,
+        maximum_point_step_mm: float = 8.0,
+        maximum_arc_length_deviation_mm: float = 4.0) -> dict[str, object]:
+    """Fill short invalid intervals in the complete 3D spline trajectory.
+
+    The common material B-spline coefficients are bridged together, so the
+    repair cannot independently reorder or kink individual sampled points.
+    Original reconstruction validity is retained in a separate dataset and
+    every synthesized frame is explicitly labelled.
+    """
+    path = Path(path)
+    with h5py.File(path, "r+") as output:
+        required = (
+            "distal/filtered_spline_coefficients_base_mm",
+            "frames/timestamp_ns", "frames/valid", "frames/learning_valid")
+        missing = [name for name in required if name not in output]
+        if missing:
+            raise ValueError("spline gap interpolation requires: "
+                             + ", ".join(missing))
+        coefficients = output[
+            "distal/filtered_spline_coefficients_base_mm"][:].astype(float)
+        timestamps_ns = output["frames/timestamp_ns"][:].astype(np.int64)
+        original_valid = output["frames/valid"][:].astype(bool)
+        learning_valid = output["frames/learning_valid"][:].astype(bool)
+        finite = np.all(np.isfinite(coefficients), axis=(1, 2))
+        degree = int(output.attrs.get("distal_temporal_spline_degree", 3))
+        basis_count = coefficients.shape[1]
+        sample_count = output["distal/points_base_mm"].shape[1]
+        u, knots, design = _common_basis(sample_count, basis_count, degree)
+        bad = _short_good_islands_as_bad(
+            ~learning_valid | ~finite, timestamps_ns, maximum_gap_ms,
+            maximum_good_island_frames)
+        interpolated = np.zeros(len(bad), dtype=bool)
+        physical_max_step = np.full(len(bad), np.nan, dtype=np.float32)
+        physical_length_deviation = np.full(
+            len(bad), np.nan, dtype=np.float32)
+        interpolation_method = np.zeros(len(bad), dtype=np.uint8)
+        physical_rejected_runs = 0
+        linear_run_count = 0
+        hermite_run_count = 0
+        indices = np.flatnonzero(bad)
+        splits = np.flatnonzero(np.diff(indices) != 1) + 1
+        for run in np.split(indices, splits):
+            if not len(run):
+                continue
+            left = int(run[0] - 1)
+            right = int(run[-1] + 1)
+            if (left < 0 or right >= len(bad) or bad[left] or bad[right]
+                    or not finite[left] or not finite[right]):
+                continue
+            duration_ms = (
+                timestamps_ns[right] - timestamps_ns[left]) * 1e-6
+            if duration_ms > float(maximum_gap_ms):
+                continue
+            hermite = _hermite_coefficient_bridge(
+                coefficients, timestamps_ns, left, right, run)
+            alpha = np.clip(
+                ((timestamps_ns[run] - timestamps_ns[left])
+                 / (timestamps_ns[right] - timestamps_ns[left])),
+                0.0, 1.0)[:, None, None]
+            linear = (
+                (1.0 - alpha) * coefficients[left][None]
+                + alpha * coefficients[right][None])
+
+            def bridge_quality(candidate):
+                block_coefficients = np.concatenate([
+                    coefficients[left:left + 1], candidate,
+                    coefficients[right:right + 1]], axis=0)
+                block_points = np.einsum(
+                    "sk,tkd->tsd", design, block_coefficients)
+                step = float(np.max(np.linalg.norm(
+                    np.diff(block_points, axis=0), axis=2)))
+                lengths = np.array([
+                    cumulative_arclength(points)[-1]
+                    for points in block_points])
+                expected = np.linspace(lengths[0], lengths[-1], len(lengths))
+                length_error = float(np.max(np.abs(lengths - expected)))
+                score = max(
+                    step / max(float(maximum_point_step_mm), 1e-9),
+                    length_error / max(
+                        float(maximum_arc_length_deviation_mm), 1e-9))
+                return score, step, length_error
+
+            hermite_quality = bridge_quality(hermite)
+            linear_quality = bridge_quality(linear)
+            if linear_quality[0] < hermite_quality[0]:
+                bridged = linear
+                _, maximum_step, length_deviation = linear_quality
+                method = 1
+            else:
+                bridged = hermite
+                _, maximum_step, length_deviation = hermite_quality
+                method = 2
+            physical_max_step[run] = maximum_step
+            physical_length_deviation[run] = length_deviation
+            if (not np.isfinite(maximum_step)
+                    or maximum_step > float(maximum_point_step_mm)
+                    or not np.isfinite(length_deviation)
+                    or length_deviation
+                    > float(maximum_arc_length_deviation_mm)):
+                physical_rejected_runs += 1
+                continue
+            coefficients[run] = bridged
+            interpolated[run] = True
+            interpolation_method[run] = method
+            linear_run_count += int(method == 1)
+            hermite_run_count += int(method == 2)
+
+        def dataset(name: str, dtype=np.uint8):
+            if name in output:
+                return output[name]
+            return output.create_dataset(
+                name, shape=(len(bad),), dtype=dtype, fillvalue=0,
+                compression="gzip", compression_opts=1, shuffle=True)
+
+        pre_valid = dataset("frames/pre_interpolation_valid")
+        # This source validity is immutable across repeated downstream resumes.
+        if not np.any(pre_valid[:]):
+            pre_valid[:] = original_valid.astype(np.uint8)
+        interpolated_ds = dataset("frames/curve_temporally_interpolated")
+        interpolated_ds[:] = interpolated.astype(np.uint8)
+        step_ds = dataset(
+            "quality/curve_interpolation_max_point_step_mm", dtype=np.float32)
+        length_ds = dataset(
+            "quality/curve_interpolation_arc_length_deviation_mm",
+            dtype=np.float32)
+        method_ds = dataset(
+            "quality/curve_interpolation_method", dtype=np.uint8)
+        step_ds[:] = physical_max_step
+        length_ds[:] = physical_length_deviation
+        method_ds[:] = interpolation_method
+        output["distal/filtered_spline_coefficients_base_mm"][:] = coefficients
+
+        for index in np.flatnonzero(interpolated):
+            points, tangent, curvature, arc_length = _evaluate_geometry(
+                coefficients[index], knots, degree, u)
+            output["distal/points_base_mm"][index] = points
+            output["distal/s_mm"][index] = cumulative_arclength(points)
+            output["distal/tangent_base"][index] = tangent
+            output["distal/curvature_per_mm"][index] = curvature
+            output["distal/base_position_base_mm"][index] = points[0]
+            output["quality/distal_spline_arc_length_mm"][index] = arc_length
+            output["quality/distal_spline_basis_count"][index] = basis_count
+            output["quality/distal_spline_internal_knot_count"][index] = (
+                basis_count - degree - 1)
+
+        # These frames now have a usable final curve.  Preserve the raw state
+        # above and clear prior reasons. Final image/mask disagreement remains
+        # diagnostic; a bridge that passed the physical gates is accepted by
+        # the final quality stage because V-overlap masks are unreliable.
+        valid = original_valid | interpolated
+        output["frames/valid"][:] = valid.astype(np.uint8)
+        flags = output["frames/learning_rejection_flags"][:].astype(np.uint16)
+        flags[interpolated] = 0
+        output["frames/learning_rejection_flags"][:] = flags
+        output["frames/learning_valid"][:] = (flags == 0).astype(np.uint8)
+        output.attrs["distal_short_gap_interpolation"] = (
+            "adaptive_symmetric_linear_or_cubic_common_basis_coefficients")
+        output.attrs["curve_interpolation_method_json"] = (
+            '{"0":"not_interpolated","1":"linear","2":"cubic_hermite"}')
+        output.attrs["distal_short_gap_interpolation_maximum_ms"] = float(
+            maximum_gap_ms)
+        output.attrs["distal_short_gap_maximum_point_step_mm"] = float(
+            maximum_point_step_mm)
+        output.attrs["distal_short_gap_maximum_arc_length_deviation_mm"] = (
+            float(maximum_arc_length_deviation_mm))
+        output.flush()
+        runs = []
+        repaired = np.flatnonzero(interpolated)
+        repaired_splits = np.flatnonzero(np.diff(repaired) != 1) + 1
+        for run in np.split(repaired, repaired_splits):
+            if len(run):
+                runs.append([int(run[0]), int(run[-1])])
+        return {
+            "interpolated_frame_count": int(np.count_nonzero(interpolated)),
+            "interpolated_runs": runs,
+            "maximum_gap_ms": float(maximum_gap_ms),
+            "physical_rejected_run_count": int(physical_rejected_runs),
+            "linear_run_count": int(linear_run_count),
+            "cubic_hermite_run_count": int(hermite_run_count),
+        }
+
+
 def _smooth_coefficients(
         observed: np.ndarray,
         timestamps_ns: np.ndarray,
@@ -170,6 +432,117 @@ def _rolling_median_prediction(
         predicted[block] = median_filter(
             observed[block], size=(size, 1, 1), mode="nearest")
     return predicted
+
+
+def _local_motion_prediction(
+        observed: np.ndarray,
+        timestamps_ns: np.ndarray,
+        valid: np.ndarray,
+        maximum_gap_ms: float) -> np.ndarray:
+    """Predict each observation from its immediate constant-velocity chord.
+
+    Unlike a wide rolling position median, this residual is insensitive to
+    sustained physical motion. An instantaneous snap or snap-return still has
+    a large local second difference.
+    """
+    predicted = np.full_like(observed, np.nan)
+    for block in _valid_blocks(valid, timestamps_ns, maximum_gap_ms):
+        predicted[block] = observed[block]
+        if len(block) < 3:
+            continue
+        previous = block[:-2]
+        current = block[1:-1]
+        following = block[2:]
+        duration = (
+            timestamps_ns[following] - timestamps_ns[previous]).astype(float)
+        alpha = np.divide(
+            timestamps_ns[current] - timestamps_ns[previous], duration,
+            out=np.full(len(current), 0.5), where=duration > 0.0)
+        predicted[current] = (
+            (1.0 - alpha)[:, None, None] * observed[previous]
+            + alpha[:, None, None] * observed[following])
+    return predicted
+
+
+def _bridge_short_point_outlier_runs(
+        outlier: np.ndarray,
+        valid: np.ndarray,
+        timestamps_ns: np.ndarray,
+        maximum_gap_ms: float) -> np.ndarray:
+    """Fill isolated paired snap/return edges without chain bridging.
+
+    Reusing every edge as both the end of one bridge and the start of another
+    can turn alternating reconstruction modes into a many-second unsupported
+    block. Each consecutive edge cluster therefore participates in at most one
+    short bridge.
+    """
+    bridged = np.asarray(outlier, dtype=bool).copy()
+    bridge_limit_ms = min(float(maximum_gap_ms), 200.0)
+    for sample in range(bridged.shape[1]):
+        indices = np.flatnonzero(valid & bridged[:, sample])
+        if len(indices) < 2:
+            continue
+        splits = np.flatnonzero(np.diff(indices) > 1) + 1
+        clusters = [run for run in np.split(indices, splits) if len(run)]
+        cursor = 0
+        while cursor + 1 < len(clusters):
+            first = int(clusters[cursor][-1])
+            second = int(clusters[cursor + 1][0])
+            duration_ms = (
+                timestamps_ns[second] - timestamps_ns[first]) * 1e-6
+            if second > first + 1 and duration_ms <= bridge_limit_ms:
+                bridged[first:second + 1, sample] = True
+                cursor += 2
+            else:
+                cursor += 1
+    return bridged
+
+
+def _confirmed_support_runs(
+        supported: np.ndarray,
+        valid: np.ndarray,
+        timestamps_ns: np.ndarray,
+        maximum_gap_ms: float,
+        minimum_frames: int = 3) -> np.ndarray:
+    """Require persistent image evidence before temporal reacquisition."""
+    confirmed = np.zeros(len(supported), dtype=bool)
+    candidates = np.flatnonzero(np.asarray(supported, bool) & valid)
+    if not len(candidates):
+        return confirmed
+    splits = np.flatnonzero(
+        (np.diff(candidates) != 1)
+        | (np.diff(timestamps_ns[candidates]) * 1e-6
+           > float(maximum_gap_ms))) + 1
+    for run in np.split(candidates, splits):
+        if len(run) >= max(1, int(minimum_frames)):
+            confirmed[run] = True
+    return confirmed
+
+
+def _trusted_joint_image_support(
+        output, valid: np.ndarray, timestamps_ns: np.ndarray,
+        maximum_gap_ms: float, minimum_frames: int = 3) -> np.ndarray:
+    """Find persistent per-frame joint fits that justify reacquisition."""
+    names = (
+        "joint_left_model_mean_px", "joint_right_model_mean_px",
+        "joint_left_model_p95_px", "joint_right_model_p95_px",
+        "joint_left_coverage_mean_px", "joint_right_coverage_mean_px",
+        "joint_optimizer_success")
+    if any(f"quality/{name}" not in output for name in names):
+        return np.zeros(len(valid), dtype=bool)
+    values = {
+        name: output[f"quality/{name}"][:].astype(float) for name in names}
+    supported = (
+        valid
+        & (values["joint_optimizer_success"] > 0.5)
+        & (values["joint_left_model_mean_px"] <= 3.0)
+        & (values["joint_right_model_mean_px"] <= 3.0)
+        & (values["joint_left_model_p95_px"] <= 8.0)
+        & (values["joint_right_model_p95_px"] <= 8.0)
+        & (values["joint_left_coverage_mean_px"] <= 5.0)
+        & (values["joint_right_coverage_mean_px"] <= 5.0))
+    return _confirmed_support_runs(
+        supported, valid, timestamps_ns, maximum_gap_ms, minimum_frames)
 
 
 def smooth_distal_spline_coefficients_hdf5(
@@ -232,9 +605,22 @@ def smooth_distal_spline_coefficients_hdf5(
             use_fitted = np.isfinite(fitted_reprojection)
             reprojection[use_fitted] = fitted_reprojection[use_fitted]
         condition = output["quality/stereo_condition"][:].astype(float)
+        condition_weight = np.clip(condition, 0.05, 1.0)
+        # The classical stereo condition number describes the independent
+        # two-ray triangulation.  It remains low in exactly the overlap case
+        # for which the joint spline uses good-eye ordering, mask support and
+        # temporal material correspondence.  Once that joint fit has a finite
+        # image-space score, use its fitted reprojection (above) as the quality
+        # weight instead of penalizing the same frame a second time for ray
+        # geometry.  Otherwise the offline smoother can average a valid arm
+        # back through the empty middle of a tight V.
+        if "quality/joint_final_symmetric_mean_px" in output:
+            joint_score = output[
+                "quality/joint_final_symmetric_mean_px"][:].astype(float)
+            condition_weight[np.isfinite(joint_score)] = 1.0
         frame_weight = (
             np.exp(-np.clip(reprojection, 0.0, 50.0) / 12.0)
-            * np.clip(condition, 0.05, 1.0))
+            * condition_weight)
         frame_weight[~np.isfinite(frame_weight)] = 0.05
         frame_weight[~valid] = 0.0
         initial_weights = np.repeat(
@@ -244,11 +630,10 @@ def smooth_distal_spline_coefficients_hdf5(
             cutoff_hz, huber_delta_mm, iterations, maximum_gap_ms,
             terminal_cutoff_hz, terminal_basis_count)
 
-        outlier_prediction = _rolling_median_prediction(
+        outlier_prediction = _local_motion_prediction(
             observed_coefficients, timestamps, valid, maximum_gap_ms)
-        # Blend the motion-preserving median predictor with the low-pass
-        # estimate.  The median supplies hard snap detection; the robust spline
-        # trajectory supplies sub-frame precision for normally moving shapes.
+        # The local chord supplies motion-invariant snap detection. The robust
+        # spline trajectory remains a fallback only at missing predictions.
         prediction_coefficients = np.where(
             np.isfinite(outlier_prediction), outlier_prediction, preliminary)
         predicted_points = np.full_like(observed_points, np.nan)
@@ -271,6 +656,15 @@ def smooth_distal_spline_coefficients_hdf5(
         point_outlier = (
             valid[:, None] & np.isfinite(innovation)
             & (innovation > point_threshold[None, :]))
+        point_outlier = _bridge_short_point_outlier_runs(
+            point_outlier, valid, timestamps, maximum_gap_ms)
+        trusted_image_support = _trusted_joint_image_support(
+            output, valid, timestamps, maximum_gap_ms, minimum_frames=3)
+        reacquired = trusted_image_support & np.any(point_outlier, axis=1)
+        # Persistent, independently image-supported joint fits define a new
+        # temporal block after an ill interval. Do not let an earlier rejected
+        # trajectory veto that reacquisition.
+        point_outlier[reacquired] = False
         outlier_fraction = np.mean(point_outlier, axis=1)
         frame_outlier = valid & (
             outlier_fraction >= float(frame_outlier_fraction))
@@ -289,7 +683,8 @@ def smooth_distal_spline_coefficients_hdf5(
         terminal_outlier = np.any(point_outlier[:, -terminal_count:], axis=1)
         rejected_samples = point_outlier | frame_outlier[:, None]
         temporal_unsupported = _long_rejected_runs(
-            rejected_samples, valid, timestamps, maximum_gap_ms)
+            rejected_samples, valid, timestamps, maximum_gap_ms,
+            minimum_sample_fraction=frame_outlier_fraction)
         final_valid = valid & ~temporal_unsupported
         final_coefficients = _smooth_coefficients(
             observed_coefficients, timestamps, final_valid, final_weights,
@@ -357,6 +752,9 @@ def smooth_distal_spline_coefficients_hdf5(
         unsupported_ds = dataset(
             "quality/shape_temporal_long_gap_unsupported", (count,),
             dtype=np.uint8, fillvalue=0)
+        reacquired_ds = dataset(
+            "quality/shape_temporal_reacquired", (count,),
+            dtype=np.uint8, fillvalue=0)
         mask_width_rejected_ds = dataset(
             "quality/mask_width_learning_rejected", (count,),
             dtype=np.uint8, fillvalue=0)
@@ -374,6 +772,7 @@ def smooth_distal_spline_coefficients_hdf5(
         frame_outlier_ds[:] = frame_outlier.astype(np.uint8)
         terminal_outlier_ds[:] = terminal_outlier.astype(np.uint8)
         unsupported_ds[:] = temporal_unsupported.astype(np.uint8)
+        reacquired_ds[:] = reacquired.astype(np.uint8)
         mask_width_rejected = np.zeros(count, dtype=bool)
         if ("quality/mask_effective_width_left_px" in output
                 and "quality/mask_effective_width_right_px" in output):
@@ -461,6 +860,7 @@ def smooth_distal_spline_coefficients_hdf5(
                 terminal_outlier & valid)),
             "long_gap_unsupported_count": int(np.count_nonzero(
                 temporal_unsupported)),
+            "reacquired_frame_count": int(np.count_nonzero(reacquired)),
             "mask_width_rejected_count": int(np.count_nonzero(
                 mask_width_rejected)),
             "learning_valid_count": int(np.count_nonzero(

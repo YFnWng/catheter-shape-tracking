@@ -24,6 +24,49 @@ class SequenceReconstructionTests(unittest.TestCase):
         self.assertTrue(np.all(observed))
         self.assertEqual(ambiguity, 1.0)
 
+    def test_overlap_path_curvature_rejects_one_sample_branch_snap(self):
+        candidates = [np.array([40.0]) for _ in range(9)]
+        costs = [np.zeros(1) for _ in candidates]
+        candidates[4] = np.array([20.0, 40.0])
+        costs[4] = np.array([-2.0, 0.0])
+        selected, observed, _ = select_overlap_aware_disparity_path(
+            candidates, costs, transition_weight=0.01,
+            curvature_weight=1.0)
+        self.assertTrue(np.all(observed))
+        np.testing.assert_allclose(selected, 40.0)
+
+    def test_forced_overlap_path_contains_at_most_one_sharp_turn(self):
+        count = 17
+        y = np.concatenate([np.arange(9), np.arange(7, -1, -1)]).astype(float)
+        reference = np.column_stack([np.full(count, 300.0), y])
+        candidates = [np.array([80.0, 120.0]) for _ in range(count)]
+        # Unary evidence alternates between projected arms. Without a topology
+        # state it is cheap to switch branches repeatedly.
+        costs = []
+        for index in range(count):
+            preferred = (index // 3) % 2
+            value = np.full(2, 4.0)
+            value[preferred] = 0.0
+            costs.append(value)
+        selected, observed, _ = select_overlap_aware_disparity_path(
+            candidates, costs, transition_weight=0.002,
+            curvature_weight=0.01, reference_xy=reference,
+            reference_view="left", maximum_sharp_turns=1,
+            sharp_turn_threshold_deg=35.0, expected_turn_index=8,
+            turn_window_samples=2)
+        self.assertTrue(np.all(observed))
+        other = np.column_stack([reference[:, 0] - selected, reference[:, 1]])
+        first = np.diff(other, axis=0)[:-1]
+        second = np.diff(other, axis=0)[1:]
+        cosine = np.sum(first * second, axis=1) / np.clip(
+            np.linalg.norm(first, axis=1) * np.linalg.norm(second, axis=1),
+            1e-9, None)
+        sharp = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))) >= 35.0
+        sharp_indices = np.flatnonzero(sharp)
+        clusters = (0 if not len(sharp_indices) else
+                    1 + np.count_nonzero(np.diff(sharp_indices) > 1))
+        self.assertLessEqual(clusters, 1)
+
     def test_overlap_aware_reconstruction_uses_unordered_mask_branches(self):
         K = np.array([
             [500.0, 0.0, 320.0],
@@ -56,6 +99,92 @@ class SequenceReconstructionTests(unittest.TestCase):
                          "unordered_mask_overlap_aware")
         np.testing.assert_allclose(
             result["points_camera_m"][:, 2], 0.6, atol=0.025)
+
+    def test_forced_overlap_aware_reconstruction_does_not_require_bad_path_loop(self):
+        K = np.array([
+            [500.0, 0.0, 320.0],
+            [0.0, 500.0, 240.0],
+            [0.0, 0.0, 1.0],
+        ])
+        baseline = 0.12
+        y = np.linspace(140.0, 260.0, 100)
+        left_points = np.column_stack([np.full(100, 300.0), y])
+        # The independently skeletonized bad-eye path contains only one branch,
+        # while its full mask still contains both valid epipolar candidates.
+        right_points = np.column_stack([np.full(100, 205.0), y])
+        left_mask = np.zeros((480, 640), np.uint8)
+        right_mask = np.zeros_like(left_mask)
+        left_mask[138:263, 298:303] = 255
+        right_mask[138:263, 178:183] = 255
+        right_mask[138:263, 203:208] = 255
+        left = Centerline(left_points, (0, 0, 640, 480), left_mask, 2.0)
+        right = Centerline(right_points, (0, 0, 640, 480), right_mask, 2.0)
+        result = reconstruct_disparity_anchored(
+            left, right, K, baseline, None, None, n_samples=80,
+            reference_view="left", overlap_aware=True,
+            force_overlap_aware=True,
+            disparity_prior_px=np.full(80, 120.0),
+            disparity_prior_weight=2.0)
+        self.assertEqual(result["overlap_aware_used"], 1)
+        self.assertEqual(result["overlap_aware_forced"], 1)
+        self.assertLess(np.median(np.abs(
+            result["fitted_disparity_px"] - 120.0)), 3.0)
+        target_pixel = np.rint(result["ordered_right_px"]).astype(int)
+        self.assertTrue(np.all(right_mask[
+            target_pixel[:, 1], target_pixel[:, 0]] > 0))
+
+    def test_forced_overlap_rejects_insufficient_exact_row_support(self):
+        K = np.array([
+            [500.0, 0.0, 320.0],
+            [0.0, 500.0, 240.0],
+            [0.0, 0.0, 1.0],
+        ])
+        y = np.linspace(140.0, 260.0, 100)
+        left_points = np.column_stack([np.full(100, 300.0), y])
+        right_points = np.column_stack([np.full(100, 200.0), y])
+        left_mask = np.zeros((480, 640), np.uint8)
+        right_mask = np.zeros_like(left_mask)
+        left_mask[138:263, 298:303] = 255
+        right_mask[140:145, 198:203] = 255
+        left = Centerline(left_points, (0, 0, 640, 480), left_mask, 2.0)
+        right = Centerline(right_points, (0, 0, 640, 480), right_mask, 2.0)
+        with self.assertRaisesRegex(
+                ValueError, "insufficient_forced_overlap_mask_rows"):
+            reconstruct_disparity_anchored(
+                left, right, K, 0.12, None, None, n_samples=80,
+                reference_view="left", overlap_aware=True,
+                force_overlap_aware=True,
+                disparity_prior_px=np.full(80, 100.0),
+                disparity_prior_weight=2.0)
+
+    def test_temporal_candidate_preserves_arm_inside_merged_mask_lobe(self):
+        K = np.array([
+            [500.0, 0.0, 320.0],
+            [0.0, 500.0, 240.0],
+            [0.0, 0.0, 1.0],
+        ])
+        y = np.linspace(140.0, 260.0, 100)
+        left_points = np.column_stack([np.full(100, 300.0), y])
+        # The observed shortcut and the run midpoint are on the right/center
+        # of one filled lobe. The temporal material point remains supported on
+        # its left arm and must be retained as a candidate.
+        right_points = np.column_stack([np.full(100, 205.0), y])
+        left_mask = np.zeros((480, 640), np.uint8)
+        right_mask = np.zeros_like(left_mask)
+        left_mask[138:263, 298:303] = 255
+        right_mask[138:263, 178:209] = 255
+        result = reconstruct_disparity_anchored(
+            Centerline(left_points, (0, 0, 640, 480), left_mask, 2.0),
+            Centerline(right_points, (0, 0, 640, 480), right_mask, 2.0),
+            K, 0.12, None, None, n_samples=80,
+            reference_view="left", overlap_aware=True,
+            force_overlap_aware=True,
+            disparity_prior_px=np.full(80, 120.0),
+            disparity_prior_weight=2.0)
+        self.assertLess(np.median(np.abs(
+            result["fitted_disparity_px"] - 120.0)), 2.0)
+        self.assertLess(np.median(np.abs(
+            result["ordered_right_px"][:, 0] - 180.0)), 2.0)
 
     def test_default_2d_resampling_preserves_piecewise_linear_corner(self):
         points = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]])

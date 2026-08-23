@@ -46,6 +46,7 @@ class SamMaterialResult:
     marker_widths_px: np.ndarray | None = None
     marker_confidence: np.ndarray | None = None
     marker_observed: np.ndarray | None = None
+    marker_interpolated: np.ndarray | None = None
     marker_raw_cluster_count: int = 0
     tip_source: str = "yellow_color"
 

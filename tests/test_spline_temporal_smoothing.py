@@ -9,12 +9,113 @@ from shape_tracking.spline_temporal_smoothing import (
     LEARNING_REJECT_MASK_WIDTH,
     LEARNING_REJECT_SHAPE_OUTLIER,
     LEARNING_REJECT_TERMINAL_OUTLIER,
+    _bridge_short_point_outlier_runs,
+    _confirmed_support_runs,
+    _local_motion_prediction,
     _long_rejected_runs,
+    interpolate_short_spline_gaps_hdf5,
     smooth_distal_spline_coefficients_hdf5,
 )
 
 
 class SplineTemporalSmoothingTests(unittest.TestCase):
+    def test_short_gap_interpolates_complete_common_basis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gap.h5"
+            count, samples, bases = 9, 16, 8
+            coefficients = np.zeros((count, bases, 3), dtype=np.float32)
+            coefficients[:, :, 0] = np.arange(bases)[None]
+            coefficients[:, :, 1] = np.arange(count)[:, None]
+            coefficients[3:6] = np.nan
+            with h5py.File(path, "w") as output:
+                output["frames/timestamp_ns"] = (
+                    np.arange(count, dtype=np.int64) * 33_333_333)
+                output["frames/valid"] = np.array(
+                    [1, 1, 1, 0, 0, 0, 1, 1, 1], np.uint8)
+                output["frames/learning_valid"] = np.array(
+                    [1, 1, 1, 0, 0, 0, 1, 1, 1], np.uint8)
+                output["frames/learning_rejection_flags"] = np.array(
+                    [0, 0, 0, 1, 1, 1, 0, 0, 0], np.uint16)
+                output["distal/filtered_spline_coefficients_base_mm"] = (
+                    coefficients)
+                output["distal/points_base_mm"] = np.full(
+                    (count, samples, 3), np.nan, np.float32)
+                output["distal/s_mm"] = np.full(
+                    (count, samples), np.nan, np.float32)
+                output["distal/tangent_base"] = np.full(
+                    (count, samples, 3), np.nan, np.float32)
+                output["distal/curvature_per_mm"] = np.full(
+                    (count, samples), np.nan, np.float32)
+                output["distal/base_position_base_mm"] = np.full(
+                    (count, 3), np.nan, np.float32)
+                for name in (
+                        "distal_spline_arc_length_mm",
+                        "distal_spline_basis_count",
+                        "distal_spline_internal_knot_count"):
+                    output[f"quality/{name}"] = np.full(count, np.nan)
+                output.attrs["distal_temporal_spline_degree"] = 3
+            summary = interpolate_short_spline_gaps_hdf5(
+                path, maximum_gap_ms=500.0)
+            self.assertEqual(summary["interpolated_frame_count"], 3)
+            self.assertEqual(summary["interpolated_runs"], [[3, 5]])
+            with h5py.File(path, "r") as output:
+                repaired = output[
+                    "distal/filtered_spline_coefficients_base_mm"][:]
+                self.assertTrue(np.all(np.isfinite(repaired[3:6])))
+                np.testing.assert_allclose(
+                    repaired[3:6, :, 1],
+                    np.repeat(
+                        np.arange(3, 6, dtype=float)[:, None], bases, axis=1),
+                    atol=1e-5)
+                np.testing.assert_array_equal(
+                    output["frames/curve_temporally_interpolated"][:],
+                    [0, 0, 0, 1, 1, 1, 0, 0, 0])
+                np.testing.assert_array_equal(
+                    output["frames/pre_interpolation_valid"][:],
+                    [1, 1, 1, 0, 0, 0, 1, 1, 1])
+                self.assertTrue(np.all(output["frames/valid"][3:6]))
+                self.assertTrue(np.all(np.isfinite(
+                    output["distal/points_base_mm"][3:6])))
+
+    def test_outlier_edge_bridging_does_not_chain_alternating_modes(self):
+        timestamps = np.arange(20, dtype=np.int64) * 33_333_333
+        outlier = np.zeros((20, 1), bool)
+        # Three close enter/return edge pairs. The old overlapping-pair loop
+        # filled the whole interval from frame 2 through frame 14.
+        outlier[[2, 5, 8, 11, 14], 0] = True
+        bridged = _bridge_short_point_outlier_runs(
+            outlier, np.ones(20, bool), timestamps, 500.0)
+        self.assertTrue(np.all(bridged[2:6, 0]))
+        self.assertTrue(np.all(bridged[8:12, 0]))
+        self.assertTrue(bridged[14, 0])
+        self.assertFalse(bridged[6, 0])
+        self.assertFalse(bridged[12, 0])
+
+    def test_local_motion_prediction_allows_fast_sustained_motion(self):
+        count = 40
+        timestamps = np.arange(count, dtype=np.int64) * 33_333_333
+        observed = np.zeros((count, 3, 1), dtype=float)
+        observed[:, :, 0] = np.arange(count)[:, None] * 2.5
+        predicted = _local_motion_prediction(
+            observed, timestamps, np.ones(count, bool), 500.0)
+        np.testing.assert_allclose(predicted, observed, atol=1e-9)
+        observed[20:23] += 8.0
+        predicted = _local_motion_prediction(
+            observed, timestamps, np.ones(count, bool), 500.0)
+        self.assertGreater(np.max(np.abs(
+            observed[19:24] - predicted[19:24])), 3.0)
+
+    def test_reacquisition_requires_persistent_support(self):
+        timestamps = np.arange(12, dtype=np.int64) * 33_333_333
+        supported = np.zeros(12, bool)
+        supported[2] = True
+        supported[6:9] = True
+        confirmed = _confirmed_support_runs(
+            supported, np.ones(12, bool), timestamps, 500.0,
+            minimum_frames=3)
+        self.assertFalse(confirmed[2])
+        self.assertTrue(np.all(confirmed[6:9]))
+
     def test_common_basis_filter_rejects_frame_and_local_tip_outliers(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "shapes.h5"
@@ -44,7 +145,11 @@ class SplineTemporalSmoothingTests(unittest.TestCase):
                 output["distal/base_position_base_mm"] = np.zeros(
                     (count, 3), np.float32)
                 output["quality/reprojection_p95_px"] = np.ones(count)
-                output["quality/stereo_condition"] = np.ones(count)
+                output["quality/fitted_reprojection_p95_px"] = np.ones(count)
+                output["quality/joint_final_symmetric_mean_px"] = np.ones(count)
+                # Joint reconstruction remains usable when independent-ray
+                # triangulation is ill-conditioned.
+                output["quality/stereo_condition"] = np.full(count, 0.05)
                 output["quality/mask_effective_width_left_px"] = np.full(
                     count, 14.0)
                 output["quality/mask_effective_width_right_px"] = np.full(
@@ -103,6 +208,22 @@ class SplineTemporalSmoothingTests(unittest.TestCase):
         supported = _long_rejected_runs(
             rejected, np.ones(count, dtype=bool), timestamps, 500.0)
         self.assertFalse(np.any(supported))
+
+    def test_local_long_rejected_run_does_not_invalidate_whole_curve(self):
+        count, samples = 60, 64
+        timestamps = np.arange(count, dtype=np.int64) * 33_333_333
+        rejected = np.zeros((count, samples), dtype=bool)
+        rejected[20:40, 30:37] = True
+        supported = _long_rejected_runs(
+            rejected, np.ones(count, dtype=bool), timestamps, 500.0,
+            minimum_sample_fraction=0.5)
+        self.assertFalse(np.any(supported))
+
+        rejected[20:40, :40] = True
+        unsupported = _long_rejected_runs(
+            rejected, np.ones(count, dtype=bool), timestamps, 500.0,
+            minimum_sample_fraction=0.5)
+        self.assertTrue(np.all(unsupported[20:40]))
 
 
 if __name__ == "__main__":

@@ -4,11 +4,16 @@ from dataclasses import replace
 import cv2
 import numpy as np
 
+from shape_tracking.geometry import cumulative_arclength
+from shape_tracking.image_sequence import _inferred_material_path_quality
 from shape_tracking.marked_segmentation import (
+    _center_route_on_mask_medial,
     catheter_color_likelihood,
     decode_marker_candidates,
     extract_marked_chromatic_result,
+    enforce_stereo_epipolar_sweep,
     refine_marked_stereo_pair,
+    reroute_marked_centerline,
 )
 from shape_tracking.sequence_reconstruction import (
     project_camera_points,
@@ -18,6 +23,19 @@ from shape_tracking.segmentation import Centerline
 
 
 class MarkedSegmentationTests(unittest.TestCase):
+    def test_medial_refinement_centers_without_changing_route_topology(self):
+        mask = np.zeros((25, 61), np.uint8)
+        mask[6:19, 2:59] = 255
+        points = np.column_stack([
+            np.linspace(3.0, 57.0, 55), np.full(55, 7.0)])
+        centered = _center_route_on_mask_medial(
+            points, mask, (0, 0, 61, 25), maximum_offset_px=6)
+        np.testing.assert_allclose(centered[[0, -1]], points[[0, -1]])
+        self.assertGreater(float(np.median(centered[4:-4, 1])), 10.5)
+        local = np.rint(centered).astype(int)
+        self.assertTrue(np.all(mask[local[:, 1], local[:, 0]] > 0))
+        self.assertTrue(np.all(np.diff(centered[:, 0]) > 0.0))
+
     @staticmethod
     def _image():
         image = np.full((140, 410, 3), 225, dtype=np.uint8)
@@ -45,6 +63,27 @@ class MarkedSegmentationTests(unittest.TestCase):
         self.assertLess(np.linalg.norm(
             result.material.points[-1]
             - result.marker_centers_xy[3]), 3.0)
+
+    def test_inferred_path_gate_accepts_stable_order_and_rejects_reversal(self):
+        result = extract_marked_chromatic_result(
+            self._image(), (0, 0, 410, 140), np.array([18.0, 80.0]))
+        stable, accepted, metrics = _inferred_material_path_quality(
+            result, result.material.points, result.material.points,
+            max_temporal_p95_px=18.0,
+            max_temporal_max_px=35.0,
+            max_sharp_turn_clusters=3)
+        self.assertTrue(accepted)
+        self.assertEqual(metrics["stereo_inferred_rejection_code"], 0)
+        self.assertIn("+validated_stereo_topology", stable.prompt.source)
+
+        _, accepted, metrics = _inferred_material_path_quality(
+            result, result.material.points[::-1], result.material.points,
+            max_temporal_p95_px=18.0,
+            max_temporal_max_px=35.0,
+            max_sharp_turn_clusters=3)
+        self.assertFalse(accepted)
+        self.assertNotEqual(
+            metrics["stereo_inferred_rejection_code"] & 1, 0)
 
     def test_distal_ring_and_yellow_tip_reject_long_background_branch(self):
         image = self._image()
@@ -151,6 +190,115 @@ class MarkedSegmentationTests(unittest.TestCase):
         self.assertGreater(len(result.material.points), 250)
         self.assertLess(np.linalg.norm(
             result.material.points[-1] - result.marker_centers_xy[3]), 3.0)
+
+    def test_marker_interval_route_preserves_both_arms_of_tight_v(self):
+        image = np.full((180, 210, 3), 225, dtype=np.uint8)
+        base = np.array([112.0, 15.0])
+        vertex = np.array([101.0, 155.0])
+        tip = np.array([94.0, 24.0])
+        cv2.line(image, tuple(base.astype(int)), (109, 43),
+                 (90, 20, 15), 9, cv2.LINE_AA)
+        cv2.line(image, (109, 43), tuple(vertex.astype(int)),
+                 (255, 165, 15), 9, cv2.LINE_AA)
+        cv2.line(image, tuple(vertex.astype(int)), tuple(tip.astype(int)),
+                 (255, 165, 15), 9, cv2.LINE_AA)
+        markers = np.array([
+            [109.0, 45.0], [107.0, 75.0],
+            [104.0, 108.0], [94.0, 28.0],
+        ])
+        for marker_id, center in enumerate(markers):
+            radius = 7 if marker_id == 3 else 4
+            cv2.circle(image, tuple(center.astype(int)), radius,
+                       (0, 0, 245), -1)
+        initial = extract_marked_chromatic_result(
+            image, (0, 0, 210, 180), base)
+        supplied = replace(
+            initial,
+            marker_centers_xy=markers,
+            marker_widths_px=np.array([8.0, 6.0, 6.0, 14.0]),
+            marker_confidence=np.full(4, 0.9),
+            marker_observed=np.ones(4, np.uint8))
+        previous = np.vstack([
+            np.column_stack([
+                np.linspace(base[0], vertex[0], 140),
+                np.linspace(base[1], vertex[1], 140)]),
+            np.column_stack([
+                np.linspace(vertex[0], tip[0], 132),
+                np.linspace(vertex[1], tip[1], 132)])[1:],
+        ])
+        routed = reroute_marked_centerline(
+            supplied, image, (0, 0, 210, 180),
+            previous_points_xy=previous)
+        self.assertIn("+marker_interval_route", routed.prompt.source)
+        points = routed.material.points
+        nearest = [
+            int(np.argmin(np.linalg.norm(points - marker, axis=1)))
+            for marker in markers]
+        self.assertTrue(np.all(np.diff(nearest) > 0))
+        # The material path must descend the right arm before returning on the
+        # left arm, rather than taking the short filled-mask connection.
+        self.assertGreater(float(np.max(points[:, 1])), 140.0)
+        self.assertGreater(
+            float(cumulative_arclength(points)[-1]), 220.0)
+
+    def test_good_eye_epipolar_sweep_restores_shortcut_eye(self):
+        image = np.full((180, 210, 3), 225, dtype=np.uint8)
+        base = np.array([112.0, 15.0])
+        vertex = np.array([101.0, 155.0])
+        tip = np.array([94.0, 24.0])
+        cv2.line(image, tuple(base.astype(int)), tuple(vertex.astype(int)),
+                 (255, 165, 15), 9, cv2.LINE_AA)
+        cv2.line(image, tuple(vertex.astype(int)), tuple(tip.astype(int)),
+                 (255, 165, 15), 9, cv2.LINE_AA)
+        markers = np.array([
+            [109.0, 45.0], [107.0, 75.0],
+            [104.0, 108.0], [94.0, 28.0],
+        ])
+        for marker_id, center in enumerate(markers):
+            cv2.circle(image, tuple(center.astype(int)),
+                       7 if marker_id == 3 else 4, (0, 0, 245), -1)
+        observed = extract_marked_chromatic_result(
+            image, (0, 0, 210, 180), base)
+        observed = replace(
+            observed,
+            marker_centers_xy=markers,
+            marker_widths_px=np.array([8.0, 6.0, 6.0, 14.0]),
+            marker_confidence=np.full(4, 0.9),
+            marker_observed=np.ones(4, np.uint8))
+        good_points = np.vstack([
+            np.column_stack([np.linspace(base[0], vertex[0], 140),
+                             np.linspace(base[1], vertex[1], 140)]),
+            np.column_stack([np.linspace(vertex[0], tip[0], 132),
+                             np.linspace(vertex[1], tip[1], 132)])[1:],
+        ])
+        good = replace(
+            observed,
+            material=replace(
+                observed.material,
+                centerline=Centerline(
+                    good_points, observed.material.centerline.roi,
+                    observed.material.mask,
+                    observed.material.centerline.radius_px)))
+        # The bad eye connects base to tip without traversing the V vertex.
+        shortcut = np.column_stack([
+            np.linspace(base[0], tip[0], 80),
+            np.linspace(base[1], tip[1], 80)])
+        bad = replace(
+            observed,
+            material=replace(
+                observed.material,
+                centerline=Centerline(
+                    shortcut, observed.material.centerline.roi,
+                    observed.material.mask,
+                    observed.material.centerline.radius_px)))
+        _, repaired, metrics = enforce_stereo_epipolar_sweep(
+            good, bad, image, image,
+            (0, 0, 210, 180), (0, 0, 210, 180), base, base,
+            minimum_sweep_deficit_px=4.0)
+        self.assertEqual(metrics["epipolar_sweep_enforced_view"], 2)
+        self.assertEqual(metrics["epipolar_sweep_anchor_used"], 1)
+        self.assertIn("+epipolar_sweep", repaired.prompt.source)
+        self.assertGreater(float(np.max(repaired.material.points[:, 1])), 145.0)
 
     def test_cross_eye_marker_recovery_does_not_change_segmentation(self):
         left_image = self._image()
@@ -373,6 +521,7 @@ class MarkedSegmentationTests(unittest.TestCase):
             marker_confidence_left=np.ones(4),
             marker_confidence_right=np.ones(4))
         self.assertEqual(result["marker_anchor_count"], 4)
+        self.assertEqual(result["marker_interval_boundary_count"], 4)
         self.assertLess(result["reprojection_p95_px"], 1.0)
 
 

@@ -87,7 +87,8 @@ def _continuous_color_path(
         roi: tuple[int, int, int, int],
         anchors_xy: list[np.ndarray],
         catheter_mask: np.ndarray,
-        previous_points_xy: np.ndarray | None = None) -> np.ndarray:
+        previous_points_xy: np.ndarray | None = None,
+        segment_likelihoods: list[np.ndarray] | None = None) -> np.ndarray:
     """Trace ordered anchors through an independently segmented catheter.
 
     A short weak-paint/specular gap may still be crossed, but distance outside
@@ -111,14 +112,14 @@ def _continuous_color_path(
     core_distance = cv2.distanceTransform(local_mask, cv2.DIST_L2, 5)
     outside_distance = cv2.distanceTransform(
         np.uint8(local_mask == 0), cv2.DIST_L2, 5)
-    cost = (
+    static_cost = (
         1.0
-        + 8.0 * (1.0 - local_likelihood) ** 2
         + 10.0 / (core_distance + 0.75)
         + np.where(
             local_mask > 0,
             0.0,
             30.0 + 12.0 * np.clip(outside_distance, 0.0, 6.0)))
+    temporal_cost = np.zeros_like(static_cost)
     if previous_points_xy is not None:
         previous = np.asarray(previous_points_xy, dtype=np.float64)
         previous = previous[np.all(np.isfinite(previous), axis=1)]
@@ -129,11 +130,25 @@ def _continuous_color_path(
             cv2.polylines(prior, [local], False, 255, 3, cv2.LINE_AA)
             temporal_distance = cv2.distanceTransform(
                 np.uint8(prior == 0), cv2.DIST_L2, 5)
-            cost += 0.08 * np.clip(temporal_distance - 4.0, 0.0, 25.0)
+            temporal_cost = (
+                0.08 * np.clip(temporal_distance - 4.0, 0.0, 25.0))
 
     output = []
     local_anchors = anchors - [x0, y0]
-    for start_xy, end_xy in zip(local_anchors[:-1], local_anchors[1:]):
+    for segment_index, (start_xy, end_xy) in enumerate(
+            zip(local_anchors[:-1], local_anchors[1:])):
+        segment_likelihood = local_likelihood
+        if (segment_likelihoods is not None
+                and segment_index < len(segment_likelihoods)):
+            supplied = np.asarray(
+                segment_likelihoods[segment_index], dtype=np.float64)
+            if supplied.shape != likelihood.shape:
+                raise ValueError("segment likelihood shape does not match ROI")
+            segment_likelihood = supplied[y0:y1, x0:x1]
+        cost = (
+            static_cost
+            + 8.0 * (1.0 - segment_likelihood) ** 2
+            + temporal_cost)
         start = tuple(np.rint(start_xy[::-1]).astype(int))
         end = tuple(np.rint(end_xy[::-1]).astype(int))
         segment, _ = route_through_array(
@@ -146,6 +161,561 @@ def _continuous_color_path(
     path[:, 0] += y0
     path[:, 1] += x0
     return path
+
+
+def _proximal_blue_likelihood(bgr: np.ndarray) -> np.ndarray:
+    """Prefer the dark-blue sheath over a nearby cyan distal branch."""
+    image = np.asarray(bgr, dtype=np.uint8)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    blue, green, red = [
+        image[:, :, channel].astype(np.float32) for channel in range(3)]
+    blue_dominance = blue - 0.70 * green - 0.30 * red
+    score = np.clip((blue_dominance - 8.0) / 72.0, 0.0, 1.0)
+    score *= ((hsv[:, :, 0] >= 82) & (hsv[:, :, 0] <= 145))
+    score *= np.clip((hsv[:, :, 2].astype(np.float32) - 12.0) / 80.0,
+                     0.0, 1.0)
+    return np.asarray(score, dtype=np.float32)
+
+
+def _soft_marker_anchor(
+        mask: np.ndarray,
+        likelihood: np.ndarray,
+        red_support: np.ndarray,
+        center_local_xy: np.ndarray,
+        width_px: float) -> np.ndarray | None:
+    """Select a medial shaft pixel near a ring without using its centroid."""
+    height, width = mask.shape
+    center = np.asarray(center_local_xy, dtype=np.float64)
+    if not np.all(np.isfinite(center)):
+        return None
+    radius = float(np.clip(
+        0.75 * max(float(width_px), 1.0) + 3.0, 5.0, 16.0))
+    x0 = max(0, int(np.floor(center[0] - radius)))
+    x1 = min(width, int(np.ceil(center[0] + radius + 1.0)))
+    y0 = max(0, int(np.floor(center[1] - radius)))
+    y1 = min(height, int(np.ceil(center[1] + radius + 1.0)))
+    if x0 >= x1 or y0 >= y1:
+        return None
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    distance = np.hypot(xx - center[0], yy - center[1])
+    allowed = (mask[y0:y1, x0:x1] > 0) & (distance <= radius)
+    local_red = red_support[y0:y1, x0:x1] & (distance <= radius)
+    if np.any(local_red & allowed):
+        # The visible annulus can be asymmetric. Dilate its observed pixels to
+        # form an uncertainty region, then let mask mediality locate the axis.
+        ring_region = cv2.dilate(
+            np.uint8(local_red),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
+        allowed &= ring_region
+    if not np.any(allowed):
+        return None
+    medial = cv2.distanceTransform(np.uint8(mask > 0), cv2.DIST_L2, 5)
+    score = (
+        2.5 * medial[y0:y1, x0:x1]
+        + 2.0 * likelihood[y0:y1, x0:x1]
+        - 0.08 * distance)
+    score[~allowed] = -np.inf
+    row, column = np.unravel_index(int(np.argmax(score)), score.shape)
+    return np.array([column + x0, row + y0], dtype=np.float64)
+
+
+def _soft_temporal_anchor(
+        mask: np.ndarray,
+        likelihood: np.ndarray,
+        predicted_local_xy: np.ndarray,
+        search_radius_px: float = 12.0) -> np.ndarray | None:
+    """Move one material-coordinate prediction onto current mask support."""
+    height, width = mask.shape
+    predicted = np.asarray(predicted_local_xy, dtype=np.float64)
+    radius = float(search_radius_px)
+    x0 = max(0, int(np.floor(predicted[0] - radius)))
+    x1 = min(width, int(np.ceil(predicted[0] + radius + 1.0)))
+    y0 = max(0, int(np.floor(predicted[1] - radius)))
+    y1 = min(height, int(np.ceil(predicted[1] + radius + 1.0)))
+    if x0 >= x1 or y0 >= y1:
+        return None
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    spatial = np.hypot(xx - predicted[0], yy - predicted[1])
+    allowed = (mask[y0:y1, x0:x1] > 0) & (spatial <= radius)
+    if not np.any(allowed):
+        return None
+    medial = cv2.distanceTransform(np.uint8(mask > 0), cv2.DIST_L2, 5)
+    score = (
+        1.8 * medial[y0:y1, x0:x1]
+        + 2.0 * likelihood[y0:y1, x0:x1]
+        - 0.35 * spatial)
+    score[~allowed] = -np.inf
+    row, column = np.unravel_index(int(np.argmax(score)), score.shape)
+    selected = np.array([column + x0, row + y0], dtype=np.float64)
+    if np.linalg.norm(selected - predicted) > radius:
+        return None
+    return selected
+
+
+def _soft_epipolar_sweep_anchor(
+        mask: np.ndarray,
+        likelihood: np.ndarray,
+        target_y_local: float,
+        row_half_width_px: int = 3) -> np.ndarray | None:
+    """Choose a mask-medial point on an opposite-eye epipolar line.
+
+    Rectification transfers only the row from the other eye.  The column is
+    deliberately selected from current-image catheter support, so this is a
+    line/span constraint and not a hard stereo point correspondence.
+    """
+    height, width = mask.shape
+    half_width = max(int(row_half_width_px), 0)
+    y0 = max(0, int(np.floor(target_y_local)) - half_width)
+    y1 = min(height, int(np.ceil(target_y_local)) + half_width + 1)
+    if y0 >= y1:
+        return None
+    allowed = mask[y0:y1] > 0
+    if not np.any(allowed):
+        return None
+    medial = cv2.distanceTransform(np.uint8(mask > 0), cv2.DIST_L2, 5)
+    yy = np.arange(y0, y1, dtype=np.float64)[:, None]
+    # Row agreement dominates small differences in paint response.  Mediality
+    # then resolves the shaft axis without favoring either arm of a tight V.
+    score = (
+        2.5 * medial[y0:y1]
+        + 1.5 * likelihood[y0:y1]
+        - 2.0 * np.abs(yy - float(target_y_local)))
+    score[~allowed] = -np.inf
+    row, column = np.unravel_index(int(np.argmax(score)), score.shape)
+    return np.array([column, row + y0], dtype=np.float64)
+
+
+def _insert_material_temporal_anchors(
+        anchors_xy: list[np.ndarray],
+        destination_marker_ids: list[int],
+        previous_points_xy: np.ndarray | None,
+        mask: np.ndarray,
+        likelihood: np.ndarray,
+        roi: tuple[int, int, int, int],
+) -> tuple[list[np.ndarray], list[int]]:
+    """Add ordered interior supports from each previous marker interval."""
+    if previous_points_xy is None:
+        return anchors_xy, destination_marker_ids
+    previous = np.asarray(previous_points_xy, dtype=np.float64)
+    previous = previous[np.all(np.isfinite(previous), axis=1)]
+    if len(previous) < 8:
+        return anchors_xy, destination_marker_ids
+    tree = cKDTree(previous)
+    indices = np.asarray([tree.query(anchor)[1] for anchor in anchors_xy], int)
+    if not np.all(np.diff(indices) > 0):
+        return anchors_xy, destination_marker_ids
+    x, y, _, _ = roi
+    expanded = [anchors_xy[0]]
+    expanded_destination: list[int] = []
+    for interval_index, (start, end) in enumerate(zip(
+            indices[:-1], indices[1:])):
+        interval = previous[start:end + 1]
+        interval_s = cumulative_arclength(interval)
+        inserted: list[np.ndarray] = []
+        if interval_s[-1] >= 12.0:
+            for fraction in (1.0 / 3.0, 2.0 / 3.0):
+                target_s = fraction * interval_s[-1]
+                prediction = np.array([
+                    np.interp(target_s, interval_s, interval[:, coordinate])
+                    for coordinate in range(2)], dtype=np.float64)
+                local = _soft_temporal_anchor(
+                    mask, likelihood, prediction - [x, y])
+                if local is not None:
+                    inserted.append(local + [x, y])
+        destination_id = destination_marker_ids[interval_index]
+        for temporal_anchor in inserted:
+            expanded.append(temporal_anchor)
+            expanded_destination.append(destination_id)
+        expanded.append(anchors_xy[interval_index + 1])
+        expanded_destination.append(destination_id)
+    return expanded, expanded_destination
+
+
+def _smooth_marker_route(
+        raw_points_xy: np.ndarray,
+        mask: np.ndarray,
+        roi: tuple[int, int, int, int]) -> np.ndarray:
+    """Smooth pixel stair-steps while preserving one genuine tight bend."""
+    points = np.asarray(raw_points_xy, dtype=np.float64)
+    raw_length = float(cumulative_arclength(points)[-1])
+    count = max(16, int(np.ceil(raw_length)) + 1)
+    resampled = resample_arclength(points, count, smooth_window=1)
+    window = min(21, count if count % 2 else count - 1)
+    smoothed = resampled.copy()
+    if window >= 5:
+        smoothed = savgol_filter(
+            resampled, window, polyorder=2, axis=0, mode="interp")
+        smoothed[0], smoothed[-1] = resampled[0], resampled[-1]
+
+    # Smoothing across a tight V may leave the observed mask. Revert only the
+    # unsupported material samples to their corresponding routed pixels; a
+    # global nearest-mask snap could jump to the other arm.
+    x, y, width, height = roi
+    local = np.rint(smoothed - [x, y]).astype(int)
+    in_bounds = (
+        (local[:, 0] >= 0) & (local[:, 0] < width)
+        & (local[:, 1] >= 0) & (local[:, 1] < height))
+    supported = np.zeros(count, dtype=bool)
+    supported[in_bounds] = mask[
+        local[in_bounds, 1], local[in_bounds, 0]] > 0
+    smoothed[~supported] = resampled[~supported]
+    return _center_route_on_mask_medial(smoothed, mask, roi)
+
+
+def _center_route_on_mask_medial(
+        points_xy: np.ndarray,
+        mask: np.ndarray,
+        roi: tuple[int, int, int, int],
+        maximum_offset_px: int = 6) -> np.ndarray:
+    """Move one existing topology toward its local mask medial ridge.
+
+    Candidate motion is restricted to the local normal of the already ordered
+    route. A small dynamic program selects a continuous offset sequence, so
+    this refinement cannot independently reroute marker intervals or alternate
+    sides from one sample to the next.
+    """
+    points = np.asarray(points_xy, dtype=np.float64)
+    if len(points) < 3:
+        return points.copy()
+    binary = np.asarray(mask > 0, dtype=np.uint8)
+    medial = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    x, y, width, height = roi
+    tangent = np.empty_like(points)
+    tangent[1:-1] = points[2:] - points[:-2]
+    tangent[0] = points[1] - points[0]
+    tangent[-1] = points[-1] - points[-2]
+    tangent /= np.maximum(
+        np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9)
+    normal = np.column_stack([-tangent[:, 1], tangent[:, 0]])
+    offsets = np.arange(
+        -max(0, int(maximum_offset_px)),
+        max(0, int(maximum_offset_px)) + 1, dtype=np.float64)
+    candidates = points[:, None, :] + offsets[None, :, None] * normal[:, None, :]
+    local = np.rint(candidates - [x, y]).astype(int)
+    inside = (
+        (local[:, :, 0] >= 0) & (local[:, :, 0] < width)
+        & (local[:, :, 1] >= 0) & (local[:, :, 1] < height))
+    supported = np.zeros(inside.shape, dtype=bool)
+    rows, columns = np.where(inside)
+    supported[rows, columns] = binary[
+        local[rows, columns, 1], local[rows, columns, 0]] > 0
+    radius = np.zeros(inside.shape, dtype=np.float64)
+    radius[rows, columns] = medial[
+        local[rows, columns, 1], local[rows, columns, 0]]
+    unary = -2.0 * radius + 0.03 * offsets[None, :] ** 2
+    unary[~supported] = np.inf
+    zero = int(np.argmin(np.abs(offsets)))
+    unary[0, :] = np.inf
+    unary[0, zero] = 0.0
+    unary[-1, :] = np.inf
+    unary[-1, zero] = 0.0
+    accumulated = unary[0].copy()
+    parents = np.zeros((len(points), len(offsets)), dtype=np.int16)
+    transition = 0.35 * (
+        offsets[:, None] - offsets[None, :]) ** 2
+    for index in range(1, len(points)):
+        cost = accumulated[:, None] + transition
+        parents[index] = np.argmin(cost, axis=0)
+        accumulated = unary[index] + np.min(cost, axis=0)
+    if not np.any(np.isfinite(accumulated)):
+        return points.copy()
+    chosen = np.empty(len(points), dtype=np.int16)
+    chosen[-1] = int(np.argmin(accumulated))
+    for index in range(len(points) - 1, 0, -1):
+        chosen[index - 1] = parents[index, chosen[index]]
+    return candidates[np.arange(len(points)), chosen]
+
+
+def center_marked_route_on_mask(
+        result: SamMaterialResult,
+        maximum_offset_px: int = 8) -> SamMaterialResult:
+    """Center any existing route without requiring marker observations.
+
+    Marker-ordered routing decides material topology when the rings are
+    available.  Centering is a separate, bounded normal refinement and remains
+    useful when a ring is temporarily missing; coupling the two stages caused
+    the observed good/bad frame alternation.
+    """
+    material = result.material
+    points = _center_route_on_mask_medial(
+        material.points, material.mask, material.roi,
+        maximum_offset_px=maximum_offset_px)
+    if len(points) != len(material.points) or not np.all(np.isfinite(points)):
+        return result
+    fraction = float(np.clip(
+        material.distal_boundary_fraction, 0.0, 1.0))
+    boundary = int(np.clip(round(
+        fraction * max(len(points) - 1, 1)), 0, len(points) - 1))
+    distance = cv2.distanceTransform(
+        np.uint8(material.mask > 0), cv2.DIST_L2, 5)
+    x, y, width, height = material.roi
+    local = np.rint(points - [x, y]).astype(int)
+    local[:, 0] = np.clip(local[:, 0], 0, width - 1)
+    local[:, 1] = np.clip(local[:, 1], 0, height - 1)
+    radii = distance[local[:, 1], local[:, 0]]
+    positive = radii[radii > 0.0]
+    centered = replace(
+        material,
+        centerline=Centerline(
+            points, material.roi, material.mask,
+            float(np.median(positive)) if len(positive)
+            else material.centerline.radius_px),
+        distal_boundary_index=boundary,
+        distal_boundary_fraction=fraction,
+        brightness_profile=np.full(len(points), np.nan, dtype=np.float64))
+    source = result.prompt.source
+    if "+mask_medial" not in source:
+        source += "+mask_medial"
+    return replace(result, material=centered,
+                   prompt=replace(result.prompt, source=source))
+
+
+def reroute_marked_centerline(
+        result: SamMaterialResult,
+        image: np.ndarray,
+        roi: tuple[int, int, int, int],
+        previous_points_xy: np.ndarray | None = None,
+        minimum_marker_confidence: float = 0.35,
+        epipolar_sweep_y: float | None = None,
+        epipolar_sweep_after_marker_id: int | None = None,
+        epipolar_sweep_row_half_width_px: int = 3) -> SamMaterialResult:
+    """Build a soft marker-ordered route through a potentially merged V mask.
+
+    Marker identity supplies material interval order. Each marker contributes
+    a red-support uncertainty region, never an equality to its centroid.
+    """
+    if (result.marker_centers_xy is None
+            or result.marker_widths_px is None
+            or result.marker_confidence is None
+            or result.marker_observed is None):
+        return result
+    centers = np.asarray(result.marker_centers_xy, dtype=np.float64)
+    widths = np.asarray(result.marker_widths_px, dtype=np.float64)
+    confidence = np.asarray(result.marker_confidence, dtype=np.float64)
+    observed = np.asarray(result.marker_observed, dtype=bool)
+    usable = (
+        observed & np.all(np.isfinite(centers), axis=1)
+        & np.isfinite(widths)
+        & (confidence >= float(minimum_marker_confidence)))
+    if not (usable[0] and usable[3] and np.count_nonzero(usable) >= 3):
+        return result
+
+    x, y, width, height = roi
+    mask = np.asarray(result.material.mask, dtype=np.uint8)
+    crop = np.asarray(image[y:y + height, x:x + width], dtype=np.uint8)
+    likelihood, red_support = _catheter_color_features(crop)
+    anchors = [np.asarray(result.material.points[0], dtype=np.float64)]
+    anchor_ids = [-1]
+    for marker_id in range(4):
+        if not usable[marker_id]:
+            continue
+        local = _soft_marker_anchor(
+            mask, likelihood, red_support,
+            centers[marker_id] - [x, y], widths[marker_id])
+        if local is None:
+            continue
+        anchors.append(local + [x, y])
+        anchor_ids.append(marker_id)
+    if anchor_ids[-1] != 3 or len(anchors) < 4:
+        return result
+
+    sweep_inserted = False
+    if (epipolar_sweep_y is not None
+            and epipolar_sweep_after_marker_id is not None
+            and 0 <= int(epipolar_sweep_after_marker_id) < 3):
+        sweep_local = _soft_epipolar_sweep_anchor(
+            mask, likelihood, float(epipolar_sweep_y) - y,
+            epipolar_sweep_row_half_width_px)
+        if sweep_local is not None:
+            sweep_global = sweep_local + [x, y]
+            insert_at = next(
+                (index for index, marker_id in enumerate(anchor_ids)
+                 if marker_id > int(epipolar_sweep_after_marker_id)),
+                len(anchor_ids))
+            adjacent = []
+            if insert_at > 0:
+                adjacent.append(np.linalg.norm(
+                    sweep_global - anchors[insert_at - 1]))
+            if insert_at < len(anchors):
+                adjacent.append(np.linalg.norm(
+                    sweep_global - anchors[insert_at]))
+            # Avoid adding a numerically duplicate anchor at the V vertex.
+            if not adjacent or min(adjacent) > 2.0:
+                anchors.insert(insert_at, sweep_global)
+                # This virtual anchor lies in the material interval ending at
+                # the next marker.  It never changes marker observations.
+                anchor_ids.insert(
+                    insert_at, int(epipolar_sweep_after_marker_id) + 1)
+                sweep_inserted = True
+
+    destination_marker_ids = anchor_ids[1:].copy()
+    anchors, destination_marker_ids = _insert_material_temporal_anchors(
+        anchors, destination_marker_ids, previous_points_xy,
+        mask, likelihood, roi)
+
+    proximal = np.maximum(
+        _proximal_blue_likelihood(crop), 0.20 * likelihood)
+    segment_likelihoods = []
+    for destination_id in destination_marker_ids:
+        # Only the registered-base to interface interval is proximal. Missing
+        # middle markers do not change this material boundary.
+        segment_likelihoods.append(
+            proximal if destination_id == 0 else likelihood)
+    try:
+        path_rc = _continuous_color_path(
+            likelihood, roi, anchors, mask,
+            previous_points_xy=previous_points_xy,
+            segment_likelihoods=segment_likelihoods)
+    except (RuntimeError, ValueError):
+        return result
+    raw_points = np.column_stack([
+        path_rc[:, 1] + x, path_rc[:, 0] + y]).astype(np.float64)
+    if len(raw_points) < 8:
+        return result
+    new_length = float(cumulative_arclength(raw_points)[-1])
+    anchor_chord_length = float(np.sum(np.linalg.norm(
+        np.diff(np.asarray(anchors), axis=0), axis=1)))
+    # Do not compare with the initial base-to-tip route: in the target failure
+    # that route is precisely the invalid short connection across the V.
+    if not (0.90 * anchor_chord_length
+            <= new_length <= 1.80 * max(anchor_chord_length, 1.0)):
+        return result
+    points = _smooth_marker_route(raw_points, mask, roi)
+    boundary = int(np.argmin(np.linalg.norm(
+        points - centers[0], axis=1)))
+    distance = cv2.distanceTransform(np.uint8(mask > 0), cv2.DIST_L2, 5)
+    local_points = np.rint(points - [x, y]).astype(int)
+    local_points[:, 0] = np.clip(local_points[:, 0], 0, width - 1)
+    local_points[:, 1] = np.clip(local_points[:, 1], 0, height - 1)
+    radii = distance[local_points[:, 1], local_points[:, 0]]
+    positive = radii[radii > 0.0]
+    radius = (
+        float(np.median(positive)) if len(positive)
+        else result.material.centerline.radius_px)
+    material = replace(
+        result.material,
+        centerline=Centerline(points, roi, mask, radius),
+        distal_boundary_index=boundary,
+        distal_boundary_fraction=float(boundary / max(len(points) - 1, 1)),
+        boundary_confidence=max(
+            float(result.material.boundary_confidence), float(confidence[0])),
+        boundary_contrast=max(
+            float(result.material.boundary_contrast), float(widths[0])),
+        material_valid=True,
+        brightness_profile=np.full(len(points), np.nan, dtype=np.float64))
+    sample_indices = np.unique(np.rint(np.linspace(
+        0, len(points) - 1, min(10, len(points)))).astype(int))
+    prompt = replace(
+        result.prompt,
+        positive_xy=points[sample_indices].copy(),
+        source=(result.prompt.source + "+marker_interval_route"
+                + ("+epipolar_sweep" if sweep_inserted else "")))
+    return replace(result, material=material, prompt=prompt)
+
+
+def _centerline_epipolar_sweep(
+        result: SamMaterialResult,
+        base_xy: np.ndarray,
+        minimum_marker_confidence: float,
+) -> tuple[float, float, int] | None:
+    """Return (base-relative span, extremal row, preceding marker id)."""
+    points = np.asarray(result.material.points, dtype=np.float64)
+    if len(points) < 8 or not np.all(np.isfinite(points)):
+        return None
+    relative_y = points[:, 1] - float(np.asarray(base_xy)[1])
+    extreme_index = int(np.argmax(np.abs(relative_y)))
+    span = float(abs(relative_y[extreme_index]))
+    centers = result.marker_centers_xy
+    confidence = result.marker_confidence
+    observed = result.marker_observed
+    if centers is None or confidence is None or observed is None:
+        return None
+    centers = np.asarray(centers, dtype=np.float64)
+    confidence = np.asarray(confidence, dtype=np.float64)
+    observed = np.asarray(observed, dtype=bool)
+    preceding = []
+    for marker_id in range(min(4, len(centers))):
+        if (not observed[marker_id]
+                or confidence[marker_id] < minimum_marker_confidence
+                or not np.all(np.isfinite(centers[marker_id]))):
+            continue
+        marker_index = int(np.argmin(np.linalg.norm(
+            points - centers[marker_id], axis=1)))
+        if marker_index <= extreme_index:
+            preceding.append(marker_id)
+    if not preceding:
+        return None
+    after_marker_id = max(preceding)
+    return span, float(points[extreme_index, 1]), after_marker_id
+
+
+def enforce_stereo_epipolar_sweep(
+        left_result: SamMaterialResult,
+        right_result: SamMaterialResult,
+        left_image: np.ndarray,
+        right_image: np.ndarray,
+        left_roi: tuple[int, int, int, int],
+        right_roi: tuple[int, int, int, int],
+        left_base_xy: np.ndarray,
+        right_base_xy: np.ndarray,
+        previous_left_points_xy: np.ndarray | None = None,
+        previous_right_points_xy: np.ndarray | None = None,
+        minimum_marker_confidence: float = 0.35,
+        minimum_sweep_deficit_px: float = 4.0,
+        row_half_width_px: int = 3,
+) -> tuple[SamMaterialResult, SamMaterialResult, dict[str, float | int]]:
+    """Make a shortened eye traverse the good eye's epipolar sweep.
+
+    The farther base-relative row in rectified stereo is invariant to
+    disparity.  When one image route shortcuts a tight V, the other eye's
+    extremal row therefore provides an x-free observation of the missing turn.
+    """
+    left = _centerline_epipolar_sweep(
+        left_result, left_base_xy, minimum_marker_confidence)
+    right = _centerline_epipolar_sweep(
+        right_result, right_base_xy, minimum_marker_confidence)
+    metrics: dict[str, float | int] = {
+        "epipolar_sweep_left_px": np.nan if left is None else left[0],
+        "epipolar_sweep_right_px": np.nan if right is None else right[0],
+        "epipolar_sweep_deficit_px": np.nan,
+        "epipolar_sweep_enforced_view": 0,
+        "epipolar_sweep_anchor_used": 0,
+    }
+    if left is None or right is None:
+        return left_result, right_result, metrics
+    deficit = abs(left[0] - right[0])
+    metrics["epipolar_sweep_deficit_px"] = deficit
+    if deficit < float(minimum_sweep_deficit_px):
+        return left_result, right_result, metrics
+
+    if left[0] > right[0]:
+        if left[2] >= 3:
+            return left_result, right_result, metrics
+        repaired = reroute_marked_centerline(
+            right_result, right_image, right_roi,
+            previous_points_xy=previous_right_points_xy,
+            minimum_marker_confidence=minimum_marker_confidence,
+            epipolar_sweep_y=left[1],
+            epipolar_sweep_after_marker_id=left[2],
+            epipolar_sweep_row_half_width_px=row_half_width_px)
+        used = "+epipolar_sweep" in repaired.prompt.source
+        metrics["epipolar_sweep_enforced_view"] = 2
+        metrics["epipolar_sweep_anchor_used"] = int(used)
+        return left_result, repaired, metrics
+
+    if right[2] >= 3:
+        return left_result, right_result, metrics
+    repaired = reroute_marked_centerline(
+        left_result, left_image, left_roi,
+        previous_points_xy=previous_left_points_xy,
+        minimum_marker_confidence=minimum_marker_confidence,
+        epipolar_sweep_y=right[1],
+        epipolar_sweep_after_marker_id=right[2],
+        epipolar_sweep_row_half_width_px=row_half_width_px)
+    used = "+epipolar_sweep" in repaired.prompt.source
+    metrics["epipolar_sweep_enforced_view"] = 1
+    metrics["epipolar_sweep_anchor_used"] = int(used)
+    return repaired, right_result, metrics
 
 
 def _independent_catheter_mask(
@@ -163,9 +733,23 @@ def _independent_catheter_mask(
     values = np.asarray(likelihood, dtype=np.float32)
     strong = np.uint8(values >= float(strong_threshold))
     support = np.uint8(values >= float(support_threshold))
-    support = cv2.morphologyEx(
-        support, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    # Do not retain an entire weak connected component merely because one of
+    # its pixels is strong.  When two projected arms form a tight V, optical
+    # blur makes a weak chromatic bridge across the white inner wedge.  The old
+    # component hysteresis (and its closing operation) promoted that complete
+    # bridge to foreground.  Grow weak support only a few pixels from the
+    # strong paint core, with progressively stricter evidence farther away.
+    grown = strong.copy()
+    thresholds = (
+        max(float(support_threshold), 0.085),
+        max(float(support_threshold), 0.070),
+        max(float(support_threshold), 0.060),
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    for threshold in thresholds:
+        neighbor = cv2.dilate(grown, kernel) > 0
+        grown |= np.uint8(neighbor & (values >= threshold))
+    support &= grown
     count, labels, stats, _ = cv2.connectedComponentsWithStats(support, 8)
     output = np.zeros_like(support, dtype=np.uint8)
     for component in range(1, count):
@@ -187,8 +771,11 @@ def _edge_refine_catheter_mask(
     if np.count_nonzero(initial) < 8:
         return initial * 255
     kernel3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    kernel11 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    band = cv2.dilate(initial, kernel11)
+    # A wide dilation lets the two arms' candidate bands merge and gives
+    # GrabCut permission to fill the inside of the V.  Five pixels still cover
+    # antialiased catheter boundaries without spanning the observed gap.
+    kernel5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    band = cv2.dilate(initial, kernel5)
     sure_foreground = np.uint8(
         (np.asarray(likelihood) >= 0.16) & (initial > 0))
     sure_foreground = cv2.erode(sure_foreground, kernel3)

@@ -2,6 +2,9 @@
 
 3D shape tracking of a steerable catheter centerline in free space.
 
+The current real-data schema, quality audit, training mask, and `cr_meta_lnn`
+integration requirements are documented in [LEARNING_HANDOFF.md](LEARNING_HANDOFF.md).
+
 ## Marked light-box recordings (2026-08-19)
 
 Session `20260819_194906` uses a neutral light-box background and four ordered
@@ -26,26 +29,69 @@ python -m shape_tracking.image_sequence \
 ```
 
 `joint_spline` is the preferred reconstruction for controlled marked
-recordings. The disparity reconstruction is retained only as a per-frame 3D
-initializer. One cubic material-coordinate B-spline is then optimized directly
-against both cyan centerlines with symmetric model-to-image and image-to-model
-losses, so neither eye is designated as the final reference. Red-ring
-centroids are projected onto each cyan centerline before entering the objective;
-their raw stereo disparities cannot pull the 3D curve away from the blue shaft.
-The approximately 57 mm length, internal-ring material coordinates, endpoint
-locations, local stretch, and curvature variation are finite robust penalties,
-not equality constraints. The existing zero-phase coefficient pass operates on
-these joint-fit curves and final two-view reprojection determines learning
-validity. Use `--reconstruction-backend disparity` for the legacy behavior.
+recordings. Disparity and the per-eye graph routes are retained only as a
+per-frame 3D initializer; they no longer compete to become the final topology.
+One cubic material-coordinate B-spline is optimized against both images at
+once. Overlap-aware stereo supplies one paired, material-indexed corridor from
+the interface to marker 3. The optimizer uses fixed pointwise correspondence
+to those corridors: it cannot reassign a sample to an arbitrary nearest ridge
+on the opposite V arm. This fixed-corridor mode is activated only when one eye
+is detected as non-bijective; well-conditioned stereo retains the more
+calibration-tolerant unordered medial-evidence objective. Corridor samples are
+parameterized by reconstructed 3D arclength, not stereo sample index. A joint
+normal search centers the two corridors on complete-silhouette distance ridges
+while enforcing their rectified epipolar-row agreement. Wide merged runs and
+large corrections are skipped so centering cannot switch V arms. Color
+thresholds no longer define the medial axis, eliminating illumination-dependent
+edge bias. Perspective projection enforces stereo geometry with one common
+material coordinate in both eyes.
+
+An ill-eye heuristic no longer switches objectives unconditionally. Entry,
+eye switches, and release all require five consecutive supporting frames, so a
+single ambiguity-threshold crossing cannot replace a usable image route.
+Suspected frames first run the ordinary equal-weight two-view fit;
+fixed-corridor recovery is used only when that fit fails strict model-distance
+and coverage checks.
+Projected-turn count remains diagnostic for this ordinary-fit decision: the
+ill-eye label has release hysteresis, so accurate two-view image evidence must
+be allowed to reacquire immediately after the overlap ends.
+`quality/joint_topology_recovery_used` records the resulting
+per-frame decision. This prevents benign projected-length differences from
+activating overlap recovery while an eye is still geometrically usable.
+
+Raw red-ring centroids enter only as soft image residuals: rings 0 and 3 use
+tighter finite uncertainties than rings 1 and 2, but no centroid is a hard
+spline waypoint. The approximately 57 mm length, approximate marker material
+coordinates, endpoint locations, local stretch, and temporal coefficient
+continuity are likewise finite robust penalties. A strong second-difference
+prior applies everywhere except one localized material interval, where high
+curvature remains legal. In the two image projections, the localized prior is
+instead applied to third differences: ordinary smooth curvature remains legal
+everywhere, while abrupt curvature changes are confined to the shared turn
+window. A post-fit topology gate requires at most one separated projected
+sharp-turn cluster per eye. In an ill-pose interval, its material location is
+transferred from the farthest epipolar sweep row in the good eye; the good eye
+does not itself need to display a cusp. That location is temporally
+rate-limited. The previous accepted 3D spline is used as a soft prior in every
+temporally adjacent frame, not only after an ill eye has already been declared.
+
+After optimization, the same 3D spline is projected into both images and its
+distal projections become the displayed/stored cyan paths. Thus the cyan and
+yellow curves cannot encode different distal topologies. The original
+independent image routes remain stored as
+`images/<view>/observed_centerline_px`; final reprojection QC compares against
+those observations and packed masks rather than comparing the spline with its
+own projection. The existing zero-phase coefficient pass operates on the
+joint-fit curves and final two-view evidence determines learning validity. Use
+`--reconstruction-backend disparity` for the legacy behavior.
 
 The joint optimizer uses an analytic coefficient Jacobian. Cubic B-spline
 collocation matrices are cached by sample/basis count, perspective projection
 is differentiated in closed form, and the length, local-stretch,
-third-difference, marker, and coefficient-prior blocks are assembled directly.
-Nearest-centerline assignments are held fixed within each local derivative,
-which gives the exact derivative away from Voronoi boundaries. A residual and
-its Jacobian share one cached evaluation at each trust-region iterate; no
-per-coefficient finite differencing is performed.
+third-difference, projected-curvature-variation, fixed-corridor, marker, and
+coefficient-prior blocks are assembled directly. A residual and its Jacobian
+share one cached evaluation at each trust-region iterate; no per-coefficient
+finite differencing is performed.
 
 In joint mode, disparity is only an initializer and its reprojection threshold
 does not reject a finite joint fit. Per-frame joint reprojection weights the
@@ -57,13 +103,18 @@ a threshold by a fraction of a pixel.
 Joint-fit coefficients are stored in `joint/coefficients_base_mm`. Its
 per-view model and coverage residuals, pre/post symmetric residual, optimized
 length, cost, evaluation count, and convergence flag are stored under
-`quality/joint_*`.
+`quality/joint_*`. The chosen curvature-relaxation coordinate and the two
+measured projected turn angles are stored as `quality/joint_turn_fraction` and
+`quality/joint_{left,right}_turn_angle_deg`.
 
 `chromatic_markers` does not run SAM inference. It extracts class-specific
 dark-blue/cyan/red/yellow likelihood rather than generic saturation and forms
 an independent per-eye mask by hysteresis: strong paint pixels seed connected
-regions and weaker edge pixels are retained only when attached to a strong
-seed. The mask is clipped to the convex image projection of the registered 3D
+regions and weaker edge pixels are admitted by only three one-pixel growth
+steps from that strong core. It does not promote a complete weak connected
+component or morphologically close it; this prevents blur between two arms of
+a tight V from filling the inner wedge. The graph-cut uncertainty band is also
+limited to two pixels beyond the color mask. The mask is clipped to the convex image projection of the registered 3D
 workspace, rather than merely its axis-aligned crop, so the blue sheath behind
 the workspace is excluded. A projected proximal cylinder along base-frame
 `-z` removes the remaining rigid sheath, and a color-seeded local graph cut
@@ -124,14 +175,108 @@ allowed to repeat, since projected self-overlap is non-bijective. The inferred
 curve therefore cannot leave the target mask merely because disparity
 smoothing placed it between two thin branches. Diagnostics are stored as
 `quality/centerline_outside_mask_fraction_left/right` and
-`quality/stereo_retry_view`.
+`quality/stereo_retry_view`. If the ordinary retry is not accepted and the
+length mismatch remains, the shorter eye is excluded from ordered-reference
+selection. The longer eye then drives an unordered full-mask epipolar solve;
+the shortened eye is retained in the symmetric joint spline fit with reduced
+observation weight (`--ill-eye-min-observation-weight`, default 0.2). The next
+frame's temporal disparity prior is projected from the finalized joint spline,
+not from its pre-joint disparity initializer. Attempt/result codes and the
+selected ill eye are stored under `quality/stereo_retry_*` and
+`quality/stereo_ill_view`.
+The hysteretic label affects a view's observation weight only while that view
+is also the currently shorter projection. During a pending switch or release,
+both views retain unit weight; a stale label can no longer suppress the newly
+good eye.
+An ambiguity trigger (default 30% of epipolar rows, after the projected-length
+ratio exceeds 1.15) activates this mode before the cyan path fully collapses.
+Once active, temporal cyan-consistency rejection is bypassed only for the
+identified ill eye so every frame can reach stereo recovery. Regularized
+disparities and the displayed inferred cyan path are snapped back to the
+current target mask; temporal priors cannot pull them into unsupported pixels.
+If two projected arms merge into one filled mask lobe, the epipolar solver also
+retains the mask-supported pixel nearest each preceding material-coordinate
+prediction. This prevents the run-midpoint representation from deleting both
+arms and creating a false cyan path through the middle of a tight V. The joint
+3D spline receives the preceding accepted spline as a soft coefficient prior
+in every adjacent frame (0.65 times
+`--ill-eye-temporal-shape-sigma-mm`, or 3.9 mm by default). The good eye and
+current mask evidence can still move the curve, but a many-to-one eye cannot
+abruptly change its branch or material order before the ill-eye detector reacts.
+
+Forced overlap recovery now keeps independently extracted image centerlines
+separate from stereo-inferred projections. An inferred path never becomes the
+next frame's color-routing prior, eliminating a feedback loop in which a wrong
+branch in one frame contaminated subsequent frames. The active ill eye is held
+until five consecutive frames support entry, switching, or release, rather than
+alternating with small framewise score changes. Within a connected V-shaped
+mask run, overlap candidates come from each distance-transform ridge instead
+of the run midpoint. A pair-state dynamic program transfers the complete
+good-eye epipolar-row sequence with first- and second-order disparity costs.
+Forced recovery preserves those selected pixels: only missing epipolar rows
+are interpolated, and later disparity smoothing or unrestricted nearest-mask
+snapping cannot silently change V branches.
+An inferred route that passes mask support, non-reversing marker order,
+terminal support, exactly-one-turn, mask-mediality, and tighter
+translation-compensated temporal-motion checks may initialize stereo, but it
+is not a final topology candidate. The
+single joint spline always makes the final decision from both masks, both sets
+of soft rings, stereo geometry, smoothness, and temporal continuity. These
+initializer diagnostics remain stored under `quality/stereo_inferred_*`;
+marker/topology metrics are recomputed from the final joint projections.
 
 Marker 3 identity combines distal position, observed width, and the preceding
 tip when available; it is not assigned solely to the largest red component.
 Markers 0 and 3 have higher stereo weights than the two intermediate rings,
 and marker-0 interface observations use a tighter finite uncertainty. A
-temporal identity gate replaces implausible one-frame marker jumps with a
-low-confidence propagated observation.
+temporal identity gate rejects implausible one-frame marker jumps. During an
+observation-cache resume, every per-eye marker track is then repaired
+bidirectionally: a snap is detected against the chord between trusted past and
+future observations, and short missing intervals are interpolated in image
+time. Repaired samples are stored in `images/<view>/marker_interpolated`; their
+confidence remains finite and lower than a direct observation. This makes
+markers available through a brief ill pose without freezing them at a past
+pixel coordinate or imposing marker centroids as curve waypoints.
+
+After stereo marker identities are reconciled, marked recordings receive a
+second 2D routing pass. The registered base and ordered ring identities divide
+the shaft into material intervals, but each ring contributes a local red-mask
+support region rather than a hard centroid waypoint. The base-to-marker-0
+interval preferentially follows dark-blue paint, preventing the proximal
+sheath from jumping onto a nearby cyan distal arm. Interior material-coordinate
+supports from the preceding accepted route are transferred separately inside
+each marker interval and snapped to current mask evidence. Consequently a
+tight projected V retains both arms and its turn location instead of being
+reduced to the shortest connection through a merged mask lobe. If current
+marker order contradicts the preceding route, those temporal supports are
+dropped for that frame. Ring spacing remains an identity regularizer only; it
+is not imposed on either the image path or the reconstructed length.
+During overlap-aware stereo, exact cyan epipolar crossings are labeled by the
+same ring-delimited intervals. A crossing from a different material interval
+receives a categorical branch penalty, while multiple samples within the same
+interval may still reuse one target pixel. No within-interval disparity or
+image arc length is interpolated, since either can be strongly nonlinear under
+foreshortening. Forced ill-eye recovery uses only exact rectified rows, so the
+selected corridor cannot move outside the current target-eye mask when its
+vertical coordinate is transferred from the reference eye. Its dynamic program
+has three topology states (before, inside, and after one contiguous sharp-turn
+cluster). Adjacent high-angle samples at one physical V therefore count as one
+turn, while a later branch snap is infeasible. The good-eye epipolar-sweep
+extremum is a soft turn-location cost rather than an exact geometric constraint.
+If too few exact-row mask samples exist, the frame is reported unsupported
+instead of reverting to ordered correspondences and producing a shortcut.
+
+Before 3D reconstruction, the two marked centerlines also compare their
+base-relative rectified-row sweeps. If one cyan path spans at least 4 pixels
+less than the other, the fuller eye supplies its extremal epipolar row and the
+preceding marker interval. The shortened eye must visit that row in the same
+material order, but chooses the column from its own mask-medial color support;
+there is no hard cross-eye point match. When the extremum precedes marker 3,
+this makes a shortcut path reach the only sharp turn visible in the good eye;
+marker 3 continues to provide the separately detected terminal observation. Configure the
+gate and calibration tolerance with `--marked-epipolar-sweep-deficit-px` and
+`--marked-epipolar-sweep-row-half-width-px`. Per-view sweep, deficit, repaired
+view, and anchor-use diagnostics are stored under `quality/epipolar_sweep_*`.
 
 For a compact visual audit without creating videos, add
 `--write-snapshots --snapshot-count 12`. Full-resolution stereo overlays are
@@ -145,7 +290,7 @@ stored under `markers/`. Overlays label decoded markers `0` through `3` in
 magenta. The previous SAM/cached/HSV backends remain unchanged for unmarked
 recordings.
 
-## Current handoff: image-only SAM work (2026-08-02)
+## Historical handoff: image-only SAM work (2026-08-02)
 
 The immediate goal is to build a robust offline catheter segmentation pipeline
 from rectified ZED2 stereo video. EM tracking is deliberately excluded from this
@@ -284,9 +429,14 @@ HDF5 still contains pixel centerlines, 3D geometry, quality, and robot data.
 The same cache boundaries are exposed explicitly through `--resume-from`:
 
 ```bash
+# Build the expensive mask/2D/marker cache once, without running stereo or 3D.
+python -m shape_tracking.image_sequence --session SESSION \
+  --segmentation-backend chromatic_markers --observations-only \
+  --outdir OBSERVATION_CACHE
+
 # Reuse masks, cyan centerlines, rings, and other image observations; rerun all 3D stages.
 python -m shape_tracking.image_sequence --session SESSION \
-  --resume-from observations --resume-h5 OLD/processed_shapes.h5 \
+  --resume-from observations --resume-h5 OBSERVATION_CACHE/processed_shapes.h5 \
   --reconstruction-backend joint_spline --outdir NEW_FROM_OBSERVATIONS
 
 # Reuse image observations and the stored stereo initializer; rerun the joint fit onward.
@@ -299,6 +449,10 @@ python -m shape_tracking.image_sequence --session SESSION \
   --resume-from joint --resume-h5 OLD/processed_shapes.h5 \
   --outdir NEW_FROM_JOINT
 ```
+
+For `--resume-from observations`, omitting `--reconstruction-backend` now
+inherits the backend recorded in the source HDF5. This prevents a joint-spline
+validation from silently reverting to the disparity-only default.
 
 `observations` decodes the selected SVO frames to support normal overlays but
 does not repeat segmentation. `stereo` and `joint` copy the source HDF5 into a
@@ -313,6 +467,8 @@ The performance controls are:
 
 - `--prompt-workers 4`: CPU workers for independent left/right colour and
   prompt extraction.
+- `--chromatic-eye-workers 2`: run the independent left/right chromatic mask,
+  edge/centerline, and route-refinement work concurrently.
 - `--sam-postprocess-workers 2`: persistent CPU workers for independent SAM
   mask selection, morphology, skeletonization, and centerline extraction.
 - `--preprocess-chunk-size 16`: number of decoded frames prepared together.
@@ -340,7 +496,9 @@ The reconstruction and material-interface defaults are now:
   Ordinary frames retain the ordered epipolar solver. Detection is controlled
   by `--overlap-self-distance-px 8`,
   `--overlap-min-arclength-separation 0.12`, and
-  `--overlap-self-fraction-threshold 0.05`.
+  `--overlap-self-fraction-threshold 0.05`. For marked data, a projected-length
+  collapse also forces this unordered-mask mode even when the collapsed cyan
+  path itself no longer contains enough geometry to report self-overlap.
 - A self-overlapped eye is excluded from reference-view selection whenever the
   other eye remains separated. `--stereo-reference-hysteresis-score 3` keeps
   the previous good reference through small score fluctuations. The disparity
@@ -441,12 +599,14 @@ alter or anchor the reconstructed image shape. It aligns independently measured
 shape, EM tip pose, and robot actuation while preserving separate validity and
 timestamp-offset fields.
 
-The 100 Hz `/teleop/control` joint-command timestamps are the canonical timeline
-because actuation is present in every recording. POS and raw encoder feedback are
-interpolated onto that timeline. Processed image shapes are nearest-neighbor
+The default uses the 100 Hz `/teleop/control` joint-command timestamps as the
+canonical timeline because actuation is present in every recording. For
+image-based learning, `--timeline image` instead emits exactly one row per
+camera frame, avoiding repeated shape targets. POS and raw encoder feedback are
+aligned onto the selected timeline. Processed image shapes are nearest-neighbor
 sampled without interpolation, and `image/source_index`,
 `image/source_offset_ms`, and `image/is_new_sample` make repeated camera samples
-explicit. EM coil poses are gap-aware interpolations followed by the existing
+explicit on the actuation clock. EM coil poses are gap-aware interpolations followed by the existing
 dual-coil tip-frame fusion. `frames/fusion_valid` requires the command and every
 enabled optional modality; `robot/feedback_valid`, `image/valid`, and `em/valid`
 remain available for less restrictive filtering.
@@ -459,7 +619,7 @@ source /home/chen-lab/Yifan/cr-venv/bin/activate
 cd /home/chen-lab/Yifan/catheter-shape-tracking
 python -m shape_tracking.fusion \
   --session /media/chen-lab/84BABCB7BABCA6D81/Yifan/catheter_sessions/20260802_134726 \
-  --image-data --no-em-data \
+  --image-data --no-em-data --timeline image \
   --window run_and_return
 ```
 
@@ -473,7 +633,10 @@ The default output is `<session>/processed_fusion/fused_dataset.h5`, with a
 compact `fusion_summary.json` beside it. Fusion also defaults to the marked
 `run_and_return` window. The output copies model-ready 3D full/distal geometry
 and scalar quality fields, but not masks or 2D SAM prompts; those remain in the
-source image HDF5 named by the fusion metadata.
+source image HDF5 named by the fusion metadata. The fused image group also
+preserves `observation_valid`, `pre_interpolation_valid`, and
+`curve_temporally_interpolated`, plus the source processing configuration and
+code provenance, so repaired curves can be included or excluded explicitly.
 
 The image-only stereo path preserves sharp turns by arc-length-resampling the
 ordered pixel skeleton with piecewise-linear interpolation by default. Disparity
@@ -590,10 +753,17 @@ count (`--curvature-spline-bases`, default 20, giving 16 internal knots), so a
 fit cannot collapse to one global cubic.  As a final offline stage, all distal
 frames are represented in the same normalized material coordinate and the same
 uniform clamped knot vector.  The 3D control-point trajectories are robustly
-zero-phase filtered (`--spline-temporal-cutoff-hz`, default 3 Hz).  A symmetric
-rolling-median prediction detects snap-away/snap-back observations; point
+zero-phase filtered (`--spline-temporal-cutoff-hz`, default 3 Hz).  A local
+timestamp-weighted constant-velocity chord detects snap-away/snap-back
+observations without treating sustained physical rotation as an outlier; point
 outliers reduce only the weights of the spline bases that influence that shaft
 region, while a predominantly bad curve rejects the whole frame observation.
+Paired snap/return edges may bridge one short interval, but each edge cluster
+can participate in only one bridge; alternating reconstruction modes can no
+longer chain into a long unsupported block.
+Three consecutive joint fits with strong two-view model and coverage evidence
+explicitly reacquire after an ill interval and start a new supported temporal
+block, rather than allowing the pre-ill motion predictor to veto the recovery.
 The final centerline, tangent, and curvature are evaluated directly from the
 filtered coefficients, with no independent per-frame refit.  Set the cutoff to
 zero to disable this stage. The last four control points use a 5 Hz terminal
@@ -612,15 +782,57 @@ options are `--spline-temporal-huber-delta-mm`,
 `--spline-temporal-max-gap-ms`, `--spline-temporal-outlier-sigma`, and
 `--spline-temporal-outlier-floor-mm`.
 
+The finalized yellow projection is independently checked against each packed
+green mask after coefficient filtering. Frames exceeding either 20% outside
+support or a 6 px 95th-percentile mask distance receive final-geometry flag 32;
+these limits are configurable with `--max-final-mask-outside-fraction` and
+`--max-final-mask-distance-p95-px`.
+
+Short, bracketed invalid intervals are repaired after that image-space QC by
+interpolating the entire common-basis 3D coefficient vector with a symmetric
+cubic Hermite bridge. This is one whole-curve operation, not independent point
+interpolation, so material order and spline topology are preserved. Tiny
+accepted islands of at most two frames inside the interval are included to
+avoid good/bad chatter. The default limit is 650 ms and can be changed with
+`--spline-interpolation-max-gap-ms`. The source reconstruction state is stored
+in `frames/pre_interpolation_valid`, synthesized frames are labelled by
+`frames/curve_temporally_interpolated`, and final reprojection/mask QC is rerun
+after interpolation. Linear and cubic-Hermite coefficient bridges are both
+evaluated and the one with the smaller normalized point-step/arc-length error
+is selected. A bridge is accepted only below the 8 mm per-frame material-point
+step and 4 mm arc-length-deviation gates. Because V-overlap masks are known to
+be unreliable inside exactly these short intervals, a physically accepted
+bridge is not vetoed by per-frame mask QC; that override is recorded in
+`quality/interpolated_curve_image_qc_overridden`. Thus a downstream learner may
+use these repaired samples or exclude them explicitly.
+
+A completed run can be patched without repeating image processing or the
+per-frame joint fit:
+
+```bash
+python -m shape_tracking.image_sequence --session SESSION \
+  --resume-from joint --resume-h5 FULL_RUN/processed_shapes.h5 \
+  --outdir FULL_RUN_PATCHED \
+  --spline-interpolation-max-gap-ms 900
+```
+
+The source is copied and never modified. Inspect the reported interpolated and
+physically rejected runs before choosing a larger limit; long or unbracketed
+intervals remain invalid.
+
 `frames/learning_valid` is the model-facing validity label. It requires a valid
 reconstruction, finite temporally filtered coefficients, no whole-shape or
-terminal temporal-outlier decision, no outlier run longer than the configured
-500 ms interpolation limit, and acceptable mask width. Long unsupported runs
-are not bridged by the final coefficient solve and their overlays omit the
-yellow curve. `frames/learning_rejection_flags` records bitwise reasons:
+terminal temporal-outlier decision, no predominantly unsupported material
+region longer than the configured 500 ms interpolation limit, and acceptable
+mask width. A persistent local outlier only downweights its influencing spline
+bases; by default at least half of the material samples must be in long rejected
+runs before the whole frame is unsupported. Unbracketed or long unsupported
+runs are not bridged and their overlays omit the yellow curve.
+`frames/learning_rejection_flags` records bitwise reasons:
 1=reconstruction, 2=unsupported temporal gap, 4=whole-shape outlier,
-8=terminal outlier, and 16=mask width. The original `frames/valid` and all
-rejected shape diagnostics are retained for inspection. Sensor fusion uses
+8=terminal outlier, 16=mask width, and 32=final image/mask fit. The original
+reconstruction state and all rejected shape diagnostics are retained for
+inspection. Sensor fusion uses
 `frames/learning_valid` when present, while exposing both
 `image/reconstruction_valid` and `image/learning_valid`; consequently
 `frames/fusion_valid` automatically excludes intermittent image outliers and
