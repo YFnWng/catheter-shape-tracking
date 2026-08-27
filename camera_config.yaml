@@ -1,5 +1,12 @@
 # Fixed ZED2 profile used for repeatable catheter-color segmentation.
 # Command-line options override individual values in this file.
+cameras:
+  # Stable rig identities. Do not rely on USB enumeration order.
+  primary:
+    serial: 20757336
+  oblique:
+    serial: 26080456
+
 camera:
   resolution: HD1080
   fps: 30

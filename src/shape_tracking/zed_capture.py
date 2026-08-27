@@ -65,7 +65,8 @@ class ZedCamera:
                  brightness=None, contrast=None, saturation=None, gamma=None,
                  hue=None, svo_compression="H264",
                  white_balance_auto_freeze_s=0.0,
-                 white_balance_auto_freeze_retries=2):
+                 white_balance_auto_freeze_retries=2,
+                 serial_number=None):
         self.resolution = resolution
         self.fps = fps
         self.sharpness = sharpness      # 0..8 (digital unsharp; 4 = SDK default)
@@ -83,6 +84,9 @@ class ZedCamera:
         self.saturation = saturation
         self.gamma = gamma
         self.svo_compression = svo_compression
+        self.serial_number = (
+            None if serial_number in (None, "", 0, "0")
+            else int(serial_number))
         self.zed = sl.Camera()
         self._left = sl.Mat()
         self._right = sl.Mat()
@@ -93,6 +97,8 @@ class ZedCamera:
         self.dist_right = None
         self.left_cam = None
         self.right_cam = None
+        self.left_camera_T_right_camera = None
+        self.right_camera_T_left_camera = None
         self._recording = False
 
     # -- lifecycle ---------------------------------------------------------- #
@@ -102,6 +108,8 @@ class ZedCamera:
         init.camera_fps = self.fps
         init.depth_mode = sl.DEPTH_MODE.NONE       # only the RGB stream is needed
         init.coordinate_units = sl.UNIT.METER
+        if self.serial_number is not None:
+            init.set_from_serial_number(self.serial_number)
         status = self.zed.open(init)
         if status != sl.ERROR_CODE.SUCCESS:
             raise RuntimeError(f"ZED open failed: {status}")
@@ -302,6 +310,10 @@ class ZedCamera:
         # Rectified ZED images are undistorted; zeros unless you feed raw frames.
         self.dist = np.zeros((5,), dtype=np.float64)
         self.dist_right = np.zeros((5,), dtype=np.float64)
+        self.left_camera_T_right_camera = np.asarray(
+            calib.stereo_transform.m, dtype=np.float64).reshape(4, 4).copy()
+        self.right_camera_T_left_camera = np.linalg.inv(
+            self.left_camera_T_right_camera)
         # Stereo baseline (m). SDK historically returns mm; normalize to meters.
         try:
             b = float(calib.get_camera_baseline())
@@ -321,6 +333,10 @@ class ZedCamera:
             "right_fx": self.right_cam.fx, "right_fy": self.right_cam.fy,
             "right_cx": self.right_cam.cx, "right_cy": self.right_cam.cy,
             "baseline_m": self.baseline_m,
+            "left_camera_T_right_camera":
+                self.left_camera_T_right_camera.tolist(),
+            "right_camera_T_left_camera":
+                self.right_camera_T_left_camera.tolist(),
             "svo_compression": self.svo_compression,
             "camera_settings": self.camera_settings(),
             "white_balance_freeze": self.white_balance_freeze,

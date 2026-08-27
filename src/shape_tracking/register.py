@@ -365,7 +365,9 @@ def save_session_camera_registration(
         registration_path, output_dir, config_path, collected,
         left_bgr, right_bgr, boards, K, dist, resolution,
         zed_serial, baseline_m, image_timestamp_ns, min_frames=10,
-        em_tool_poses=None, image_only=False):
+        em_tool_poses=None, image_only=False,
+        K_right=None, dist_right=None,
+        right_camera_T_left_camera=None, overlay_prefix=""):
     """Fit camera-to-base registration and merge it into a session JSON.
 
     The collected mapping contains r, t and c observation lists per board.
@@ -509,15 +511,26 @@ def save_session_camera_registration(
         document['modalities'] = {'camera': True, 'em': True}
         base_T_aurora, overlay_coils = build_em_overlay_geometry(
             document['em'], em_tool_poses)
-    right_camera_T_left_camera = np.eye(4)
-    right_camera_T_left_camera[0, 3] = -float(baseline_m)
+    K_right = np.asarray(
+        K if K_right is None else K_right, dtype=np.float64)
+    dist_right = np.asarray(
+        dist if dist_right is None else dist_right, dtype=np.float64)
+    if right_camera_T_left_camera is None:
+        right_camera_T_left_camera = np.eye(4)
+        right_camera_T_left_camera[0, 3] = -float(baseline_m)
+    else:
+        right_camera_T_left_camera = np.asarray(
+            right_camera_T_left_camera, dtype=np.float64)
+        if right_camera_T_left_camera.shape != (4, 4):
+            raise ValueError(
+                "right_camera_T_left_camera must be a 4x4 transform")
     right_camera_T_robot_base = (
         right_camera_T_left_camera @ left_camera_T_robot_base)
     left_roi = workspace_roi(
         K, left_camera_T_robot_base, workspace,
         left_bgr.shape[1], left_bgr.shape[0])
     right_roi = workspace_roi(
-        K, right_camera_T_robot_base, workspace,
+        K_right, right_camera_T_robot_base, workspace,
         right_bgr.shape[1], right_bgr.shape[0])
 
     poses_left = {
@@ -534,11 +547,14 @@ def save_session_camera_registration(
         left_camera_T_robot_base, workspace, AXIS_LEN_M,
         base_T_aurora=base_T_aurora, coils=overlay_coils)
     overlay_right = annotate_view(
-        right_bgr, boards, K, dist, poses_right,
+        right_bgr, boards, K_right, dist_right, poses_right,
         right_camera_T_robot_base, workspace, AXIS_LEN_M,
         base_T_aurora=base_T_aurora, coils=overlay_coils)
-    left_name = 'registration_left.png'
-    right_name = 'registration_right.png'
+    overlay_stem = (
+        'registration'
+        if not overlay_prefix else f'registration_{overlay_prefix}')
+    left_name = f'{overlay_stem}_left.png'
+    right_name = f'{overlay_stem}_right.png'
     if not cv2.imwrite(os.path.join(output_dir, left_name), overlay_left):
         raise OSError('failed to write left registration overlay')
     if not cv2.imwrite(os.path.join(output_dir, right_name), overlay_right):
@@ -557,9 +573,15 @@ def save_session_camera_registration(
         'robot_base_T_right_camera': np.linalg.inv(
             right_camera_T_robot_base).tolist(),
         'right_camera_T_left_camera': right_camera_T_left_camera.tolist(),
+        'left_camera_T_right_camera': np.linalg.inv(
+            right_camera_T_left_camera).tolist(),
         'intrinsics': {
             'K': np.asarray(K).tolist(),
+            'K_left': np.asarray(K).tolist(),
+            'K_right': K_right.tolist(),
             'distortion': np.asarray(dist).reshape(-1).tolist(),
+            'distortion_left': np.asarray(dist).reshape(-1).tolist(),
+            'distortion_right': dist_right.reshape(-1).tolist(),
             'resolution': resolution,
             'zed_serial': str(zed_serial),
             'baseline_m': float(baseline_m),

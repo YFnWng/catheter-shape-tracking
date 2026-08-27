@@ -945,6 +945,43 @@ ignored. The resulting `registration.json` has `mode: image_only`, `em: null`,
 and a solved camera-to-base transform. `session_metadata.json` records the
 enabled modalities independently of registration completion.
 
+#### Two ZED2 cameras, one fixed board
+
+The default `camera_config.yaml` now names both physical ZED2s by serial number:
+
+```yaml
+cameras:
+  primary: {serial: 20757336}
+  oblique: {serial: 26080456}
+```
+
+With two entries, the same image-only command opens both cameras and shows a
+2-by-2 preview (one camera per row, `LEFT | RIGHT` per row). The single fixed
+robot-base ChArUco board must be visible in at least one eye of each camera. The
+recorder detects both eyes, keeps the observation with more ChArUco corners, and
+uses factory stereo calibration to express right-eye observations in the
+left-camera frame. It does not need to be visible simultaneously: each camera
+accumulates its own observations of that same stationary board.
+
+```powershell
+python -m shape_tracking `
+    --camera-config .\camera_config.yaml `
+    --registration-config .\registration_config.yaml `
+    --resolution HD1080 --fps 30 --preview-fps 10 `
+    --image-only --autorecord
+```
+
+The session contains `primary_*.svo2`, `oblique_*.svo2`, one frame-index CSV per
+camera, and `camera_frame_pairs.csv`. Pairing is timestamp-based because USB
+ZED2 cameras do not provide a shared hardware trigger. `registration.json`
+stores both camera rigs, and four overlays named
+`registration_<rig>_<left|right>.png` verify the result. Offline reconstruction
+is still single-camera and does not consume this schema yet.
+
+For bandwidth stability, connect the cameras to separate USB 3 host controllers
+when possible. Never depend on USB enumeration order; update the serial numbers
+in the YAML if the physical primary/oblique assignments change.
+
 ### Fixed camera settings for repeatable segmentation
 
 Auto exposure/gain and auto white balance can change catheter colors and edge

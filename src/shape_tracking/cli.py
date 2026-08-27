@@ -42,20 +42,11 @@ def _default_camera_config_path():
 
 def _load_camera_config(path):
     """Load and flatten the camera/recording sections of a capture profile."""
-    if not path:
+    document = _load_camera_document(path)
+    if not document:
         return {}
-    with open(path, encoding="utf-8") as stream:
-        document = yaml.safe_load(stream) or {}
-    if not isinstance(document, dict):
-        raise ValueError("camera config must contain a YAML mapping")
-    top_level = set(document) - {"camera", "recording"}
-    if top_level:
-        raise ValueError(
-            "unknown camera config section(s): " + ", ".join(sorted(top_level)))
     camera = document.get("camera", {}) or {}
     recording = document.get("recording", {}) or {}
-    if not isinstance(camera, dict) or not isinstance(recording, dict):
-        raise ValueError("camera and recording config sections must be mappings")
     values = dict(camera)
     values.update(recording)
     unknown = set(values) - CAMERA_CONFIG_KEYS
@@ -63,6 +54,51 @@ def _load_camera_config(path):
         raise ValueError(
             "unknown camera config setting(s): " + ", ".join(sorted(unknown)))
     return values
+
+
+def _load_camera_document(path):
+    """Load a capture profile while retaining its named physical cameras."""
+    if not path:
+        return {}
+    with open(path, encoding="utf-8") as stream:
+        document = yaml.safe_load(stream) or {}
+    if not isinstance(document, dict):
+        raise ValueError("camera config must contain a YAML mapping")
+    top_level = set(document) - {"camera", "recording", "cameras"}
+    if top_level:
+        raise ValueError(
+            "unknown camera config section(s): " + ", ".join(sorted(top_level)))
+    camera = document.get("camera", {}) or {}
+    recording = document.get("recording", {}) or {}
+    cameras = document.get("cameras", {}) or {}
+    if (not isinstance(camera, dict) or not isinstance(recording, dict)
+            or not isinstance(cameras, dict)):
+        raise ValueError(
+            "camera, recording, and cameras config sections must be mappings")
+    return document
+
+
+def _load_camera_rigs(path):
+    """Return validated named camera rigs from a capture profile."""
+    from .multi_camera import CameraRigSpec, validate_rig_specs
+
+    document = _load_camera_document(path)
+    configured = document.get("cameras", {}) if document else {}
+    if not configured:
+        return ()
+    rigs = []
+    for rig_id, item in configured.items():
+        if not isinstance(item, dict):
+            raise ValueError(f"camera rig {rig_id!r} must be a mapping")
+        unknown = set(item) - {"serial"}
+        if unknown:
+            raise ValueError(
+                f"unknown setting(s) for camera rig {rig_id!r}: "
+                + ", ".join(sorted(unknown)))
+        if "serial" not in item:
+            raise ValueError(f"camera rig {rig_id!r} requires serial")
+        rigs.append(CameraRigSpec(str(rig_id), int(item["serial"])))
+    return validate_rig_specs(rigs)
 
 
 def _limit_frame_index(path, frame_count):
@@ -212,6 +248,11 @@ def parse_args(argv=None):
         '--camera-registration-min-corners', type=int, default=6,
         help='minimum ChArUco corners for a camera-registration observation.')
     args = ap.parse_args(argv)
+    try:
+        args.camera_rigs = _load_camera_rigs(args.camera_config)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        ap.error(
+            f"could not load camera rigs from {args.camera_config!r}: {exc}")
     if args.image_only and args.aurora_port:
         ap.error("--image-only cannot be combined with --aurora-port")
     if (args.exposure >= 0) != (args.gain >= 0):
@@ -244,6 +285,9 @@ def main(argv=None):
     from .zed_capture import ZedCamera, assess_stereo_color
 
     args = parse_args(argv)
+    if len(args.camera_rigs) == 2:
+        from .dual_cli import main_dual
+        return main_dual(args, args.camera_rigs)
     field_registration = (
         None if args.image_only else
         camera_register.load_field_generator_config(args.registration_config))
@@ -352,7 +396,10 @@ def main(argv=None):
                 args.white_balance_auto_freeze_retries,
             brightness=args.brightness, contrast=args.contrast, hue=args.hue,
             saturation=args.saturation, gamma=args.gamma,
-            svo_compression=args.svo_compression) as cam:
+            svo_compression=args.svo_compression,
+            serial_number=(
+                args.camera_rigs[0].serial_number
+                if args.camera_rigs else None)) as cam:
         info = cam.info()
         print(f"ZED serial {info['serial']}, model {info['model']}, SDK {info['sdk']}")
         print(f"Resolution {info['resolution']}  fx={info['fx']:.1f} fy={info['fy']:.1f} "

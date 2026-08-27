@@ -54,6 +54,8 @@ class SessionCameraRegistrationTest(unittest.TestCase):
             ])
             _, boards = boards_mod.build_boards()
             registration_path = root / 'registration.json'
+            right_camera_T_left_camera = np.eye(4)
+            right_camera_T_left_camera[0, 3] = -0.2
 
             camera = save_session_camera_registration(
                 registration_path=str(registration_path),
@@ -62,7 +64,9 @@ class SessionCameraRegistrationTest(unittest.TestCase):
                 boards=boards, K=K, dist=np.zeros(5), resolution='TEST',
                 zed_serial='123', baseline_m=0.12,
                 image_timestamp_ns=100, min_frames=10,
-                image_only=True)
+                image_only=True, K_right=K.copy(), dist_right=np.zeros(5),
+                right_camera_T_left_camera=right_camera_T_left_camera,
+                overlay_prefix='primary')
 
             document = json.loads(registration_path.read_text())
             self.assertEqual(document['mode'], 'image_only')
@@ -72,6 +76,10 @@ class SessionCameraRegistrationTest(unittest.TestCase):
             self.assertEqual(camera['boards_used'], [0])
             self.assertIsNone(camera['field_generator_board'])
             self.assertIsNone(camera['em_overlay'])
+            self.assertEqual(
+                camera['right_camera_T_left_camera'][0][3], -0.2)
+            self.assertTrue((root / 'registration_primary_left.png').is_file())
+            self.assertTrue((root / 'registration_primary_right.png').is_file())
             with self.assertRaisesRegex(ValueError, 'EM registration'):
                 load_session_registration(root)
             loaded = load_session_registration(root, require_em=False)

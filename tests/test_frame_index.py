@@ -50,6 +50,35 @@ class FrameIndexTest(unittest.TestCase):
             self.assertEqual(args.hue, 0)
             self.assertEqual(args.svo_compression, "H264_LOSSLESS")
 
+    def test_camera_yaml_selects_two_physical_rigs_by_serial(self):
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / "camera.yaml"
+            config.write_text(
+                "cameras:\n"
+                "  primary:\n"
+                "    serial: 20757336\n"
+                "  oblique:\n"
+                "    serial: 26080456\n"
+                "camera:\n"
+                "  exposure: 8\n"
+                "  gain: 1\n",
+                encoding="utf-8")
+            args = parse_args(["--camera-config", str(config)])
+        self.assertEqual(
+            [(rig.rig_id, rig.serial_number) for rig in args.camera_rigs],
+            [("primary", 20757336), ("oblique", 26080456)])
+
+    def test_camera_yaml_rejects_duplicate_serials(self):
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / "camera.yaml"
+            config.write_text(
+                "cameras:\n"
+                "  primary: {serial: 20757336}\n"
+                "  oblique: {serial: 20757336}\n",
+                encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                parse_args(["--camera-config", str(config)])
+
     def test_white_balance_requires_hardware_supported_100k_step(self):
         with self.assertRaises(SystemExit):
             parse_args([
