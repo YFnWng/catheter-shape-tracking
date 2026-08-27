@@ -1004,7 +1004,7 @@ values for every dataset intended to share a segmentation model.
 
 The default fixed profile is [`camera_config.yaml`](camera_config.yaml). It
 contains the ZED Explorer settings selected for the light box, including manual
-exposure/gain and an auto-white-balance warm-up/freeze. Running
+exposure/gain and native auto-white-balance warm-up/freeze. Running
 `python -m shape_tracking` loads it automatically. Select another profile with:
 
 ```powershell
@@ -1016,22 +1016,26 @@ Command-line camera options override individual YAML values. Pass
 SVO2 codec; override it with, for example,
 `--svo-compression H264_LOSSLESS`.
 
-For the ZED2's coarse manual white-balance control, the default profile instead
-uses `white_balance_auto_freeze_s: 5.0`: the camera applies all final image
-controls, grabs five seconds of unrecorded frames with auto white balance, and
-then disables auto without writing a manual temperature. The console and
+Auto-freeze is enabled by setting `white_balance_temperature: -1` and
+`white_balance_auto_freeze_s` to a positive duration. The camera applies all
+final image controls, grabs unrecorded frames with native auto white balance,
+then disables auto without rewriting the coarse temperature read-back. This
+retains the ISP's converged sensor gains. In dual-camera mode the cameras warm
+sequentially, and the preview starts only after both have frozen. The console and
 `session_metadata.json` record the warm-up duration, frame count, temperature
 read-back, and final auto/manual state. Keep the light box and scene stationary
 during startup.
 
-The recorder checks both eyes after every freeze attempt. A gross single-eye
-color cast or clipping (such as the intermittent all-green right view) causes
-another auto-WB convergence attempt. After the configured retry count it falls
-back to continuous auto white balance and verifies both eyes again. SVO start is
-blocked until the stereo pair passes, both views are shown side by side, and
-three consecutive failures during recording stop the SVO with details saved in
-`session_metadata.json`. Configure retries with
-`white_balance_auto_freeze_retries` (default 2).
+The recorder checks the bright neutral light-box background in both eyes after
+every freeze attempt. A strong tint, eye-to-eye mismatch, or clipping (such as
+the intermittent all-green right view) causes another convergence attempt. If
+all attempts fail, startup fails rather than recording with continuous auto
+white balance. Dual-camera recording also requires the neutral chromaticities
+of both rigs to agree. These strict scene-neutrality checks apply only before
+recording starts. During recording, hands, tools, and other colored foreground
+objects may enter the views, so only three consecutive catastrophic ISP faults
+(extreme channel dominance or clipping) stop the SVOs. Configure startup retries
+with `white_balance_auto_freeze_retries` (default 2).
 
 ### Direct optical field-generator registration
 

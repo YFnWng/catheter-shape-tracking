@@ -34,8 +34,10 @@ markers:
       - [0.0, 0.0, 0.0, 1.0]
   1:                                   # ids 9..16  (alternative forms shown)
     # full 4x4 (rotation + translation together):
-    translation: [25.0, -122.0, -40.0]
-    rotation_euler_deg: [0.0, -150.0, 0.0]
+    # translation: [25.0, -122.0, -40.0]
+    # rotation_euler_deg: [0.0, -150.0, 0.0]
+    translation: [-50.0, -23.0, 0.0]
+    rotation_euler_deg: [-90.0, 0.0, 0.0]
     # or:  translation: [..]  +  rotation_euler_deg: [..]  /  rotation_quat: [..]
 
 # Direct optical Aurora registration using the 100 x 100 mm field-generator

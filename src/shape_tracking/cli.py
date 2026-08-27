@@ -687,13 +687,14 @@ def main(argv=None):
                             "SVO autorecord blocked for 15s by failed stereo "
                             f"color preflight: {last_stereo_color_health}")
                 if cam.is_recording:
-                    if last_stereo_color_health["healthy"]:
+                    if last_stereo_color_health["runtime_healthy"]:
                         unhealthy_recording_checks = 0
                     else:
                         unhealthy_recording_checks += 1
                         if unhealthy_recording_checks >= 3:
                             metadata["stereo_color_fault"] = {
                                 "timestamp_ns": int(ts),
+                                "fault_class": "catastrophic_isp_color",
                                 "health": last_stereo_color_health,
                             }
                             with open(

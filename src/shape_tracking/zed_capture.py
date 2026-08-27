@@ -14,38 +14,115 @@ import time
 import numpy as np
 
 
-def assess_stereo_color(left_bgr, right_bgr):
-    """Detect gross single-eye ISP tint/clipping without scene calibration."""
-    reports = []
-    for name, image in (("left", left_bgr), ("right", right_bgr)):
-        array = np.asarray(image)
-        if array.ndim != 3 or array.shape[2] < 3 or array.size == 0:
-            raise ValueError(f"invalid {name} image for stereo color check")
-        # Subsample for a cheap live check. The light-box background dominates
-        # the scene, so a failed sensor ISP state remains obvious globally.
-        pixels = array[::8, ::8, :3].reshape(-1, 3).astype(np.float64)
-        mean_bgr = pixels.mean(axis=0)
-        channel_dominance = float(
-            mean_bgr.max() / max(1.0, (mean_bgr.sum() - mean_bgr.max()) / 2.0))
-        green_dominance = float(
-            mean_bgr[1] / max(1.0, (mean_bgr[0] + mean_bgr[2]) / 2.0))
-        green_clip_fraction = float(np.mean(
-            (pixels[:, 1] >= 250)
-            & (pixels[:, 0] < 100)
-            & (pixels[:, 2] < 100)))
-        healthy = channel_dominance < 3.0 and green_clip_fraction < 0.10
-        reports.append({
-            "eye": name,
-            "mean_bgr": [float(value) for value in mean_bgr],
-            "channel_dominance": channel_dominance,
-            "green_dominance": green_dominance,
-            "green_clip_fraction": green_clip_fraction,
-            "healthy": bool(healthy),
-        })
+_MEAN_CHANNEL_RATIO_LIMIT = 1.12
+_NEUTRAL_CHANNEL_RATIO_LIMIT = 1.10
+_STEREO_CHROMATICITY_DELTA_LIMIT = 0.010
+_MULTI_CAMERA_CHROMATICITY_DELTA_LIMIT = 0.03
+_GREEN_BALANCE_MIN = 0.95
+_GREEN_BALANCE_MAX = 1.10
+
+
+def _eye_color_report(name, image):
+    array = np.asarray(image)
+    if array.ndim != 3 or array.shape[2] < 3 or array.size == 0:
+        raise ValueError(f"invalid {name} image for stereo color check")
+    pixels = array[::8, ::8, :3].reshape(-1, 3).astype(np.float64)
+    mean_bgr = pixels.mean(axis=0)
+    mean_ratio = float(mean_bgr.max() / max(1.0, mean_bgr.min()))
+    brightness = pixels.mean(axis=1)
+    # Use bright mid-tones, not clipped white pixels. A clipped light-box
+    # background is [255, 255, 255] regardless of the ISP gains and can hide a
+    # very visible cast in the rest of the image.
+    bright_floor = np.percentile(brightness, 45.0)
+    usable = pixels[
+        (brightness >= bright_floor)
+        & (pixels.max(axis=1) < 248.0)
+        & (pixels.min(axis=1) > 24.0)]
+    minimum_usable = max(32, int(0.02 * len(pixels)))
+    neutral_pixels = usable if len(usable) >= minimum_usable else pixels
+    neutral_bgr = np.median(neutral_pixels, axis=0)
+    neutral_sum = float(neutral_bgr.sum())
+    chroma = neutral_bgr / neutral_sum if neutral_sum else np.zeros(3)
+    ratio = float(neutral_bgr.max() / max(1.0, neutral_bgr.min()))
+    dominance = float(
+        mean_bgr.max() / max(1.0, (mean_bgr.sum() - mean_bgr.max()) / 2.0))
+    green_dominance = float(
+        mean_bgr[1] / max(1.0, (mean_bgr[0] + mean_bgr[2]) / 2.0))
+    green_clip = float(np.mean(
+        (pixels[:, 1] >= 250) & (pixels[:, 0] < 100) & (pixels[:, 2] < 100)))
+    gross_healthy = (
+        dominance < 3.0 and green_clip < 0.10 and mean_bgr.mean() >= 8.0)
+    healthy = (gross_healthy
+               and mean_ratio <= _MEAN_CHANNEL_RATIO_LIMIT
+               and _GREEN_BALANCE_MIN <= green_dominance
+               <= _GREEN_BALANCE_MAX
+               and neutral_bgr.mean() >= 40.0
+               and ratio <= _NEUTRAL_CHANNEL_RATIO_LIMIT)
     return {
-        "healthy": bool(all(report["healthy"] for report in reports)),
+        "eye": name, "mean_bgr": mean_bgr.tolist(),
+        "mean_channel_ratio": mean_ratio,
+        "mean_channel_ratio_limit": _MEAN_CHANNEL_RATIO_LIMIT,
+        "channel_dominance": dominance, "green_dominance": green_dominance,
+        "green_balance_min": _GREEN_BALANCE_MIN,
+        "green_balance_max": _GREEN_BALANCE_MAX,
+        "green_clip_fraction": green_clip, "neutral_bgr": neutral_bgr.tolist(),
+        "neutral_chromaticity_bgr": chroma.tolist(),
+        "neutral_channel_ratio": ratio,
+        "neutral_channel_ratio_limit": _NEUTRAL_CHANNEL_RATIO_LIMIT,
+        "gross_healthy": bool(gross_healthy),
+        "healthy": bool(healthy)}
+
+
+def assess_stereo_color(left_bgr, right_bgr):
+    """Detect tint/clipping and disagreement between a ZED's two eyes."""
+    reports = [
+        _eye_color_report("left", left_bgr),
+        _eye_color_report("right", right_bgr)]
+    left_chroma = np.asarray(reports[0]["neutral_chromaticity_bgr"])
+    right_chroma = np.asarray(reports[1]["neutral_chromaticity_bgr"])
+    stereo_delta = float(np.max(np.abs(left_chroma - right_chroma)))
+    return {
+        "healthy": bool(all(report["healthy"] for report in reports)
+                        and stereo_delta <= _STEREO_CHROMATICITY_DELTA_LIMIT),
+        # Runtime scenes may contain hands, tools, or other large colored
+        # objects. Only catastrophic ISP corruption/clipping is meaningful
+        # after WB has been frozen and recording has started.
+        "runtime_healthy": bool(
+            all(report["gross_healthy"] for report in reports)),
         "eyes": {report["eye"]: report for report in reports},
+        "stereo_chromaticity_delta": stereo_delta,
+        "stereo_chromaticity_delta_limit": _STEREO_CHROMATICITY_DELTA_LIMIT,
     }
+
+
+def assess_multi_camera_color(reports):
+    """Require independently healthy rigs to agree on background color."""
+    rig_chromaticity = {}
+    for rig, report in reports.items():
+        eyes = report.get("eyes", {})
+        values = [np.asarray(eyes[eye]["neutral_chromaticity_bgr"])
+                  for eye in ("left", "right") if eye in eyes]
+        if len(values) == 2:
+            rig_chromaticity[rig] = np.mean(values, axis=0)
+    max_delta = 0.0
+    names = sorted(rig_chromaticity)
+    for index, first in enumerate(names):
+        for second in names[index + 1:]:
+            delta = np.abs(rig_chromaticity[first]
+                           - rig_chromaticity[second])
+            max_delta = max(max_delta, float(np.max(delta)))
+    complete = len(rig_chromaticity) == len(reports) and len(reports) >= 2
+    healthy = (complete
+               and all(item.get("healthy", False) for item in reports.values())
+               and max_delta <= _MULTI_CAMERA_CHROMATICITY_DELTA_LIMIT)
+    return {
+        "healthy": bool(healthy), "complete": bool(complete),
+        "rig_chromaticity_bgr": {
+            rig: value.tolist() for rig, value in rig_chromaticity.items()},
+        "max_rig_chromaticity_delta": max_delta,
+        "max_rig_chromaticity_delta_limit":
+            _MULTI_CAMERA_CHROMATICITY_DELTA_LIMIT}
+
 
 try:
     import pyzed.sl as sl
@@ -164,7 +241,8 @@ class ZedCamera:
 
         # Converge auto WB only after all other image controls have their final
         # values. Disabling WHITEBALANCE_AUTO without writing a temperature
-        # retains the auto algorithm's current sensor gains.
+        # retains the native ISP's current per-sensor gains. The temperature
+        # read-back is coarse and must not be written back as a substitute.
         if self.white_balance_auto_freeze_s > 0:
             self._freeze_auto_white_balance()
         else:
@@ -209,6 +287,7 @@ class ZedCamera:
                 "temperature_before_freeze": before,
                 "temperature_after_freeze": settings.get(
                     "whitebalance_temperature"),
+                "freeze_method": "disable_auto_retain_native_isp_gains",
                 "health": health,
             })
             if health["healthy"]:
@@ -219,6 +298,7 @@ class ZedCamera:
                     "temperature_before_freeze": before,
                     "temperature_after_freeze": settings.get(
                         "whitebalance_temperature"),
+                    "freeze_method": "disable_auto_retain_native_isp_gains",
                     "whitebalance_auto_after_freeze": settings.get(
                         "whitebalance_auto"),
                     "attempts": attempts,
@@ -226,39 +306,20 @@ class ZedCamera:
                     "stereo_color_health": health,
                 }
                 return
+            print(
+                f"[WB serial={self.serial_number}] attempt "
+                f"{attempt}/{max_attempts} rejected; retrying: "
+                f"left_mean={health['eyes']['left']['mean_bgr']}, "
+                f"right_mean={health['eyes']['right']['mean_bgr']}, "
+                f"stereo_delta={health['stereo_chromaticity_delta']:.4f}",
+                flush=True)
 
-        # Disabling auto can intermittently corrupt one ZED2 ISP. If all freeze
-        # attempts fail, return to continuous auto and verify both eyes instead
-        # of permitting a silently unusable recording.
-        fallback_started = time.monotonic()
+        # Continuous auto is unsuitable for color-based segmentation. Restore
+        # it only as a safe non-recording state, then block camera startup.
         self._set_camera_setting(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
-        fallback_frames = 0
-        while time.monotonic() - fallback_started < self.white_balance_auto_freeze_s:
-            if self.zed.grab(self._runtime) == sl.ERROR_CODE.SUCCESS:
-                fallback_frames += 1
-            else:
-                time.sleep(0.005)
-        total_frames += fallback_frames
-        health = self.current_stereo_color_health()
-        settings = self.camera_settings()
-        self.white_balance_freeze = {
-            "requested_warmup_s": self.white_balance_auto_freeze_s,
-            "actual_warmup_s": time.monotonic() - total_started,
-            "frames_grabbed": total_frames,
-            "temperature_before_freeze": attempts[-1][
-                "temperature_before_freeze"],
-            "temperature_after_freeze": settings.get(
-                "whitebalance_temperature"),
-            "whitebalance_auto_after_freeze": settings.get(
-                "whitebalance_auto"),
-            "attempts": attempts,
-            "fallback_to_continuous_auto": True,
-            "stereo_color_health": health,
-        }
-        if not health["healthy"]:
-            raise RuntimeError(
-                "ZED stereo color preflight failed after auto-WB retries and "
-                f"continuous-auto fallback: {health}")
+        raise RuntimeError(
+            "ZED stereo color preflight failed after deterministic auto-WB "
+            f"freeze retries: {attempts}")
 
     def current_stereo_color_health(self):
         """Retrieve the current pair and return gross per-eye color health."""

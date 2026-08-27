@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
+import copy
 import csv
 import json
 import os
@@ -220,7 +221,8 @@ def main_dual(args, rig_specs):
     """Capture two ZEDs and register both from one fixed ChArUco board."""
     import cv2
     from . import register as camera_register
-    from .zed_capture import ZedCamera, assess_stereo_color
+    from .zed_capture import (
+        ZedCamera, assess_multi_camera_color, assess_stereo_color)
 
     rig_ids = tuple(spec.rig_id for spec in rig_specs)
     field_registration = (
@@ -271,26 +273,46 @@ def main_dual(args, rig_specs):
              "pending": bool(args.autorecord),
              "deadline": time.monotonic() + 20.0,
              "reg_collecting": False, "reg_done": False, "notice": None,
-             "bad_color_checks": {rig: 0 for rig in rig_ids}}
+             "bad_color_checks": {rig: 0 for rig in rig_ids},
+             "bad_cross_camera_color_checks": 0}
     try:
         for spec in rig_specs:
             camera = ZedCamera(**_camera_kwargs(args, spec.serial_number))
             try:
+                if args.white_balance_auto_freeze_s > 0:
+                    print(
+                        f"[{spec.rig_id}][WB] warming native auto white "
+                        f"balance for {args.white_balance_auto_freeze_s:.1f}s; "
+                        "preview starts after both cameras are frozen",
+                        flush=True)
                 camera.open()
             except Exception as exc:
                 camera.close()
-                raise RuntimeError(
-                    f"could not open camera rig {spec.rig_id!r} "
+                message = (
+                    f"could not initialize camera rig {spec.rig_id!r} "
                     f"(ZED serial {spec.serial_number}) at "
-                    f"{args.resolution}@{args.fps}. If another configured ZED "
-                    "already opened, connect the cameras to separate USB 3 "
-                    "host controllers or reduce resolution/frame rate; SVO "
-                    "compression does not reduce live USB bandwidth."
-                ) from exc
+                    f"{args.resolution}@{args.fps}: {exc}")
+                if "ZED open failed" in str(exc):
+                    message += (
+                        ". Connect the cameras to separate USB 3 host "
+                        "controllers or reduce resolution/frame rate; SVO "
+                        "compression does not reduce live USB bandwidth.")
+                raise RuntimeError(message) from exc
             cameras[spec.rig_id] = camera
             info = camera.info()
             metadata["camera_rigs"][spec.rig_id] = info
             print(f"[{spec.rig_id}] ZED {info['serial']} {info['resolution']}@{args.fps}")
+            freeze = info.get("white_balance_freeze")
+            if freeze is not None:
+                print(
+                    f"[{spec.rig_id}][WB] auto-freeze complete: "
+                    f"{freeze['frames_grabbed']} frames, "
+                    f"{freeze['actual_warmup_s']:.2f}s, "
+                    f"temperature read-back "
+                    f"{freeze['temperature_before_freeze']} -> "
+                    f"{freeze['temperature_after_freeze']}, "
+                    f"auto={freeze['whitebalance_auto_after_freeze']}",
+                    flush=True)
             np.savez(os.path.join(session_dir, f"{spec.rig_id}_intrinsics.npz"),
                      K_left=camera.K, dist_left=camera.dist,
                      K_right=camera.K_right, dist_right=camera.dist_right,
@@ -301,6 +323,7 @@ def main_dual(args, rig_specs):
         stride = (max(1, int(round(args.fps / args.preview_fps)))
                   if args.preview_fps > 0 else 1)
         capture = MultiZedCapture(cameras, preview_stride=stride).start()
+        state["deadline"] = time.monotonic() + 20.0
         infos = {rig: cameras[rig].info() for rig in rig_ids}
         pose_file = open(os.path.join(session_dir, "board_poses.csv"),
                          "w", newline="", encoding="utf-8")
@@ -309,6 +332,7 @@ def main_dual(args, rig_specs):
             "camera_rig", "detection_eye", "timestamp_ns", "board", "corners",
             "tx_m", "ty_m", "tz_m", "rx_rad", "ry_rad", "rz_rad"])
         last_frames, color_health = {}, {}
+        multi_camera_color_health = None
         last_processed = {rig: 0 for rig in rig_ids}
         last_bundle_sequence = 0
 
@@ -317,12 +341,20 @@ def main_dual(args, rig_specs):
                 json.dump(metadata, stream, indent=2, sort_keys=True)
 
         def start_recording():
+            nonlocal multi_camera_color_health
             if capture.is_recording:
                 return
             bad = {rig: value for rig, value in color_health.items()
                    if not value["healthy"]}
-            if len(color_health) != 2 or bad:
-                raise RuntimeError(f"dual-camera color preflight failed: {bad}")
+            multi_camera_color_health = assess_multi_camera_color(color_health)
+            if (len(color_health) != 2 or bad
+                    or not multi_camera_color_health["healthy"]):
+                raise RuntimeError(
+                    "dual-camera color preflight failed: "
+                    f"per_rig={bad}, cross_rig={multi_camera_color_health}")
+            metadata["recording_color_preflight"] = {
+                "per_rig": copy.deepcopy(color_health),
+                "cross_rig": copy.deepcopy(multi_camera_color_health)}
             capture.start_recording(session_dir, session_id)
             try:
                 if em_recorder is not None:
@@ -466,18 +498,21 @@ def main_dual(args, rig_specs):
                             cv2.FONT_HERSHEY_SIMPLEX, .7, color, 2)
                 overlays[rig] = np.hstack((left_overlay, right_overlay))
 
+            multi_camera_color_health = assess_multi_camera_color(color_health)
             if state["pending"]:
                 if (len(color_health) == 2 and all(
-                        value["healthy"] for value in color_health.values())):
+                        value["healthy"] for value in color_health.values())
+                        and multi_camera_color_health["healthy"]):
                     start_recording()
                     state["pending"] = False
                 elif time.monotonic() >= state["deadline"]:
                     raise RuntimeError(
                         "dual-camera autorecord blocked for 20s by color "
-                        f"preflight: {color_health}")
+                        f"preflight: per_rig={color_health}, "
+                        f"cross_rig={multi_camera_color_health}")
             if capture.is_recording:
                 for rig, health in color_health.items():
-                    if health["healthy"]:
+                    if health["runtime_healthy"]:
                         state["bad_color_checks"][rig] = 0
                     else:
                         state["bad_color_checks"][rig] += 1
@@ -489,7 +524,7 @@ def main_dual(args, rig_specs):
                         stop_recording()
                         raise RuntimeError(
                             f"both SVOs stopped after 3 consecutive {rig} "
-                            f"stereo color failures: {health}")
+                            f"catastrophic ISP color failures: {health}")
             finish_registration_if_ready()
             if state["png"]:
                 for rig, frame in bundle.items():

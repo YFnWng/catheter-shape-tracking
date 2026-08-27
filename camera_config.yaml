@@ -18,13 +18,13 @@ camera:
   gamma: 5
 
   # Supplying both exposure and gain disables AEC/AGC.
-  exposure: 3
+  exposure: 6
   gain: 1
 
-  # Let auto white balance converge under the final fixed exposure and color
-  # controls, then freeze its current gains before previews/recording begin.
+  # Let native auto white balance converge under the final exposure and color
+  # controls, then disable auto while retaining the ISP's converged gains.
   white_balance_temperature: -1
-  white_balance_auto_freeze_s: 5.0
+  white_balance_auto_freeze_s: 8.0
   white_balance_auto_freeze_retries: 2
 
 recording:
