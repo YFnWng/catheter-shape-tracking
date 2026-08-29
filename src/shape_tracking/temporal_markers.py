@@ -95,14 +95,20 @@ def repair_stereo_marker_tracks(
         maximum_chord_residual_px: float = 12.0,
         interpolated_confidence: float = 0.55,
 ) -> dict[str, dict[str, np.ndarray]]:
-    """Repair four per-eye tracks with future and past image evidence.
+    """Repair marker tracks in any number of views with future/past evidence.
 
     The output remains image-space evidence. No ring centroid is made a hard
     curve constraint, and approximate inter-ring distances are not imposed.
     """
     timestamps = np.asarray(timestamps_ns, dtype=np.int64)
     output: dict[str, dict[str, np.ndarray]] = {}
-    for view in ("left", "right"):
+    views = tuple(centers_by_view)
+    if not views:
+        return output
+    required = (widths_by_view, confidence_by_view, observed_by_view)
+    if any(set(mapping) != set(views) for mapping in required):
+        raise ValueError("marker track view mappings do not have matching keys")
+    for view in views:
         centers = np.asarray(centers_by_view[view], dtype=np.float64).copy()
         widths = np.asarray(widths_by_view[view], dtype=np.float64).copy()
         confidence = np.asarray(
@@ -120,4 +126,3 @@ def repair_stereo_marker_tracks(
             "confidence": confidence, "observed": observed,
             "interpolated": interpolated}
     return output
-

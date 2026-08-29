@@ -32,6 +32,7 @@ capture = []
 shape-tracking-record = "shape_tracking.cli:main"
 shape-tracking-process = "shape_tracking.sequence:main"
 shape-tracking-process-image = "shape_tracking.image_sequence:main"
+shape-tracking-process-multi-image = "shape_tracking.multi_image_sequence:main"
 shape-tracking-fuse = "shape_tracking.fusion:main"
 
 [tool.setuptools.packages.find]

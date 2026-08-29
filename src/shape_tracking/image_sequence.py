@@ -50,6 +50,7 @@ from .materials import (
 )
 from .marked_segmentation import (
     catheter_color_likelihood,
+    extract_marked_chromatic_observation,
     extract_marked_chromatic_result,
     refine_marked_stereo_pair,
     reroute_marked_centerline,
@@ -204,6 +205,7 @@ class ImageProcessingConfig:
     sam_postprocess_workers: int = 2
     prompt_workers: int = 4
     chromatic_eye_workers: int = 2
+    dual_camera_observation_profile: bool = False
     preprocess_chunk_size: int = 16
     prefetch_frames: int = 16
     hdf_buffer_frames: int = 128
@@ -2304,7 +2306,8 @@ def _write_final_overlays(
         scale: float,
         write_video: bool,
         write_snapshots: bool,
-        snapshot_indices: set[int]) -> None:
+        snapshot_indices: set[int],
+        rig_id: str | None = None) -> None:
     """Render overlays after the non-causal interface pass has finalized."""
     import h5py
 
@@ -2321,7 +2324,7 @@ def _write_final_overlays(
         np.zeros(3, dtype=np.float64))[0][0]
     try:
         with h5py.File(output / "processed_shapes.h5", "r") as shapes, (
-                SvoReader(find_svo(session))) as svo:
+                SvoReader(find_svo(session, rig_id=rig_id))) as svo:
             valid = shapes["frames/valid"][:].astype(bool)
             shape_supported = (
                 shapes["quality/shape_temporal_supported"][:].astype(bool)
@@ -3661,14 +3664,15 @@ def _iter_preprocessed_frames(
 def _estimate_chromatic_backgrounds(
         session: Path,
         registration,
-        sample_count: int) -> tuple[np.ndarray, np.ndarray]:
+        sample_count: int,
+        rig_id: str | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Estimate the fixed scene from sparse samples of the complete SVO.
 
     The camera and light box are fixed, while the catheter moves.  A temporal
     median therefore retains the ChArUco board (including its colored edge
     fringes) but removes the moving catheter at almost every pixel.
     """
-    all_records = load_frame_index(session)
+    all_records = load_frame_index(session, rig_id=rig_id)
     if not all_records:
         raise ValueError("cannot estimate background without SVO frame records")
     count = int(np.clip(int(sample_count), 5, len(all_records)))
@@ -3678,7 +3682,7 @@ def _estimate_chromatic_backgrounds(
     right_crops: list[np.ndarray] = []
     left_roi = registration.roi_left_xywh
     right_roi = registration.roi_right_xywh
-    with SvoReader(find_svo(session)) as reader:
+    with SvoReader(find_svo(session, rig_id=rig_id)) as reader:
         for index in indices:
             _, left, right = reader.read(all_records[int(index)].svo_frame)
             for image, roi, output in (
@@ -3771,7 +3775,8 @@ def process_image_session(
         reconstruction_backend: str = "disparity",
         propagated_mask_h5: os.PathLike | str | None = None,
         cached_mask_h5: os.PathLike | str | None = None,
-        observations_only: bool = False) -> dict:
+        observations_only: bool = False,
+        rig_id: str | None = None) -> dict:
     initialization_started = time.perf_counter()
     config = config or ImageProcessingConfig()
     session = Path(session_path).resolve()
@@ -3779,10 +3784,12 @@ def process_image_session(
         Path(output_dir).resolve() if output_dir is not None
         else session / "processed_image")
     output.mkdir(parents=True, exist_ok=True)
-    registration = load_session_registration(session, require_em=False)
+    registration = load_session_registration(
+        session, require_em=False, rig_id=rig_id)
     markers = load_collection_markers(session)
     records = select_frame_records(
-        load_frame_index(session), markers, window, start_ns, end_ns,
+        load_frame_index(session, rig_id=rig_id), markers, window,
+        start_ns, end_ns,
         stride, max_frames)
     snapshot_count = int(max(1, snapshot_count))
     if snapshot_frames:
@@ -3838,7 +3845,8 @@ def process_image_session(
     metadata = {
         "session": session.name,
         "session_path": str(session),
-        "svo_path": str(find_svo(session)),
+        "svo_path": str(find_svo(session, rig_id=rig_id)),
+        "rig_id": rig_id,
         "registration_path": str(registration.path),
         "window": window,
         "start_ns": int(query_ns[0]),
@@ -3894,7 +3902,8 @@ def process_image_session(
             and config.chromatic_background_subtraction):
         chromatic_background_left, chromatic_background_right = (
             _estimate_chromatic_backgrounds(
-                session, registration, config.chromatic_background_samples))
+                session, registration, config.chromatic_background_samples,
+                rig_id=rig_id))
     if segmentation_backend == "chromatic_markers":
         workspace_mask_left = _projected_workspace_roi_mask(
             registration, right=False,
@@ -3952,7 +3961,7 @@ def process_image_session(
 
     try:
         svo_open_started = time.perf_counter()
-        with SvoReader(find_svo(session)) as svo:
+        with SvoReader(find_svo(session, rig_id=rig_id)) as svo:
             timing_totals_s["svo_open"] = (
                 time.perf_counter() - svo_open_started)
             record_iterator = iter(svo.iter_records(records))
@@ -4012,6 +4021,7 @@ def process_image_session(
                 status = "valid"
                 metrics: dict[str, float | int] = {}
                 left_result = right_result = None
+                left_chromatic_workspace = right_chromatic_workspace = None
                 full_geometry = distal_geometry = assembled = None
                 joint_reconstruction = None
                 try:
@@ -4100,7 +4110,11 @@ def process_image_session(
 
                         def extract_eye(arguments):
                             image, roi, base, previous, background, workspace = arguments
-                            return extract_marked_chromatic_result(
+                            extractor = (
+                                extract_marked_chromatic_observation
+                                if config.dual_camera_observation_profile
+                                else extract_marked_chromatic_result)
+                            return extractor(
                                 image, roi, base,
                                 config.chromatic_min_saturation,
                                 config.chromatic_min_value,
@@ -4120,6 +4134,9 @@ def process_image_session(
                                 extract_eye, extraction_arguments[1])
                             left_result, right_result = (
                                 left_future.result(), right_future.result())
+                        if config.dual_camera_observation_profile:
+                            left_result, left_chromatic_workspace = left_result
+                            right_result, right_chromatic_workspace = right_result
                         left_result, right_result = refine_marked_stereo_pair(
                             left_image, right_image,
                             left_result, right_result,
@@ -4164,61 +4181,82 @@ def process_image_session(
                                 previous_valid_results[0].material.points)
                             previous_right_points = (
                                 previous_valid_results[1].material.points)
-                        def reroute_eye(result, image, roi, previous):
+                        def reroute_eye(
+                                result, image, roi, previous, workspace):
                             return reroute_marked_centerline(
                                 result, image, roi,
                                 previous_points_xy=previous,
                                 minimum_marker_confidence=(
-                                    config.marker_min_confidence))
+                                    config.marker_min_confidence),
+                                workspace=workspace,
+                                use_temporal_interval_anchors=(
+                                    not config.dual_camera_observation_profile))
 
                         if chromatic_executor is None:
                             left_result = reroute_eye(
                                 left_result, left_image,
                                 registration.roi_left_xywh,
-                                previous_left_points)
+                                previous_left_points,
+                                left_chromatic_workspace)
                             right_result = reroute_eye(
                                 right_result, right_image,
                                 registration.roi_right_xywh,
-                                previous_right_points)
+                                previous_right_points,
+                                right_chromatic_workspace)
                         else:
                             left_future = chromatic_executor.submit(
                                 reroute_eye, left_result, left_image,
                                 registration.roi_left_xywh,
-                                previous_left_points)
+                                previous_left_points,
+                                left_chromatic_workspace)
                             right_future = chromatic_executor.submit(
                                 reroute_eye, right_result, right_image,
                                 registration.roi_right_xywh,
-                                previous_right_points)
+                                previous_right_points,
+                                right_chromatic_workspace)
                             left_result, right_result = (
                                 left_future.result(), right_future.result())
-                        left_result, right_result, sweep_metrics = (
-                            enforce_stereo_epipolar_sweep(
-                                left_result, right_result,
-                                left_image, right_image,
-                                registration.roi_left_xywh,
-                                registration.roi_right_xywh,
-                                base_left, base_right,
-                                previous_left_points_xy=previous_left_points,
-                                previous_right_points_xy=previous_right_points,
-                                minimum_marker_confidence=(
-                                    config.marker_min_confidence),
-                                minimum_sweep_deficit_px=(
-                                    config.marked_epipolar_sweep_deficit_px),
-                                row_half_width_px=(
-                                    config.marked_epipolar_sweep_row_half_width_px)))
+                        if config.dual_camera_observation_profile:
+                            sweep_metrics = {
+                                "epipolar_sweep_left_px": np.nan,
+                                "epipolar_sweep_right_px": np.nan,
+                                "epipolar_sweep_deficit_px": np.nan,
+                                "epipolar_sweep_enforced_view": 0,
+                                "epipolar_sweep_anchor_used": 0,
+                            }
+                        else:
+                            left_result, right_result, sweep_metrics = (
+                                enforce_stereo_epipolar_sweep(
+                                    left_result, right_result,
+                                    left_image, right_image,
+                                    registration.roi_left_xywh,
+                                    registration.roi_right_xywh,
+                                    base_left, base_right,
+                                    previous_left_points_xy=previous_left_points,
+                                    previous_right_points_xy=previous_right_points,
+                                    minimum_marker_confidence=(
+                                        config.marker_min_confidence),
+                                    minimum_sweep_deficit_px=(
+                                        config.marked_epipolar_sweep_deficit_px),
+                                    row_half_width_px=(
+                                        config.marked_epipolar_sweep_row_half_width_px)))
                         metrics.update(sweep_metrics)
                         # Local normal centering is independent of marker
                         # availability. Rings select order/topology; they must
                         # not decide whether a fallback route receives basic
                         # medial refinement.
                         if chromatic_executor is None:
-                            left_result = center_marked_route_on_mask(left_result)
-                            right_result = center_marked_route_on_mask(right_result)
+                            left_result = center_marked_route_on_mask(
+                                left_result, workspace=left_chromatic_workspace)
+                            right_result = center_marked_route_on_mask(
+                                right_result, workspace=right_chromatic_workspace)
                         else:
                             left_future = chromatic_executor.submit(
-                                center_marked_route_on_mask, left_result)
+                                center_marked_route_on_mask, left_result, 8,
+                                left_chromatic_workspace)
                             right_future = chromatic_executor.submit(
-                                center_marked_route_on_mask, right_result)
+                                center_marked_route_on_mask, right_result, 8,
+                                right_chromatic_workspace)
                             left_result, right_result = (
                                 left_future.result(), right_future.result())
                         for view, result in (
@@ -5865,7 +5903,8 @@ def process_image_session(
             output_fps, config.video_scale,
             write_video=write_video,
             write_snapshots=write_snapshots,
-            snapshot_indices=snapshot_indices)
+            snapshot_indices=snapshot_indices,
+            rig_id=rig_id)
         timing_totals_s["overlay_video_final"] = (
             time.perf_counter() - overlay_started)
 
@@ -5919,6 +5958,10 @@ def process_image_session(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", required=True)
+    parser.add_argument(
+        "--rig", default=None,
+        help=("camera rig ID in a multi-camera session; omitted preserves the "
+              "legacy single-camera registration/SVO behavior"))
     parser.add_argument("--sam-checkpoint", default=None)
     parser.add_argument(
         "--sam-config", default="configs/sam2.1/sam2.1_hiera_l.yaml")
@@ -6412,7 +6455,8 @@ def main(argv=None) -> None:
             reconstruction_backend=args.reconstruction_backend,
             propagated_mask_h5=args.propagated_mask_h5,
             cached_mask_h5=args.cached_mask_h5,
-            observations_only=args.observations_only)
+            observations_only=args.observations_only,
+            rig_id=args.rig)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 

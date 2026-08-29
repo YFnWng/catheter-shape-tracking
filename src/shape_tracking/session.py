@@ -91,7 +91,8 @@ class SessionRegistration:
 
 def load_session_registration(
         path_or_session: os.PathLike | str,
-        require_em: bool = True) -> SessionRegistration:
+        require_em: bool = True,
+        rig_id: str | None = None) -> SessionRegistration:
     """Load and validate the unified ``registration.json``."""
     path = Path(path_or_session)
     if path.is_dir():
@@ -99,7 +100,15 @@ def load_session_registration(
     with path.open(encoding="utf-8") as stream:
         document = json.load(stream)
     em = document.get("em") or {}
-    camera = document.get("camera") or {}
+    if rig_id is None:
+        camera = document.get("camera") or {}
+    else:
+        rigs = document.get("camera_rigs") or {}
+        if rig_id not in rigs:
+            raise ValueError(
+                f"camera rig {rig_id!r} is not registered in {path}; "
+                f"available rigs: {sorted(rigs)}")
+        camera = rigs[rig_id] or {}
     em_solved = em.get("transform_status") == "solved"
     if require_em and not em_solved:
         raise ValueError(f"EM registration is not solved in {path}")
@@ -413,10 +422,14 @@ def normalize_frame_records(records: list[FrameRecord]) -> list[FrameRecord]:
     return normalized
 
 
-def load_frame_index(path_or_session: os.PathLike | str) -> list[FrameRecord]:
+def load_frame_index(
+        path_or_session: os.PathLike | str,
+        rig_id: str | None = None) -> list[FrameRecord]:
     path = Path(path_or_session)
     if path.is_dir():
-        path = path / "frame_index.csv"
+        path = path / (
+            "frame_index.csv" if rig_id is None
+            else f"{rig_id}_frame_index.csv")
     rows = []
     with path.open(newline="", encoding="utf-8") as stream:
         for row in csv.DictReader(stream):
@@ -429,11 +442,20 @@ def load_frame_index(path_or_session: os.PathLike | str) -> list[FrameRecord]:
     return rows
 
 
-def find_svo(session: os.PathLike | str) -> Path:
-    paths = sorted(Path(session).glob("*.svo2")) + sorted(Path(session).glob("*.svo"))
+def find_svo(
+        session: os.PathLike | str,
+        rig_id: str | None = None) -> Path:
+    root = Path(session)
+    if rig_id is None:
+        paths = sorted(root.glob("*.svo2")) + sorted(root.glob("*.svo"))
+    else:
+        paths = sorted(root.glob(f"{rig_id}_*.svo2")) + sorted(
+            root.glob(f"{rig_id}_*.svo"))
     if len(paths) != 1:
         raise ValueError(
-            f"expected one SVO/SVO2 in {session}, found {len(paths)}")
+            f"expected one SVO/SVO2 in {session}"
+            + ("" if rig_id is None else f" for rig {rig_id!r}")
+            + f", found {len(paths)}")
     return paths[0]
 
 

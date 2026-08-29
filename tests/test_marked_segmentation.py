@@ -10,6 +10,7 @@ from shape_tracking.marked_segmentation import (
     _center_route_on_mask_medial,
     catheter_color_likelihood,
     decode_marker_candidates,
+    extract_marked_chromatic_observation,
     extract_marked_chromatic_result,
     enforce_stereo_epipolar_sweep,
     refine_marked_stereo_pair,
@@ -63,6 +64,19 @@ class MarkedSegmentationTests(unittest.TestCase):
         self.assertLess(np.linalg.norm(
             result.material.points[-1]
             - result.marker_centers_xy[3]), 3.0)
+
+    def test_dual_camera_workspace_is_reused_by_marker_routing(self):
+        image = self._image()
+        result, workspace = extract_marked_chromatic_observation(
+            image, (0, 0, 410, 140), np.array([18.0, 80.0]))
+        self.assertEqual(workspace.likelihood.shape, (140, 410))
+        self.assertEqual(workspace.medial_distance.shape, (140, 410))
+        routed = reroute_marked_centerline(
+            result, image, (0, 0, 410, 140), workspace=workspace,
+            use_temporal_interval_anchors=False)
+        self.assertIn("+marker_interval_route", routed.prompt.source)
+        self.assertLess(np.linalg.norm(
+            routed.material.points[-1] - routed.marker_centers_xy[3]), 4.0)
 
     def test_inferred_path_gate_accepts_stable_order_and_rejects_reversal(self):
         result = extract_marked_chromatic_result(

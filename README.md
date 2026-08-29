@@ -975,8 +975,182 @@ The session contains `primary_*.svo2`, `oblique_*.svo2`, one frame-index CSV per
 camera, and `camera_frame_pairs.csv`. Pairing is timestamp-based because USB
 ZED2 cameras do not provide a shared hardware trigger. `registration.json`
 stores both camera rigs, and four overlays named
-`registration_<rig>_<left|right>.png` verify the result. Offline reconstruction
-is still single-camera and does not consume this schema yet.
+`registration_<rig>_<left|right>.png` verify the result.
+
+The dual-camera offline entry point is separate from the original single-ZED
+pipeline, so old datasets and commands retain their behavior. It first writes
+one reusable 2D observation cache per rig, then fits a common cubic 3D B-spline
+in robot-base coordinates to all four calibrated views. The recorded
+`camera_frame_pairs.csv` is authoritative; each output row uses the midpoint of
+the two camera timestamps as its canonical time and retains both source frame
+numbers and the inter-rig offset.
+
+```bash
+python -m shape_tracking.multi_image_sequence \
+  --session SESSION \
+  --outdir SESSION/processed_image_dual_zed \
+  --stage all \
+  --window run_and_return \
+  --rig-workers 2 \
+  --chromatic-eye-workers 2 \
+  --prefetch-frames 16
+```
+
+The two rig caches run in separate spawned processes so each owns its ZED
+decoder and output file. Within each process the two eyes use two worker
+threads. Set `--rig-workers 1` only for serial debugging. The dual-camera
+observation profile reuses each eye's color likelihood, red support, mask
+distance fields, and temporal distance field throughout the frame. It does not
+run the legacy within-ZED tight-V epipolar-sweep repair or insert dense temporal
+anchors into every marker interval. Instead, projected nonlocal overlap and
+four-view disagreement softly downweight an ill-conditioned view; evidence
+from both physical rigs remains represented when choosing a 3D initializer.
+
+The expensive image observations can be generated once and reused while the
+3D objective is refined:
+
+```bash
+python -m shape_tracking.multi_image_sequence \
+  --session SESSION --outdir OUTPUT --stage observations
+
+python -m shape_tracking.multi_image_sequence \
+  --session SESSION --outdir OUTPUT_RECONSTRUCTED --stage reconstruct \
+  --primary-observations-h5 OUTPUT/observations_primary/processed_shapes.h5 \
+  --oblique-observations-h5 OUTPUT/observations_oblique/processed_shapes.h5 \
+  --write-snapshots --snapshot-count 24
+```
+
+Render a four-panel overlay video from a completed output without rerunning any
+image or 3D processing:
+
+```bash
+python -m shape_tracking.multi_image_sequence \
+  --session SESSION --outdir OUTPUT --stage overlay \
+  --overlay-scale 1.0
+```
+
+This writes `OUTPUT/overlay_four_view.mp4` at the paired-camera frame rate.
+Scale 1.0 produces 1920x1080; scale 0.5 produces 960x540. The renderer reads
+`OUTPUT/processed_shapes.h5` and both `OUTPUT/observations_<rig>` caches by
+default. `--overlay-video PATH` overrides the destination, while `--stride`
+and `--max-frames` can generate a quick inspection video.
+
+The result preserves the training-facing `distal`, `full`, `frames`, `quality`,
+and `robot` groups. It additionally stores raw common-spline coefficients,
+the causal coefficient-velocity estimate used to compensate the cameras' small
+timestamp offset,
+per-view residuals under `multi_view` and `quality`, plus both camera
+calibrations under `calibration/{primary,oblique}`. The 33 unpaired primary
+frames in the 20260827 session—and unpaired frames generally—are intentionally
+skipped rather than assigned an incorrect cross-rig match.
+
+Marker identity is associated globally and symmetrically in the four-view
+stage; neither physical camera is a permanent reference. Each stereo rig first
+contributes an ordered set of unique current-frame red components, treating
+collapsed detections of one physical ring under adjacent labels as a duplicate.
+Monotonic assignments of those components to physical ring IDs are then scored
+jointly by calibrated cross-rig geometry, temporal 3D continuity, and only a
+weak source-label prior. If exactly one rig sees four unique stereo rings, that
+complete rig becomes the temporary reference for that frame only. Its missing
+counterpart observations are projected into the incomplete rig; the direction
+reverses automatically whenever the other rig is complete. Short remaining
+gaps are interpolated bidirectionally afterward. Associated centers, original
+source slots, cross-camera inferred flags, and the per-frame temporary-reference
+code are saved under `multi_view` for audit. Approximate ring spacing is not a
+hard constraint.
+
+Image-space curve agreement is also converted into depth symmetrically. For
+each rig whose two routes are currently non-overlapping and order-preserving,
+a monotonic dynamic-programming match pairs samples by rectified epipolar row
+while allowing perspective-dependent arclength stretch. The point matches are
+reduced to one robust spatial B-spline disparity field. Its basis is fixed,
+its second differences are penalized, and red-ring disparities are soft
+supporting observations. It deliberately has no causal previous-frame prior:
+a stale disparity after a short rejection otherwise produces a visible depth
+hold followed by a snap. Temporal smoothing is applied later to the complete
+3D coefficient sequence with zero phase. The reconstructed opposite-eye route
+must remain close to that eye's independently extracted cyan centerline. This
+support changes the 3D residual weight continuously; only grossly incomplete,
+high-epipolar-error, severely unsupported, or implausibly collapsed matches
+are rejected. When the
+cross-rig consistency gate selects one trusted rig, that rig supplies the
+ordered stereo curve; when neither rig is excluded, topology, epipolar quality,
+and short reference hysteresis choose the stronger candidate without a
+camera-name preference. The matched pixels are triangulated and enter the
+spline objective only after a frame-level 3D innovation gate. The accepted
+depth residual is quadratic but finite-weight; all image centerline residuals
+remain robust, including the nearly excluded ill-posed rig. It does not
+hard-pin spline parameters or marker arclengths. This removes the depth null
+direction left by independent nearest-curve losses while preventing a wrong
+2D branch from overpowering the selected well-posed rig. The selected rig,
+match count, epipolar p95, triangulated curve length, disparity coefficients,
+opposite-eye support, innovation, and selection score are stored as
+`multi_view/ordered_stereo_reference_code` and
+`quality/multi_view_ordered_stereo_*`.
+
+The selected ordered-stereo rig is also the fitting reference for the complete
+frame, not only for the auxiliary depth residual. Its two image routes and its
+stereo depth determine the spline; the other physical camera remains available
+for cross-validation and unweighted residual diagnostics at negligible fit
+weight. A valid reference remains latched until it fails the geometric gates
+or an explicit cross-rig inconsistency selects the other rig. Transient
+agreement between the two tip estimates therefore cannot suddenly restore a
+tight-V camera to full weight. The effective reference is stored separately as
+`multi_view/fit_reference_rig_code`; `trusted_rig_code` continues to describe
+the endpoint-disagreement decision itself.
+
+The normal fast path uses one initializer and adaptive view weights. If the
+unweighted symmetric residual of a currently trusted physical camera exceeds
+9 px, the reconstruction enters reacquisition: all-view, primary, oblique, and
+temporal hypotheses are optimized independently with topology-only weights and
+compared using the worst trusted-camera residual. A deliberately excluded rig
+cannot force this expensive search on every subsequent frame. Entering or
+leaving a single-trusted-rig state triggers one reacquisition, after which a
+healthy latched rig uses the ordinary velocity-aware temporal fit. The selected
+image-supported reacquisition basin receives one final common temporal polish;
+the polish is retained only when its image/terminal/length score remains within
+the configured tolerance. Thus stale temporal state cannot suppress newly
+recovered image evidence, while equivalent initializer basins cannot alternate
+frame by frame. A direct result with an entire-camera residual above 12 px is
+excluded from temporal observations and training; the existing short-gap
+coefficient interpolation may recover it when valid shapes bracket a
+sufficiently short interval. Reacquisition reason bits and accepted temporal
+polishes are stored under `multi_view/reacquisition_*`; per-rig image metrics
+remain under `quality/multi_view_*_rig_*`. The two image-error defaults can be
+overridden with `--reacquisition-rig-error-px` and
+`--whole-rig-max-symmetric-px`.
+
+Before the joint fit, marker-3 is also triangulated independently by each ZED
+stereo pair. If the two rig-level tip estimates disagree by more than 8 mm,
+they cannot describe one simultaneous catheter shape. The rig whose tip is
+temporally continuous and whose projected topology is better conditioned is
+then trusted; the inconsistent rig remains in diagnostics at negligible fit
+weight. This permits a well-posed oblique ZED to reconstruct the curve by
+itself instead of being compromised by a failed primary pair. The selected rig,
+both stereo tip estimates, and their disagreement are stored under
+`multi_view`/`quality`.
+
+Dense centerline nearest-neighbor terms use an explicitly transformed soft-L1
+loss. Endpoint, length, smoothness, stretch, and temporal priors remain
+quadratic rather than being accidentally saturated by a global robust loss.
+Marker 0 and marker 3 are projected onto the cyan centerline before acting as
+strong soft endpoint observations. Reacquisition and direct validity consider
+terminal error, centerline coverage, and gross length deviation in addition to
+mean reprojection. Final terminal QC is repeated after temporal filtering.
+The dual-camera zero-phase coefficient smoother uses a 3 Hz cutoff and bounded
+0.15 observation blend for both body and terminal coefficients. Earlier higher
+terminal bandwidth passed visible marker-3/disparity jitter into the final
+near-tip curve. A completed reconstruction can be re-filtered without decoding
+images or repeating the per-frame optimizer:
+
+```bash
+python -m shape_tracking.multi_image_sequence \
+  --session SESSION --outdir RESMOOTHED_OUTPUT --stage resmooth \
+  --shape-h5 ORIGINAL_OUTPUT/processed_shapes.h5
+```
+
+The source HDF5 is not modified. The resmoothed copy refreshes final terminal
+and length QC and writes `resmooth_summary.json`.
 
 For bandwidth stability, connect the cameras to separate USB 3 host controllers
 when possible. Never depend on USB enumeration order; update the serial numbers

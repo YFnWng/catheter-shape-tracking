@@ -9,6 +9,7 @@ in the *identity score* below; it is never imposed on the reconstructed curve.
 from __future__ import annotations
 
 from dataclasses import replace
+from dataclasses import dataclass
 from itertools import combinations
 
 import cv2
@@ -29,6 +30,23 @@ from .segmentation import Centerline, resample_arclength
 
 
 EXPECTED_MARKER_COORDINATES_MM = np.array([0.0, 10.0, 30.0, 57.0])
+
+
+@dataclass(frozen=True)
+class MarkedChromaticWorkspace:
+    """Reusable dense image products for one eye in one frame.
+
+    The arrays are deliberately ephemeral and are not stored in HDF5.  The
+    dual-camera observation path keeps this object only until the result for
+    the current frame has been written.
+    """
+
+    likelihood: np.ndarray
+    red_support: np.ndarray
+    medial_distance: np.ndarray
+    outside_distance: np.ndarray
+    temporal_distance: np.ndarray | None
+    proximal_likelihood: np.ndarray
 
 
 def _catheter_color_features(
@@ -88,7 +106,8 @@ def _continuous_color_path(
         anchors_xy: list[np.ndarray],
         catheter_mask: np.ndarray,
         previous_points_xy: np.ndarray | None = None,
-        segment_likelihoods: list[np.ndarray] | None = None) -> np.ndarray:
+        segment_likelihoods: list[np.ndarray] | None = None,
+        workspace: MarkedChromaticWorkspace | None = None) -> np.ndarray:
     """Trace ordered anchors through an independently segmented catheter.
 
     A short weak-paint/specular gap may still be crossed, but distance outside
@@ -109,9 +128,15 @@ def _continuous_color_path(
     local_likelihood = np.asarray(
         likelihood[y0:y1, x0:x1], dtype=np.float64)
     local_mask = np.uint8(catheter_mask[y0:y1, x0:x1] > 0)
-    core_distance = cv2.distanceTransform(local_mask, cv2.DIST_L2, 5)
-    outside_distance = cv2.distanceTransform(
-        np.uint8(local_mask == 0), cv2.DIST_L2, 5)
+    if workspace is None:
+        core_distance = cv2.distanceTransform(local_mask, cv2.DIST_L2, 5)
+        outside_distance = cv2.distanceTransform(
+            np.uint8(local_mask == 0), cv2.DIST_L2, 5)
+    else:
+        core_distance = np.asarray(
+            workspace.medial_distance[y0:y1, x0:x1], dtype=np.float64)
+        outside_distance = np.asarray(
+            workspace.outside_distance[y0:y1, x0:x1], dtype=np.float64)
     static_cost = (
         1.0
         + 10.0 / (core_distance + 0.75)
@@ -120,7 +145,11 @@ def _continuous_color_path(
             0.0,
             30.0 + 12.0 * np.clip(outside_distance, 0.0, 6.0)))
     temporal_cost = np.zeros_like(static_cost)
-    if previous_points_xy is not None:
+    if workspace is not None and workspace.temporal_distance is not None:
+        temporal_cost = 0.08 * np.clip(
+            workspace.temporal_distance[y0:y1, x0:x1] - 4.0,
+            0.0, 25.0)
+    elif previous_points_xy is not None:
         previous = np.asarray(previous_points_xy, dtype=np.float64)
         previous = previous[np.all(np.isfinite(previous), axis=1)]
         if len(previous) >= 2:
@@ -182,7 +211,8 @@ def _soft_marker_anchor(
         likelihood: np.ndarray,
         red_support: np.ndarray,
         center_local_xy: np.ndarray,
-        width_px: float) -> np.ndarray | None:
+        width_px: float,
+        medial_distance: np.ndarray | None = None) -> np.ndarray | None:
     """Select a medial shaft pixel near a ring without using its centroid."""
     height, width = mask.shape
     center = np.asarray(center_local_xy, dtype=np.float64)
@@ -209,7 +239,9 @@ def _soft_marker_anchor(
         allowed &= ring_region
     if not np.any(allowed):
         return None
-    medial = cv2.distanceTransform(np.uint8(mask > 0), cv2.DIST_L2, 5)
+    medial = (
+        cv2.distanceTransform(np.uint8(mask > 0), cv2.DIST_L2, 5)
+        if medial_distance is None else np.asarray(medial_distance))
     score = (
         2.5 * medial[y0:y1, x0:x1]
         + 2.0 * likelihood[y0:y1, x0:x1]
@@ -223,7 +255,8 @@ def _soft_temporal_anchor(
         mask: np.ndarray,
         likelihood: np.ndarray,
         predicted_local_xy: np.ndarray,
-        search_radius_px: float = 12.0) -> np.ndarray | None:
+        search_radius_px: float = 12.0,
+        medial_distance: np.ndarray | None = None) -> np.ndarray | None:
     """Move one material-coordinate prediction onto current mask support."""
     height, width = mask.shape
     predicted = np.asarray(predicted_local_xy, dtype=np.float64)
@@ -239,7 +272,9 @@ def _soft_temporal_anchor(
     allowed = (mask[y0:y1, x0:x1] > 0) & (spatial <= radius)
     if not np.any(allowed):
         return None
-    medial = cv2.distanceTransform(np.uint8(mask > 0), cv2.DIST_L2, 5)
+    medial = (
+        cv2.distanceTransform(np.uint8(mask > 0), cv2.DIST_L2, 5)
+        if medial_distance is None else np.asarray(medial_distance))
     score = (
         1.8 * medial[y0:y1, x0:x1]
         + 2.0 * likelihood[y0:y1, x0:x1]
@@ -292,6 +327,7 @@ def _insert_material_temporal_anchors(
         mask: np.ndarray,
         likelihood: np.ndarray,
         roi: tuple[int, int, int, int],
+        medial_distance: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], list[int]]:
     """Add ordered interior supports from each previous marker interval."""
     if previous_points_xy is None:
@@ -319,7 +355,8 @@ def _insert_material_temporal_anchors(
                     np.interp(target_s, interval_s, interval[:, coordinate])
                     for coordinate in range(2)], dtype=np.float64)
                 local = _soft_temporal_anchor(
-                    mask, likelihood, prediction - [x, y])
+                    mask, likelihood, prediction - [x, y],
+                    medial_distance=medial_distance)
                 if local is not None:
                     inserted.append(local + [x, y])
         destination_id = destination_marker_ids[interval_index]
@@ -334,7 +371,8 @@ def _insert_material_temporal_anchors(
 def _smooth_marker_route(
         raw_points_xy: np.ndarray,
         mask: np.ndarray,
-        roi: tuple[int, int, int, int]) -> np.ndarray:
+        roi: tuple[int, int, int, int],
+        medial_distance: np.ndarray | None = None) -> np.ndarray:
     """Smooth pixel stair-steps while preserving one genuine tight bend."""
     points = np.asarray(raw_points_xy, dtype=np.float64)
     raw_length = float(cumulative_arclength(points)[-1])
@@ -359,14 +397,16 @@ def _smooth_marker_route(
     supported[in_bounds] = mask[
         local[in_bounds, 1], local[in_bounds, 0]] > 0
     smoothed[~supported] = resampled[~supported]
-    return _center_route_on_mask_medial(smoothed, mask, roi)
+    return _center_route_on_mask_medial(
+        smoothed, mask, roi, medial_distance=medial_distance)
 
 
 def _center_route_on_mask_medial(
         points_xy: np.ndarray,
         mask: np.ndarray,
         roi: tuple[int, int, int, int],
-        maximum_offset_px: int = 6) -> np.ndarray:
+        maximum_offset_px: int = 6,
+        medial_distance: np.ndarray | None = None) -> np.ndarray:
     """Move one existing topology toward its local mask medial ridge.
 
     Candidate motion is restricted to the local normal of the already ordered
@@ -378,7 +418,9 @@ def _center_route_on_mask_medial(
     if len(points) < 3:
         return points.copy()
     binary = np.asarray(mask > 0, dtype=np.uint8)
-    medial = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    medial = (
+        cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+        if medial_distance is None else np.asarray(medial_distance))
     x, y, width, height = roi
     tangent = np.empty_like(points)
     tangent[1:-1] = points[2:] - points[:-2]
@@ -428,7 +470,8 @@ def _center_route_on_mask_medial(
 
 def center_marked_route_on_mask(
         result: SamMaterialResult,
-        maximum_offset_px: int = 8) -> SamMaterialResult:
+        maximum_offset_px: int = 8,
+        workspace: MarkedChromaticWorkspace | None = None) -> SamMaterialResult:
     """Center any existing route without requiring marker observations.
 
     Marker-ordered routing decides material topology when the rings are
@@ -439,15 +482,19 @@ def center_marked_route_on_mask(
     material = result.material
     points = _center_route_on_mask_medial(
         material.points, material.mask, material.roi,
-        maximum_offset_px=maximum_offset_px)
+        maximum_offset_px=maximum_offset_px,
+        medial_distance=(
+            None if workspace is None else workspace.medial_distance))
     if len(points) != len(material.points) or not np.all(np.isfinite(points)):
         return result
     fraction = float(np.clip(
         material.distal_boundary_fraction, 0.0, 1.0))
     boundary = int(np.clip(round(
         fraction * max(len(points) - 1, 1)), 0, len(points) - 1))
-    distance = cv2.distanceTransform(
-        np.uint8(material.mask > 0), cv2.DIST_L2, 5)
+    distance = (
+        cv2.distanceTransform(
+            np.uint8(material.mask > 0), cv2.DIST_L2, 5)
+        if workspace is None else workspace.medial_distance)
     x, y, width, height = material.roi
     local = np.rint(points - [x, y]).astype(int)
     local[:, 0] = np.clip(local[:, 0], 0, width - 1)
@@ -478,7 +525,9 @@ def reroute_marked_centerline(
         minimum_marker_confidence: float = 0.35,
         epipolar_sweep_y: float | None = None,
         epipolar_sweep_after_marker_id: int | None = None,
-        epipolar_sweep_row_half_width_px: int = 3) -> SamMaterialResult:
+        epipolar_sweep_row_half_width_px: int = 3,
+        workspace: MarkedChromaticWorkspace | None = None,
+        use_temporal_interval_anchors: bool = True) -> SamMaterialResult:
     """Build a soft marker-ordered route through a potentially merged V mask.
 
     Marker identity supplies material interval order. Each marker contributes
@@ -503,7 +552,13 @@ def reroute_marked_centerline(
     x, y, width, height = roi
     mask = np.asarray(result.material.mask, dtype=np.uint8)
     crop = np.asarray(image[y:y + height, x:x + width], dtype=np.uint8)
-    likelihood, red_support = _catheter_color_features(crop)
+    if workspace is None:
+        likelihood, red_support = _catheter_color_features(crop)
+        medial_distance = None
+    else:
+        likelihood = workspace.likelihood
+        red_support = workspace.red_support
+        medial_distance = workspace.medial_distance
     anchors = [np.asarray(result.material.points[0], dtype=np.float64)]
     anchor_ids = [-1]
     for marker_id in range(4):
@@ -511,7 +566,8 @@ def reroute_marked_centerline(
             continue
         local = _soft_marker_anchor(
             mask, likelihood, red_support,
-            centers[marker_id] - [x, y], widths[marker_id])
+            centers[marker_id] - [x, y], widths[marker_id],
+            medial_distance=medial_distance)
         if local is None:
             continue
         anchors.append(local + [x, y])
@@ -549,12 +605,14 @@ def reroute_marked_centerline(
                 sweep_inserted = True
 
     destination_marker_ids = anchor_ids[1:].copy()
-    anchors, destination_marker_ids = _insert_material_temporal_anchors(
-        anchors, destination_marker_ids, previous_points_xy,
-        mask, likelihood, roi)
+    if use_temporal_interval_anchors:
+        anchors, destination_marker_ids = _insert_material_temporal_anchors(
+            anchors, destination_marker_ids, previous_points_xy,
+            mask, likelihood, roi, medial_distance=medial_distance)
 
-    proximal = np.maximum(
-        _proximal_blue_likelihood(crop), 0.20 * likelihood)
+    proximal = (
+        np.maximum(_proximal_blue_likelihood(crop), 0.20 * likelihood)
+        if workspace is None else workspace.proximal_likelihood)
     segment_likelihoods = []
     for destination_id in destination_marker_ids:
         # Only the registered-base to interface interval is proximal. Missing
@@ -565,7 +623,8 @@ def reroute_marked_centerline(
         path_rc = _continuous_color_path(
             likelihood, roi, anchors, mask,
             previous_points_xy=previous_points_xy,
-            segment_likelihoods=segment_likelihoods)
+            segment_likelihoods=segment_likelihoods,
+            workspace=workspace)
     except (RuntimeError, ValueError):
         return result
     raw_points = np.column_stack([
@@ -580,10 +639,13 @@ def reroute_marked_centerline(
     if not (0.90 * anchor_chord_length
             <= new_length <= 1.80 * max(anchor_chord_length, 1.0)):
         return result
-    points = _smooth_marker_route(raw_points, mask, roi)
+    points = _smooth_marker_route(
+        raw_points, mask, roi, medial_distance=medial_distance)
     boundary = int(np.argmin(np.linalg.norm(
         points - centers[0], axis=1)))
-    distance = cv2.distanceTransform(np.uint8(mask > 0), cv2.DIST_L2, 5)
+    distance = (
+        cv2.distanceTransform(np.uint8(mask > 0), cv2.DIST_L2, 5)
+        if medial_distance is None else medial_distance)
     local_points = np.rint(points - [x, y]).astype(int)
     local_points[:, 0] = np.clip(local_points[:, 0], 0, width - 1)
     local_points[:, 1] = np.clip(local_points[:, 1], 0, height - 1)
@@ -1700,7 +1762,7 @@ def decode_marker_candidates(
     return centers, widths, confidence, observed
 
 
-def extract_marked_chromatic_result(
+def _extract_marked_chromatic_result(
         bgr: np.ndarray,
         roi: tuple[int, int, int, int],
         base_point_xy: np.ndarray,
@@ -1709,7 +1771,9 @@ def extract_marked_chromatic_result(
         previous_points_xy: np.ndarray | None = None,
         background_bgr: np.ndarray | None = None,
         minimum_background_difference: int = 18,
-        workspace_mask: np.ndarray | None = None) -> SamMaterialResult:
+        workspace_mask: np.ndarray | None = None,
+        build_workspace: bool = False,
+        ) -> tuple[SamMaterialResult, MarkedChromaticWorkspace | None]:
     """Return a pipeline-compatible color mask, centerline, tip, and markers."""
     x, y, width, height = roi
     crop = bgr[y:y + height, x:x + width]
@@ -1737,6 +1801,30 @@ def extract_marked_chromatic_result(
     mask = _edge_refine_catheter_mask(
         bgr[y:y + height, x:x + width], mask, likelihood,
         workspace_mask=workspace_mask)
+    processing_workspace = None
+    if build_workspace:
+        binary = np.uint8(mask > 0)
+        medial_distance = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+        outside_distance = cv2.distanceTransform(
+            np.uint8(binary == 0), cv2.DIST_L2, 5)
+        temporal_distance = None
+        if previous_points_xy is not None:
+            previous = np.asarray(previous_points_xy, dtype=np.float64)
+            previous = previous[np.all(np.isfinite(previous), axis=1)]
+            if len(previous) >= 2:
+                prior = np.zeros(mask.shape, dtype=np.uint8)
+                local = np.rint(previous - [x, y]).astype(np.int32)
+                cv2.polylines(prior, [local], False, 255, 3, cv2.LINE_AA)
+                temporal_distance = cv2.distanceTransform(
+                    np.uint8(prior == 0), cv2.DIST_L2, 5)
+        processing_workspace = MarkedChromaticWorkspace(
+            likelihood=likelihood,
+            red_support=red_support,
+            medial_distance=medial_distance,
+            outside_distance=outside_distance,
+            temporal_distance=temporal_distance,
+            proximal_likelihood=np.maximum(
+                _proximal_blue_likelihood(crop), 0.20 * likelihood))
     # Marker detection uses paint chromaticity inside the edge-refined object.
     # There is no generic HSV component and no route to a neutral background.
     color_support = cv2.bitwise_and(
@@ -1756,7 +1844,8 @@ def extract_marked_chromatic_result(
         likelihood, roi,
         [np.asarray(base_point_xy, dtype=np.float64), distal_anchor],
         mask,
-        previous_points_xy)
+        previous_points_xy,
+        workspace=processing_workspace)
     points = np.column_stack([
         path[:, 1] + x, path[:, 0] + y]).astype(np.float64)
     # Rings 0--2 identify material locations but are not image-space
@@ -1781,7 +1870,10 @@ def extract_marked_chromatic_result(
     # subsequent joint two-view fit.
     tip = None
 
-    distance = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    distance = (
+        cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        if processing_workspace is None
+        else processing_workspace.medial_distance)
     sampled_radius = distance[
         np.clip(path[:, 0], 0, mask.shape[0] - 1),
         np.clip(path[:, 1], 0, mask.shape[1] - 1)]
@@ -1842,7 +1934,7 @@ def extract_marked_chromatic_result(
         positive_xy=material.points[sample_indices].copy(),
         negative_xy=np.empty((0, 2), dtype=np.float64),
         source="marked_chromatic")
-    return SamMaterialResult(
+    result = SamMaterialResult(
         material=material,
         prompt=prompt,
         sam_iou=float("nan"),
@@ -1856,3 +1948,42 @@ def extract_marked_chromatic_result(
         marker_observed=observed,
         marker_raw_cluster_count=len(candidates),
         tip_source="wide_red_ring_center")
+    return result, processing_workspace
+
+
+def extract_marked_chromatic_result(
+        bgr: np.ndarray,
+        roi: tuple[int, int, int, int],
+        base_point_xy: np.ndarray,
+        minimum_saturation: int = 55,
+        minimum_value: int = 30,
+        previous_points_xy: np.ndarray | None = None,
+        background_bgr: np.ndarray | None = None,
+        minimum_background_difference: int = 18,
+        workspace_mask: np.ndarray | None = None) -> SamMaterialResult:
+    """Legacy marked extraction API; behavior and return type are unchanged."""
+    return _extract_marked_chromatic_result(
+        bgr, roi, base_point_xy, minimum_saturation, minimum_value,
+        previous_points_xy, background_bgr, minimum_background_difference,
+        workspace_mask, build_workspace=False)[0]
+
+
+def extract_marked_chromatic_observation(
+        bgr: np.ndarray,
+        roi: tuple[int, int, int, int],
+        base_point_xy: np.ndarray,
+        minimum_saturation: int = 55,
+        minimum_value: int = 30,
+        previous_points_xy: np.ndarray | None = None,
+        background_bgr: np.ndarray | None = None,
+        minimum_background_difference: int = 18,
+        workspace_mask: np.ndarray | None = None,
+        ) -> tuple[SamMaterialResult, MarkedChromaticWorkspace]:
+    """Extract a marked observation and retain reusable dense intermediates."""
+    result, workspace = _extract_marked_chromatic_result(
+        bgr, roi, base_point_xy, minimum_saturation, minimum_value,
+        previous_points_xy, background_bgr, minimum_background_difference,
+        workspace_mask, build_workspace=True)
+    if workspace is None:  # pragma: no cover - enforced by build_workspace
+        raise RuntimeError("chromatic workspace was not constructed")
+    return result, workspace
