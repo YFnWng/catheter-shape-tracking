@@ -82,7 +82,12 @@ def load_robot_streams(session_or_bag: str | Path) -> RobotStreams:
         raise ImportError("robot alignment requires `pip install rosbags`") from exc
 
     path = Path(session_or_bag)
-    bag = path / "rosbag" if (path / "rosbag").is_dir() else path
+    if (path / "rosbag").is_dir():
+        bag = path / "rosbag"
+    elif (path / "robot_bag").is_dir():
+        bag = path / "robot_bag"
+    else:
+        bag = path
     if not bag.is_dir():
         raise FileNotFoundError(f"ROS bag directory does not exist: {bag}")
 

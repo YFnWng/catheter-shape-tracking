@@ -56,6 +56,7 @@ EYES = ("left", "right")
 VIEW_IDS = tuple(f"{rig}_{eye}" for rig in RIGS for eye in EYES)
 LENGTH_REJECTION_FLAG = np.uint16(1 << 6)
 WHOLE_RIG_REJECTION_FLAG = np.uint16(1 << 7)
+ABRUPT_OBSERVATION_REJECTION_FLAG = np.uint16(1 << 8)
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,12 @@ class MultiCameraConfig:
     ordered_disparity_max_right_support_p95_px: float = 8.0
     ordered_disparity_support_sigma_px: float = 5.0
     ordered_stereo_max_innovation_mm: float = 4.0
+    refine_cross_rig_registration: bool = True
+    cross_rig_registration_min_pairs: int = 200
+    cross_rig_registration_max_initial_error_mm: float = 10.0
+    cross_rig_registration_max_translation_mm: float = 8.0
+    cross_rig_registration_max_rotation_deg: float = 3.0
+    reject_abrupt_observation_jumps: bool = False
 
 
 class ObservationCache:
@@ -129,10 +136,13 @@ class ObservationCache:
         self.svo_frames = np.asarray(self.file["frames/svo_frame"], np.int64)
         self.timestamps_ns = np.asarray(
             self.file["frames/timestamp_ns"], np.int64)
+        self.observation_valid = np.asarray(
+            self.file["frames/observation_valid"], dtype=bool)
         self.index_by_svo = {
             int(frame): index for index, frame in enumerate(self.svo_frames)}
-        if not np.all(self.file["frames/observation_valid"][:]):
-            raise ValueError(f"observation cache contains invalid rows: {path}")
+        if len(self.observation_valid) != len(self.svo_frames):
+            raise ValueError(
+                f"observation validity length does not match frames: {path}")
         centers = {
             eye: self.file[f"images/{eye}/marker_centers_px"][:]
             for eye in EYES}
@@ -260,7 +270,7 @@ def build_observation_caches(
                 summaries[rig_id] = summary
     for rig_id in RIGS:
         summary = summaries[rig_id]
-        if summary["observation_valid_frame_count"] != summary["frame_count"]:
+        if summary["processed_frame_count"] != summary["frame_count"]:
             raise RuntimeError(
                 f"{rig_id} observation cache is incomplete: {summary}")
         paths[rig_id] = str(
@@ -342,6 +352,187 @@ def _triangulate_marker_pair(
         return None
     point = homogeneous[:3] / homogeneous[3] * 1000.0
     return point if np.all(np.isfinite(point)) else None
+
+
+def _rigid_alignment(
+        source: np.ndarray, target: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Least-squares rigid transform mapping ``source`` onto ``target``."""
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if source.shape != target.shape or source.ndim != 2 or source.shape[1] != 3:
+        raise ValueError("rigid-alignment inputs must be matching (N, 3) arrays")
+    if len(source) < 3:
+        raise ValueError("rigid alignment requires at least three points")
+    source_center = np.mean(source, axis=0)
+    target_center = np.mean(target, axis=0)
+    u, _, vt = np.linalg.svd(
+        (source - source_center).T @ (target - target_center))
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0.0:
+        vt[-1] *= -1.0
+        rotation = vt.T @ u.T
+    translation = target_center - rotation @ source_center
+    return rotation, translation
+
+
+def _robust_rigid_alignment(
+        source: np.ndarray, target: np.ndarray,
+        maximum_initial_error_mm: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """IRLS-like trimmed rigid alignment for cross-rig marker positions."""
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    finite = np.all(np.isfinite(source), axis=1) & np.all(
+        np.isfinite(target), axis=1)
+    finite &= np.linalg.norm(source - target, axis=1) <= float(
+        maximum_initial_error_mm)
+    inliers = finite.copy()
+    for _ in range(6):
+        if np.count_nonzero(inliers) < 3:
+            break
+        rotation, translation = _rigid_alignment(
+            source[inliers], target[inliers])
+        residual = np.linalg.norm(
+            (rotation @ source.T).T + translation - target, axis=1)
+        center = float(np.median(residual[inliers]))
+        mad = float(np.median(np.abs(residual[inliers] - center)))
+        cutoff = min(float(maximum_initial_error_mm),
+                     max(1.0, center + 3.5 * 1.4826 * mad))
+        updated = finite & (residual <= cutoff)
+        if np.array_equal(updated, inliers):
+            break
+        inliers = updated
+    if np.count_nonzero(inliers) < 3:
+        raise ValueError("cross-rig rigid alignment has too few inliers")
+    rotation, translation = _rigid_alignment(
+        source[inliers], target[inliers])
+    return rotation, translation, inliers
+
+
+def _refine_cross_rig_registration(
+        registrations: dict[str, object], marker_centers: np.ndarray,
+        marker_inferred: np.ndarray,
+        marker_temporal_outliers: dict[str, np.ndarray],
+        config: MultiCameraConfig,
+) -> tuple[dict[str, object], dict]:
+    """Align oblique stereo triangulations to the primary base coordinates.
+
+    The board registration remains the initial estimate and the primary rig
+    remains the robot-base anchor. Only a small, robust SE(3) correction is
+    permitted. Cross-camera-inferred markers and temporally corrupt rig rows
+    are excluded so repaired observations cannot calibrate the cameras.
+    """
+    diagnostic = {
+        "enabled": bool(config.refine_cross_rig_registration),
+        "applied": False,
+        "anchor_rig": "primary",
+        "corrected_rig": "oblique",
+    }
+    if not config.refine_cross_rig_registration:
+        return registrations, diagnostic
+    templates = {}
+    for rig in RIGS:
+        registration = registrations[rig]
+        for eye in EYES:
+            transform = (registration.left_camera_T_base if eye == "left"
+                         else registration.right_camera_T_base)
+            templates[(rig, eye)] = _projection_matrix(ViewObservation(
+                view_id=f"{rig}_{eye}", K=registration.K,
+                camera_T_base=transform,
+                centerline_xy=np.empty((0, 2), dtype=np.float64)))
+    points = {rig: [] for rig in RIGS}
+    count = len(marker_centers)
+    view_index = {name: index for index, name in enumerate(VIEW_IDS)}
+    for frame in range(count):
+        if any(marker_temporal_outliers[rig][frame] > 0 for rig in RIGS):
+            continue
+        for marker in range(4):
+            if np.any(marker_inferred[frame, :, marker]):
+                continue
+            pair = {}
+            for rig in RIGS:
+                left = marker_centers[
+                    frame, view_index[f"{rig}_left"], marker]
+                right = marker_centers[
+                    frame, view_index[f"{rig}_right"], marker]
+                if not (np.all(np.isfinite(left))
+                        and np.all(np.isfinite(right))):
+                    break
+                pair[rig] = _triangulate_marker_pair(
+                    left, templates[(rig, "left")],
+                    right, templates[(rig, "right")])
+                if pair[rig] is None:
+                    break
+            if len(pair) == len(RIGS):
+                for rig in RIGS:
+                    points[rig].append(pair[rig])
+    primary = np.asarray(points["primary"], dtype=np.float64)
+    oblique = np.asarray(points["oblique"], dtype=np.float64)
+    diagnostic["candidate_pair_count"] = int(len(primary))
+    if len(primary) < config.cross_rig_registration_min_pairs:
+        diagnostic["reason"] = "insufficient_marker_pairs"
+        return registrations, diagnostic
+    rotation, translation_mm, inliers = _robust_rigid_alignment(
+        oblique, primary,
+        config.cross_rig_registration_max_initial_error_mm)
+    rotation_deg = float(np.degrees(np.arccos(np.clip(
+        (np.trace(rotation) - 1.0) * 0.5, -1.0, 1.0))))
+    translation_norm_mm = float(np.linalg.norm(translation_mm))
+    before = np.linalg.norm(oblique[inliers] - primary[inliers], axis=1)
+    after = np.linalg.norm(
+        (rotation @ oblique[inliers].T).T + translation_mm
+        - primary[inliers], axis=1)
+    diagnostic.update({
+        "inlier_pair_count": int(np.count_nonzero(inliers)),
+        "rotation_matrix": rotation.tolist(),
+        "rotation_angle_deg": rotation_deg,
+        "translation_mm": translation_mm.tolist(),
+        "translation_norm_mm": translation_norm_mm,
+        "before_median_mm": float(np.median(before)),
+        "before_p95_mm": float(np.percentile(before, 95)),
+        "after_median_mm": float(np.median(after)),
+        "after_p95_mm": float(np.percentile(after, 95)),
+    })
+    if (rotation_deg > config.cross_rig_registration_max_rotation_deg
+            or translation_norm_mm
+            > config.cross_rig_registration_max_translation_mm):
+        diagnostic["reason"] = "correction_exceeds_safety_limit"
+        return registrations, diagnostic
+    correction = np.eye(4, dtype=np.float64)
+    correction[:3, :3] = rotation
+    correction[:3, 3] = translation_mm * 1e-3
+    base_correction_inverse = np.linalg.inv(correction)
+    oblique_registration = registrations["oblique"]
+    refined = dict(registrations)
+    refined["oblique"] = replace(
+        oblique_registration,
+        left_camera_T_base=(
+            oblique_registration.left_camera_T_base
+            @ base_correction_inverse),
+        right_camera_T_base=(
+            oblique_registration.right_camera_T_base
+            @ base_correction_inverse))
+    diagnostic["applied"] = True
+    diagnostic["reason"] = "robust_marker_alignment"
+    return refined, diagnostic
+
+
+def _fit_reference_from_available_rigs(
+        trusted_rig: str | None, available_rig_mask: int,
+) -> tuple[str | None, set[str]]:
+    """Use all healthy rigs jointly; return one reference only as fallback."""
+    available = {
+        rig for rig, bit in (("primary", 1), ("oblique", 2))
+        if int(available_rig_mask) & bit}
+    if trusted_rig in available:
+        return trusted_rig, {trusted_rig}
+    if len(available) == 1:
+        rig = next(iter(available))
+        return rig, {rig}
+    if len(available) == 2:
+        return None, available
+    return None, set()
 
 
 def _monotonic_epipolar_curve_matches(
@@ -625,11 +816,14 @@ def _select_ordered_stereo_curve(
         observations: list[ViewObservation], trusted_rig: str | None,
         previous_rig: str | None, config: MultiCameraConfig,
         disparity_states: dict[str, dict] | None = None,
-        rig_timestamps_ns: dict[str, int] | None = None) -> dict | None:
+        rig_timestamps_ns: dict[str, int] | None = None,
+        corrupted_rigs: set[str] | None = None) -> dict | None:
     disparity_states = disparity_states or {}
     rig_timestamps_ns = rig_timestamps_ns or {}
+    corrupted_rigs = set() if corrupted_rigs is None else set(corrupted_rigs)
     candidates = {
         rig: candidate for rig in RIGS
+        if rig not in corrupted_rigs
         if (candidate := _ordered_stereo_curve_candidate(
             observations, rig, config,
             previous_disparity_coefficients=(
@@ -637,10 +831,16 @@ def _select_ordered_stereo_curve(
             previous_timestamp_ns=(
                 disparity_states.get(rig, {}).get("timestamp_ns")),
             timestamp_ns=rig_timestamps_ns.get(rig))) is not None}
-    if trusted_rig is not None:
-        return candidates.get(trusted_rig)
     if not candidates:
         return None
+    # Cross-rig endpoint consistency is advisory. If that rig's current image
+    # is corrupt or topologically unusable, immediately fall back to the other
+    # independently valid stereo rig.
+    if trusted_rig is not None and trusted_rig in candidates:
+        selected = candidates[trusted_rig]
+        selected["available_rig_mask"] = sum(
+            (1 if rig == "primary" else 2) for rig in candidates)
+        return selected
     best = max(candidates.values(), key=lambda item: item["score"])
     previous = candidates.get(previous_rig)
     # Both surviving candidates have already passed topology, epipolar,
@@ -649,9 +849,10 @@ def _select_ordered_stereo_curve(
     # must not change the objective (and therefore the depth basin) from one
     # frame to the next.  An explicit cross-rig inconsistency decision above
     # still overrides this latch immediately.
-    if previous is not None:
-        return previous
-    return best
+    selected = previous if previous is not None else best
+    selected["available_rig_mask"] = sum(
+        (1 if rig == "primary" else 2) for rig in candidates)
+    return selected
 
 
 def _marker_hypothesis_residuals(
@@ -1218,7 +1419,7 @@ def _create_output(
     import h5py
 
     output = h5py.File(path, "w")
-    output.attrs["schema_version"] = 23
+    output.attrs["schema_version"] = 26
     output.attrs["mode"] = "dual_zed_four_view_shape_tracking"
     output.attrs["coordinate_frame"] = "robot_base"
     output.attrs["position_units"] = "mm"
@@ -1229,6 +1430,9 @@ def _create_output(
     output.attrs["processing_config_json"] = json.dumps(
         asdict(config), sort_keys=True)
     output.attrs["metadata_json"] = json.dumps(metadata, sort_keys=True)
+    if "cross_rig_registration_refinement" in metadata:
+        output.attrs["cross_rig_registration_refinement_json"] = json.dumps(
+            metadata["cross_rig_registration_refinement"], sort_keys=True)
     output.attrs["learning_rejection_flags_json"] = json.dumps({
         1: "reconstruction_invalid",
         2: "temporal_long_gap_unsupported",
@@ -1251,6 +1455,8 @@ def _create_output(
     ds("frames/learning_valid", (count,), np.uint8, 0)
     ds("frames/learning_rejection_flags", (count,), np.uint16, 0)
     ds("frames/observation_valid", (count,), np.uint8, 0)
+    for rig in RIGS:
+        ds(f"frames/{rig}_observation_valid", (count,), np.uint8, 0)
     ds("frames/primary_svo_frame", (count,), np.int32, -1)
     ds("frames/oblique_svo_frame", (count,), np.int32, -1)
     ds("frames/primary_timestamp_ns", (count,), np.int64, 0)
@@ -1289,7 +1495,12 @@ def _create_output(
     ds("multi_view/ordered_stereo_disparity_coefficients_px",
        (count, config.ordered_disparity_basis_count))
     ds("multi_view/marker_reference_code", (count,), np.uint8, 0)
+    ds("multi_view/marker_temporal_outlier_count", (count,), np.uint8, 0)
+    ds("multi_view/ordered_stereo_available_rig_mask",
+       (count,), np.uint8, 0)
     for rig in RIGS:
+        ds(f"multi_view/{rig}_marker_temporal_outlier_count",
+           (count,), np.uint8, 0)
         ds(f"multi_view/{rig}_stereo_terminal_base_mm", (count, 3))
     for view_id in VIEW_IDS:
         ds(f"multi_view/{view_id}_marker_centers_px", (count, 4, 2))
@@ -1333,6 +1544,7 @@ def _create_output(
             "multi_view_ordered_stereo_innovation_mm",
             "multi_view_ordered_stereo_innovation_rejected",
             "multi_view_ordered_stereo_disparity_temporal_used",
+            "abrupt_observation_jump_rejected",
             "distal_spline_basis_count", "distal_spline_internal_knot_count",
             "distal_spline_rms_residual_mm"):
         ds(f"quality/{name}", (count,))
@@ -1362,6 +1574,30 @@ def _create_output(
         group.attrs["baseline_m"] = registration.baseline_m
         group.attrs["zed_serial"] = registration.zed_serial
     return output
+
+
+def _registrations_with_saved_calibration(
+        session: Path, shapes,
+) -> dict[str, object]:
+    """Load the exact refined transforms used to create a shape HDF5."""
+    registrations = {
+        rig: load_session_registration(
+            session, require_em=False, rig_id=rig) for rig in RIGS}
+    if "calibration" not in shapes:
+        return registrations
+    for rig in RIGS:
+        path = f"calibration/{rig}"
+        if path not in shapes:
+            continue
+        saved = shapes[path]
+        registrations[rig] = replace(
+            registrations[rig],
+            K=np.asarray(saved["camera_matrix"], dtype=np.float64),
+            left_camera_T_base=np.asarray(
+                saved["left_camera_T_base"], dtype=np.float64),
+            right_camera_T_base=np.asarray(
+                saved["right_camera_T_base"], dtype=np.float64))
+    return registrations
 
 
 def reconstruct_multi_camera_session(
@@ -1416,12 +1652,21 @@ def reconstruct_multi_camera_session(
     marker_centers = []
     marker_widths = []
     marker_confidence = []
+    marker_temporal_outlier_count = []
+    marker_temporal_outlier_count_by_rig = {rig: [] for rig in RIGS}
     for primary_index, oblique_index, *_ in rows:
         per_view = []
         per_view_widths = []
         per_view_confidence = []
+        temporal_outliers_by_rig = {rig: 0 for rig in RIGS}
         for rig, source_index in (
                 ("primary", primary_index), ("oblique", oblique_index)):
+            if not caches[rig].observation_valid[source_index]:
+                # A decoded row that failed observation extraction is a
+                # rig-local corruption event. Marker repair may provide
+                # finite values for temporal continuity, but it must not make
+                # this camera eligible as the frame's stereo reference.
+                temporal_outliers_by_rig[rig] += 1
             for eye in EYES:
                 per_view.append(np.asarray(
                     caches[rig].marker_tracks[eye]["centers"][source_index],
@@ -1432,9 +1677,16 @@ def reconstruct_multi_camera_session(
                 per_view_confidence.append(np.asarray(
                     caches[rig].marker_tracks[eye]["confidence"][source_index],
                     dtype=np.float64))
+                temporal_outliers_by_rig[rig] += int(np.count_nonzero(
+                    caches[rig].marker_tracks[eye]["outlier"][source_index]))
         marker_centers.append(per_view)
         marker_widths.append(per_view_widths)
         marker_confidence.append(per_view_confidence)
+        marker_temporal_outlier_count.append(sum(
+            temporal_outliers_by_rig.values()))
+        for rig in RIGS:
+            marker_temporal_outlier_count_by_rig[rig].append(
+                temporal_outliers_by_rig[rig])
     (marker_centers, marker_source_slots, marker_inferred,
      marker_reference_code, _) = _associate_cross_camera_marker_identities(
         np.asarray(marker_centers), np.asarray(marker_widths),
@@ -1444,6 +1696,12 @@ def reconstruct_multi_camera_session(
         (marker_source_slots >= 0)
         & (marker_source_slots != physical_slots))
     cross_marker_rejected = marker_reassigned
+    for rig in RIGS:
+        marker_temporal_outlier_count_by_rig[rig] = np.asarray(
+            marker_temporal_outlier_count_by_rig[rig], dtype=np.uint8)
+    registrations, cross_rig_registration = _refine_cross_rig_registration(
+        registrations, marker_centers, marker_inferred,
+        marker_temporal_outlier_count_by_rig, config)
     robot = align_robot_streams(load_robot_streams(session), timestamps)
     metadata = {
         "session": session.name,
@@ -1452,10 +1710,17 @@ def reconstruct_multi_camera_session(
             rig: str(Path(path).resolve()) for rig, path in observation_h5.items()},
         "rigs": list(RIGS),
         "view_ids": list(VIEW_IDS),
+        "cross_rig_registration_refinement": cross_rig_registration,
     }
     h5_path = output_dir / "processed_shapes.h5"
     output = _create_output(
         h5_path, len(rows), config, registrations, metadata)
+    output["multi_view/marker_temporal_outlier_count"][:] = np.asarray(
+        marker_temporal_outlier_count, dtype=np.uint8)
+    for rig in RIGS:
+        output[
+            f"multi_view/{rig}_marker_temporal_outlier_count"
+        ][:] = marker_temporal_outlier_count_by_rig[rig]
     for view, view_id in enumerate(VIEW_IDS):
         output[f"multi_view/{view_id}_marker_centers_px"][:] = (
             marker_centers[:, view])
@@ -1489,7 +1754,17 @@ def reconstruct_multi_camera_session(
             output["frames/oblique_timestamp_ns"][index] = oblique_ns
             output["frames/inter_rig_offset_ms"][index] = (
                 (oblique_ns - primary_ns) * 1e-6)
-            output["frames/observation_valid"][index] = 1
+            rig_observation_valid = {
+                "primary": bool(
+                    caches["primary"].observation_valid[primary_index]),
+                "oblique": bool(
+                    caches["oblique"].observation_valid[oblique_index]),
+            }
+            for rig in RIGS:
+                output[f"frames/{rig}_observation_valid"][index] = int(
+                    rig_observation_valid[rig])
+            output["frames/observation_valid"][index] = int(any(
+                rig_observation_valid.values()))
             offsets = {
                 "primary": (primary_ns - midpoint_ns) * 1e-9,
                 "oblique": (oblique_ns - midpoint_ns) * 1e-9,
@@ -1501,18 +1776,22 @@ def reconstruct_multi_camera_session(
                         ("primary", primary_index),
                         ("oblique", oblique_index)):
                     for eye in EYES:
-                        observations.append(caches[rig].view(
-                            source_index, eye, registrations[rig], offsets[rig],
-                            marker_override=marker_centers[
-                                index, view_ordinal]))
-                        output[
-                            f"multi_view/{rig}_{eye}_axial_endpoints_px"
-                        ][index] = observations[-1].axial_markers_xy[[0, 3]]
+                        if rig_observation_valid[rig]:
+                            observations.append(caches[rig].view(
+                                source_index, eye, registrations[rig],
+                                offsets[rig], marker_override=marker_centers[
+                                    index, view_ordinal]))
+                            output[
+                                f"multi_view/{rig}_{eye}_axial_endpoints_px"
+                            ][index] = observations[-1].axial_markers_xy[[0, 3]]
                         view_ordinal += 1
                 (trusted_rig, stereo_terminals,
                  terminal_disagreement_mm) = _select_consistent_rig(
                     observations, previous_terminal_base_mm,
                     config.max_cross_rig_endpoint_disagreement_mm)
+                corrupted_rigs = {
+                    rig for rig in RIGS
+                    if marker_temporal_outlier_count_by_rig[rig][index] > 0}
                 ordered_stereo = _select_ordered_stereo_curve(
                     observations, trusted_rig,
                     accepted_ordered_stereo_rig, config,
@@ -1520,20 +1799,34 @@ def reconstruct_multi_camera_session(
                     rig_timestamps_ns={
                         "primary": int(primary_ns),
                         "oblique": int(oblique_ns),
-                    })
-                # The ordered stereo rig is not merely an auxiliary depth
-                # term: once selected, its internally consistent image pair
-                # defines the complete fitting objective.  The other camera
-                # remains in residual diagnostics but cannot pull the spline
-                # through an ill-posed branch when a transient endpoint gate
-                # happens to call both rigs consistent.
-                fit_reference_rig = (
-                    trusted_rig if trusted_rig is not None else
-                    (None if ordered_stereo is None else
-                     ordered_stereo["rig"]))
-                fit_rigs = (
-                    set(RIGS) if fit_reference_rig is None else
-                    {fit_reference_rig})
+                    },
+                    corrupted_rigs=corrupted_rigs)
+                output[
+                    "multi_view/ordered_stereo_available_rig_mask"
+                ][index] = (
+                    0 if ordered_stereo is None else
+                    ordered_stereo["available_rig_mask"])
+                usable_trusted_rig = (
+                    trusted_rig
+                    if trusted_rig is not None
+                    and trusted_rig not in corrupted_rigs else None)
+                available_rig_mask = (
+                    0 if ordered_stereo is None else
+                    int(ordered_stereo["available_rig_mask"]))
+                fit_reference_rig, fit_rigs = (
+                    _fit_reference_from_available_rigs(
+                        usable_trusted_rig, available_rig_mask))
+                if not fit_rigs:
+                    # No rig passed the ordered-stereo topology gates. Retain
+                    # any decoded, non-corrupt image evidence for diagnostics
+                    # and possible temporal recovery, but final learning QC
+                    # still rejects the frame through the zero available mask.
+                    fit_rigs = {
+                        rig for rig in RIGS
+                        if rig not in corrupted_rigs
+                        and rig_observation_valid[rig]}
+                    if len(fit_rigs) == 1:
+                        fit_reference_rig = next(iter(fit_rigs))
                 fit_observations = _rig_restricted_observations(
                     observations, fit_reference_rig,
                     config.excluded_rig_weight)
@@ -1546,9 +1839,15 @@ def reconstruct_multi_camera_session(
                 for rig, terminal in stereo_terminals.items():
                     output[f"multi_view/{rig}_stereo_terminal_base_mm"][
                         index] = terminal
-                if trusted_rig is not None:
-                    previous_terminal_base_mm = stereo_terminals[trusted_rig]
-                elif all(rig in stereo_terminals for rig in RIGS):
+                if usable_trusted_rig is not None:
+                    previous_terminal_base_mm = stereo_terminals[
+                        usable_trusted_rig]
+                elif (ordered_stereo is not None
+                      and ordered_stereo["rig"] in stereo_terminals):
+                    previous_terminal_base_mm = stereo_terminals[
+                        ordered_stereo["rig"]]
+                elif (not corrupted_rigs
+                      and all(rig in stereo_terminals for rig in RIGS)):
                     previous_terminal_base_mm = 0.5 * (
                         stereo_terminals["primary"]
                         + stereo_terminals["oblique"])
@@ -1956,6 +2255,25 @@ def reconstruct_multi_camera_session(
             if "frames/curve_temporally_interpolated" in output
             else np.zeros(len(flags), dtype=bool))
         flags[whole_rig_failure & ~interpolated] |= WHOLE_RIG_REJECTION_FLAG
+        primary_corrupt = output[
+            "multi_view/primary_marker_temporal_outlier_count"][:] > 0
+        oblique_corrupt = output[
+            "multi_view/oblique_marker_temporal_outlier_count"][:] > 0
+        both_rigs_corrupt = primary_corrupt & oblique_corrupt
+        no_usable_stereo_rig = (
+            output["multi_view/ordered_stereo_available_rig_mask"][:] == 0)
+        # Corruption is camera-specific.  One bad rig must not invalidate a
+        # frame reconstructed from the other independently usable stereo rig.
+        # Reject only simultaneous corruption, or a frame for which every
+        # non-corrupt rig is topologically/epipolarly unusable (including a
+        # good camera viewing an ill-posed configuration).
+        abrupt_jump = both_rigs_corrupt | no_usable_stereo_rig
+        abrupt_rejected = (
+            abrupt_jump if config.reject_abrupt_observation_jumps else
+            np.zeros(len(flags), dtype=bool))
+        flags[abrupt_rejected] |= ABRUPT_OBSERVATION_REJECTION_FLAG
+        output["quality/abrupt_observation_jump_rejected"][:] = (
+            abrupt_rejected.astype(np.uint8))
         final_terminal = np.full(
             (len(points), len(VIEW_IDS), 2), np.nan, dtype=np.float32)
         for view_ordinal, view_id in enumerate(VIEW_IDS):
@@ -2025,6 +2343,7 @@ def reconstruct_multi_camera_session(
             32: "final_image_fit",
             64: "distal_arc_length_outside_learning_range",
             128: "whole_camera_image_fit",
+            256: "abrupt_observation_jump",
         }, sort_keys=True)
         output.flush()
         valid_count = int(np.count_nonzero(output["frames/valid"][:]))
@@ -2042,6 +2361,7 @@ def reconstruct_multi_camera_session(
         "valid_frame_count": valid_count,
         "learning_valid_count": learning_count,
         "status_counts": status_counts,
+        "cross_rig_registration_refinement": cross_rig_registration,
         "temporal_smoothing": smoothing,
         "interpolation": interpolation,
         "elapsed_s": time.perf_counter() - started,
@@ -2056,6 +2376,207 @@ def _unpack_mask(dataset, index: int) -> np.ndarray:
     return np.unpackbits(
         np.asarray(dataset[index]), bitorder="little",
         count=width * height).reshape(height, width)
+
+
+def validate_cross_rig_registration(
+        session: Path, shape_h5: Path, output_dir: Path,
+        snapshot_count: int = 24,
+) -> dict:
+    """Audit the marker-derived SE(3) correction without spline fitting."""
+    import h5py
+
+    session = Path(session).resolve()
+    shape_h5 = Path(shape_h5).resolve()
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    original = {
+        rig: load_session_registration(
+            session, require_em=False, rig_id=rig) for rig in RIGS}
+    with h5py.File(shape_h5, "r") as shapes:
+        centers = np.stack([
+            shapes[f"multi_view/{view}_marker_centers_px"][:]
+            for view in VIEW_IDS], axis=1)
+        inferred = np.stack([
+            shapes[f"multi_view/{view}_marker_cross_camera_inferred"][:]
+            for view in VIEW_IDS], axis=1).astype(bool)
+        temporal_outliers = {
+            rig: np.asarray(shapes[
+                f"multi_view/{rig}_marker_temporal_outlier_count"][:])
+            for rig in RIGS}
+        timestamps_ns = np.asarray(shapes["frames/timestamp_ns"][:], np.int64)
+        source_frames = {
+            rig: np.asarray(
+                shapes[f"frames/{rig}_svo_frame"][:], np.int64)
+            for rig in RIGS}
+    refined, diagnostic = _refine_cross_rig_registration(
+        original, centers, inferred, temporal_outliers,
+        MultiCameraConfig())
+    if not diagnostic.get("applied"):
+        report = {"shape_h5": str(shape_h5), **diagnostic}
+        (output_dir / "cross_rig_registration_validation.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+        return report
+
+    view_index = {name: index for index, name in enumerate(VIEW_IDS)}
+    primary_projections = {}
+    for eye in EYES:
+        transform = (original["primary"].left_camera_T_base
+                     if eye == "left" else
+                     original["primary"].right_camera_T_base)
+        primary_projections[eye] = (
+            original["primary"].K @ transform[:3])
+    per_frame_before = np.full(len(centers), np.nan, dtype=np.float64)
+    per_frame_after = np.full(len(centers), np.nan, dtype=np.float64)
+    primary_points = np.full(
+        (len(centers), 4, 3), np.nan, dtype=np.float64)
+    for frame in range(len(centers)):
+        before_errors = []
+        after_errors = []
+        for marker in range(4):
+            left = centers[
+                frame, view_index["primary_left"], marker]
+            right = centers[
+                frame, view_index["primary_right"], marker]
+            if not (np.all(np.isfinite(left))
+                    and np.all(np.isfinite(right))
+                    and not np.any(inferred[frame, :, marker])):
+                continue
+            point = _triangulate_marker_pair(
+                left, primary_projections["left"],
+                right, primary_projections["right"])
+            if point is None:
+                continue
+            primary_points[frame, marker] = point
+            for eye in EYES:
+                observed = centers[
+                    frame, view_index[f"oblique_{eye}"], marker]
+                if not np.all(np.isfinite(observed)):
+                    continue
+                old_transform = (
+                    original["oblique"].left_camera_T_base
+                    if eye == "left" else
+                    original["oblique"].right_camera_T_base)
+                new_transform = (
+                    refined["oblique"].left_camera_T_base
+                    if eye == "left" else
+                    refined["oblique"].right_camera_T_base)
+                old_xy = project_points(
+                    original["oblique"].K, old_transform,
+                    point[None])[0][0]
+                new_xy = project_points(
+                    refined["oblique"].K, new_transform,
+                    point[None])[0][0]
+                if np.all(np.isfinite(old_xy)):
+                    before_errors.append(float(np.linalg.norm(
+                        old_xy - observed)))
+                if np.all(np.isfinite(new_xy)):
+                    after_errors.append(float(np.linalg.norm(
+                        new_xy - observed)))
+        if before_errors:
+            per_frame_before[frame] = float(np.median(before_errors))
+        if after_errors:
+            per_frame_after[frame] = float(np.median(after_errors))
+    finite = np.isfinite(per_frame_before) & np.isfinite(per_frame_after)
+    report = {
+        "shape_h5": str(shape_h5),
+        **diagnostic,
+        "validation_frame_count": int(np.count_nonzero(finite)),
+        "cross_reprojection_before_median_px": float(np.median(
+            per_frame_before[finite])),
+        "cross_reprojection_before_p95_px": float(np.percentile(
+            per_frame_before[finite], 95)),
+        "cross_reprojection_after_median_px": float(np.median(
+            per_frame_after[finite])),
+        "cross_reprojection_after_p95_px": float(np.percentile(
+            per_frame_after[finite], 95)),
+    }
+    with (output_dir / "cross_rig_registration_frames.csv").open(
+            "w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("frame_index", "timestamp_ns",
+                         "before_median_px", "after_median_px"))
+        for index in np.flatnonzero(finite):
+            writer.writerow((int(index), int(timestamps_ns[index]),
+                             float(per_frame_before[index]),
+                             float(per_frame_after[index])))
+
+    valid_indices = np.flatnonzero(finite)
+    count = min(max(0, int(snapshot_count)), len(valid_indices))
+    if count:
+        uniform = valid_indices[np.linspace(
+            0, len(valid_indices) - 1, max(1, count // 2),
+            dtype=int)]
+        worst = valid_indices[np.argsort(
+            per_frame_before[valid_indices])[-(count - len(uniform)):]] \
+            if count > len(uniform) else np.empty(0, dtype=int)
+        selected = np.unique(np.concatenate([uniform, worst]))
+        if len(selected) > count:
+            selected = selected[:count]
+        snapshot_dir = output_dir / "cross_rig_registration_snapshots"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        with SvoReader(find_svo(session, rig_id="primary")) as primary_svo, \
+                SvoReader(find_svo(
+                    session, rig_id="oblique")) as oblique_svo:
+            readers = {"primary": primary_svo, "oblique": oblique_svo}
+            for index in selected:
+                panels = []
+                for rig in RIGS:
+                    _, left_image, right_image = readers[rig].read(
+                        int(source_frames[rig][index]))
+                    for eye, source_image in (
+                            ("left", left_image), ("right", right_image)):
+                        panel = source_image.copy()
+                        for marker in range(4):
+                            observed = centers[
+                                index, view_index[f"{rig}_{eye}"], marker]
+                            if np.all(np.isfinite(observed)):
+                                cv2.circle(panel, tuple(np.rint(
+                                    observed).astype(int)), 7,
+                                    (0, 255, 0), 2, cv2.LINE_AA)
+                            point = primary_points[index, marker]
+                            if (rig != "oblique"
+                                    or not np.all(np.isfinite(point))):
+                                continue
+                            for registration, color in (
+                                    (original[rig], (0, 0, 255)),
+                                    (refined[rig], (255, 255, 0))):
+                                transform = (
+                                    registration.left_camera_T_base
+                                    if eye == "left" else
+                                    registration.right_camera_T_base)
+                                xy = project_points(
+                                    registration.K, transform,
+                                    point[None])[0][0]
+                                if np.all(np.isfinite(xy)):
+                                    x, y = tuple(np.rint(xy).astype(int))
+                                    cv2.drawMarker(
+                                        panel, (x, y), color,
+                                        cv2.MARKER_CROSS, 15, 2,
+                                        cv2.LINE_AA)
+                        cv2.putText(
+                            panel, f"{rig} {eye}", (20, 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                            (0, 0, 0), 2, cv2.LINE_AA)
+                        panels.append(cv2.resize(
+                            panel, (960, 540),
+                            interpolation=cv2.INTER_AREA))
+                mosaic = np.vstack([
+                    np.hstack(panels[:2]), np.hstack(panels[2:])])
+                cv2.putText(
+                    mosaic,
+                    ("green=observed  red=board registration  "
+                     "cyan=refined registration"),
+                    (20, 1070), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 0, 0), 2, cv2.LINE_AA)
+                path = snapshot_dir / f"frame_{int(index):06d}.png"
+                if not cv2.imwrite(str(path), mosaic):
+                    raise OSError(f"failed to write {path}")
+    report["snapshot_count"] = int(count)
+    report["snapshot_dir"] = str(
+        output_dir / "cross_rig_registration_snapshots")
+    (output_dir / "cross_rig_registration_validation.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    return report
 
 
 def _render_four_view_mosaic(
@@ -2151,9 +2672,7 @@ def write_four_view_overlay_video(
     """Render a four-view MP4 from existing results without reconstruction."""
     import h5py
 
-    registrations = registrations or {
-        rig: load_session_registration(session, require_em=False, rig_id=rig)
-        for rig in RIGS}
+    supplied_registrations = registrations is not None
     stride = max(1, int(stride))
     scale = float(np.clip(scale, 0.25, 1.0))
     panel_size = (
@@ -2166,6 +2685,9 @@ def write_four_view_overlay_video(
             h5py.File(observation_h5["oblique"], "r") as oblique_obs, \
             SvoReader(find_svo(session, rig_id="primary")) as primary_svo, \
             SvoReader(find_svo(session, rig_id="oblique")) as oblique_svo:
+        if not supplied_registrations:
+            registrations = _registrations_with_saved_calibration(
+                session, shapes)
         sources = {"primary": primary_obs, "oblique": oblique_obs}
         readers = {"primary": primary_svo, "oblique": oblique_svo}
         source_maps = {
@@ -2254,10 +2776,9 @@ def resmooth_multi_camera_hdf5(
         max_learning_mask_width_px=float("inf"),
         reject_recovered_outliers=False)
 
-    registrations = {
-        rig: load_session_registration(
-            session, require_em=False, rig_id=rig) for rig in RIGS}
     with h5py.File(destination, "r+") as output:
+        registrations = _registrations_with_saved_calibration(
+            session, output)
         points = output["distal/points_base_mm"][:]
         valid = output["frames/valid"][:].astype(bool)
         flags = preserved_flags.copy()
@@ -2327,6 +2848,7 @@ def resmooth_multi_camera_hdf5(
             32: "final_image_fit",
             64: "distal_arc_length_outside_learning_range",
             128: "whole_camera_image_fit",
+            256: "abrupt_observation_jump",
         }, sort_keys=True)
         learning_valid = int(np.count_nonzero(flags == 0))
         output.flush()
@@ -2349,13 +2871,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--outdir", required=True)
     parser.add_argument(
         "--stage", choices=(
-            "observations", "reconstruct", "resmooth", "overlay", "all"),
+            "observations", "registration", "reconstruct", "resmooth",
+            "overlay", "all"),
         default="all")
     parser.add_argument("--primary-observations-h5", default=None)
     parser.add_argument("--oblique-observations-h5", default=None)
     parser.add_argument(
         "--shape-h5", default=None,
-        help="existing four-view shape HDF5 for --stage overlay/resmooth")
+        help=("existing four-view shape HDF5 for --stage "
+              "registration/overlay/resmooth"))
     parser.add_argument(
         "--overlay-video", default=None,
         help="MP4 path for --stage overlay; defaults inside --outdir")
@@ -2380,6 +2904,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--whole-rig-max-symmetric-px", type=float, default=12.0,
         help=("reject direct reconstruction when an entire physical camera "
               "exceeds this unweighted symmetric mean residual"))
+    parser.add_argument(
+        "--reject-abrupt-observation-jumps", action="store_true",
+        help=("exclude a frame from learning only when both camera rigs are "
+              "temporally corrupt or no non-corrupt, well-conditioned rig "
+              "can provide stereo depth; retain diagnostics and overlays"))
+    parser.add_argument(
+        "--no-cross-rig-registration-refinement", action="store_true",
+        help=("disable the robust marker-based SE(3) refinement of the "
+              "oblique registration; intended only for calibration audits"))
     parser.add_argument("--chromatic-eye-workers", type=int, default=2)
     parser.add_argument(
         "--rig-workers", type=int, default=2,
@@ -2400,6 +2933,14 @@ def main(argv=None) -> None:
         "primary": args.primary_observations_h5,
         "oblique": args.oblique_observations_h5,
     }
+    if args.stage == "registration":
+        shape_h5 = Path(
+            args.shape_h5 or output / "processed_shapes.h5").resolve()
+        summary = validate_cross_rig_registration(
+            session, shape_h5, output,
+            snapshot_count=args.snapshot_count)
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return
     if args.stage == "overlay":
         for rig in RIGS:
             if observation_paths[rig] is None:
@@ -2440,7 +2981,11 @@ def main(argv=None) -> None:
         MultiCameraConfig(
             max_nfev=args.max_nfev,
             reacquisition_rig_error_px=args.reacquisition_rig_error_px,
-            whole_rig_max_symmetric_px=args.whole_rig_max_symmetric_px),
+            whole_rig_max_symmetric_px=args.whole_rig_max_symmetric_px,
+            refine_cross_rig_registration=(
+                not args.no_cross_rig_registration_refinement),
+            reject_abrupt_observation_jumps=(
+                args.reject_abrupt_observation_jumps)),
         write_snapshots=args.write_snapshots,
         snapshot_count=args.snapshot_count)
     print(json.dumps(summary, indent=2, sort_keys=True))

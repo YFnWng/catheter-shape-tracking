@@ -32,7 +32,8 @@ def _repair_one_track(
         observed: np.ndarray, timestamps_ns: np.ndarray,
         maximum_gap_ms: float, maximum_chord_residual_px: float,
         interpolated_confidence: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+           np.ndarray]:
     values = np.asarray(values, dtype=np.float64).copy()
     widths = np.asarray(widths, dtype=np.float64).copy()
     confidence = np.asarray(confidence, dtype=np.float64).copy()
@@ -40,6 +41,7 @@ def _repair_one_track(
         np.asarray(observed, dtype=bool)
         & np.all(np.isfinite(values), axis=1))
     trusted = direct.copy()
+    outlier = np.zeros(len(values), dtype=bool)
     # Iteration is needed when a short run contains more than one mutually
     # consistent wrong observation. Removing its largest chord residual first
     # exposes the remaining samples to the same bidirectional test.
@@ -50,6 +52,7 @@ def _repair_one_track(
             residual > float(maximum_chord_residual_px))
         if not np.any(bad):
             break
+        outlier |= bad
         trusted[bad] = False
 
     repaired = values.copy()
@@ -82,7 +85,8 @@ def _repair_one_track(
     repaired_width[~available] = np.nan
     repaired_confidence[~available] = 0.0
     return (repaired, repaired_width, repaired_confidence,
-            available.astype(np.uint8), interpolated.astype(np.uint8))
+            available.astype(np.uint8), interpolated.astype(np.uint8),
+            outlier.astype(np.uint8))
 
 
 def repair_stereo_marker_tracks(
@@ -115,14 +119,16 @@ def repair_stereo_marker_tracks(
             confidence_by_view[view], dtype=np.float64).copy()
         observed = np.asarray(observed_by_view[view], dtype=np.uint8).copy()
         interpolated = np.zeros_like(observed, dtype=np.uint8)
+        outlier = np.zeros_like(observed, dtype=np.uint8)
         for marker in range(centers.shape[1]):
             (centers[:, marker], widths[:, marker], confidence[:, marker],
-             observed[:, marker], interpolated[:, marker]) = _repair_one_track(
+             observed[:, marker], interpolated[:, marker],
+             outlier[:, marker]) = _repair_one_track(
                 centers[:, marker], widths[:, marker], confidence[:, marker],
                 observed[:, marker], timestamps, maximum_gap_ms,
                 maximum_chord_residual_px, interpolated_confidence)
         output[view] = {
             "centers": centers, "widths": widths,
             "confidence": confidence, "observed": observed,
-            "interpolated": interpolated}
+            "interpolated": interpolated, "outlier": outlier}
     return output

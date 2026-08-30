@@ -996,6 +996,41 @@ python -m shape_tracking.multi_image_sequence \
   --prefetch-frames 16
 ```
 
+For recordings known to contain isolated SVO decode corruption, add
+`--reject-abrupt-observation-jumps`. The zero-phase temporal audit then keeps
+the filtered frame for visualization. Corruption is tracked separately for the
+primary and oblique rigs: a rig with a marker jump is removed from stereo-depth
+reference selection, while the other independently valid, well-conditioned rig
+can still produce a learning-valid frame. Learning rejection bit 256 is set
+only when both rigs are corrupt in the same paired frame, or when no remaining
+non-corrupt rig passes the topology, epipolar, support, and length gates (for
+example, the only good camera sees an ill-posed configuration). Repaired marker
+tracks remain available for visualization and neighboring fits.
+Rows where one observation pass itself fails are handled the same way: the
+failed rig is recorded in `frames/{rig}_observation_valid`, omitted from that
+frame's fitting objective, and the other rig remains eligible. Observation
+cache construction therefore succeeds when all requested frames were
+processed even if a small number of individual rows are invalid.
+
+Before four-view reconstruction, the dual-rig pipeline robustly aligns the
+oblique rig's independently triangulated, directly observed ring tracks to the
+primary rig. This estimates only a safety-bounded SE(3) correction to the
+board registration; temporally rejected and cross-camera-inferred marker rows
+cannot influence it. The correction and before/after residuals are saved in
+`cross_rig_registration_refinement_json` and `processing_summary.json`.
+When both stereo rigs pass the topology and corruption gates, all four views
+then receive normal fitting weight. A single physical rig dominates only when
+the other rig is corrupt, fails its ordered-stereo topology/support gates, or
+the independently reconstructed endpoints are mutually inconsistent.
+The refinement can be audited without rerunning spline reconstruction using
+`--stage registration --shape-h5 EXISTING_SHAPES_H5`. This writes a JSON
+summary, a per-frame before/after residual CSV, and snapshots where green
+circles are observed marker centers, red crosses use the original board
+registration, and cyan crosses use the refined registration.
+Collection events are read from both legacy `rosbag/` and current
+`robot_bag/` session directories, so `run_and_return` uses the recorded
+`run_start` and `run_end` timestamps.
+
 The two rig caches run in separate spawned processes so each owns its ZED
 decoder and output file. Within each process the two eyes use two worker
 threads. Set `--rig-workers 1` only for serial debugging. The dual-camera

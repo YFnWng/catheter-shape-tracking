@@ -17,10 +17,12 @@ from shape_tracking.multi_view_reconstruction import (
 from shape_tracking.multi_image_sequence import (
     MultiCameraConfig,
     _associate_cross_camera_marker_identities,
+    _fit_reference_from_available_rigs,
     _fit_ordered_disparity_spline,
     _ordered_stereo_curve_candidate,
     _pair_map,
     _repair_cross_camera_marker_centers,
+    _robust_rigid_alignment,
     _result_requires_reacquisition,
     _result_rig_errors,
     _select_consistent_rig,
@@ -72,6 +74,39 @@ class MultiViewReconstructionTests(unittest.TestCase):
             self.assertTrue(np.all(in_front))
             self.observations.append(ViewObservation(
                 f"view_{index}", self.K, transform, pixels))
+
+    def test_fit_reference_is_joint_until_only_one_rig_is_usable(self):
+        reference, rigs = _fit_reference_from_available_rigs(None, 3)
+        self.assertIsNone(reference)
+        self.assertEqual(rigs, {"primary", "oblique"})
+
+        reference, rigs = _fit_reference_from_available_rigs(None, 2)
+        self.assertEqual(reference, "oblique")
+        self.assertEqual(rigs, {"oblique"})
+
+        reference, rigs = _fit_reference_from_available_rigs("primary", 3)
+        self.assertEqual(reference, "primary")
+        self.assertEqual(rigs, {"primary"})
+
+    def test_robust_rigid_alignment_recovers_small_extrinsic_error(self):
+        rng = np.random.default_rng(4)
+        source = rng.normal(size=(500, 3)) * np.array([20.0, 30.0, 15.0])
+        angle = np.deg2rad(0.8)
+        rotation = np.array([
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        translation = np.array([-0.8, 1.9, 1.1])
+        target = (rotation @ source.T).T + translation
+        target += rng.normal(scale=0.05, size=target.shape)
+        target[::23] += rng.normal(scale=20.0, size=target[::23].shape)
+        fitted_rotation, fitted_translation, inliers = (
+            _robust_rigid_alignment(source, target))
+        self.assertGreater(int(np.count_nonzero(inliers)), 450)
+        np.testing.assert_allclose(fitted_rotation, rotation, atol=5e-4)
+        np.testing.assert_allclose(
+            fitted_translation, translation, atol=0.03)
 
     def test_material_order_dlt_is_a_finite_initializer(self):
         reconstructed = triangulate_material_curve(self.observations)
@@ -306,6 +341,24 @@ class MultiViewReconstructionTests(unittest.TestCase):
         selected = _select_ordered_stereo_curve(
             observations, "oblique", "primary", config)
         self.assertEqual(selected["rig"], "oblique")
+
+        # Corruption is rig-local. A corrupt trusted rig is excluded and the
+        # other independently valid camera pair becomes the reference.
+        selected = _select_ordered_stereo_curve(
+            observations, "primary", "primary", config,
+            corrupted_rigs={"primary"})
+        self.assertEqual(selected["rig"], "oblique")
+        self.assertEqual(selected["available_rig_mask"], 2)
+        selected = _select_ordered_stereo_curve(
+            observations, "oblique", "oblique", config,
+            corrupted_rigs={"oblique"})
+        self.assertEqual(selected["rig"], "primary")
+        self.assertEqual(selected["available_rig_mask"], 1)
+
+        selected = _select_ordered_stereo_curve(
+            observations, None, None, config,
+            corrupted_rigs={"primary", "oblique"})
+        self.assertIsNone(selected)
 
         ill_primary = [replace(item, topology_weight=0.08)
                        for item in primary]

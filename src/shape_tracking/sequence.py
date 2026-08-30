@@ -93,7 +93,12 @@ def _decode_std_string(serialized: bytes) -> str:
 
 def load_collection_markers(session: Path) -> dict[str, dict]:
     """Read collection JSON markers from a copied rosbag, when available."""
-    databases = sorted((session / "rosbag").glob("*.db3"))
+    # Current dual-camera recorder sessions use ``robot_bag``; retain the
+    # historical ``rosbag`` name for older recordings.
+    databases = sorted({
+        *session.glob("rosbag/*.db3"),
+        *session.glob("robot_bag/*.db3"),
+    })
     markers = {}
     for database in databases:
         connection = sqlite3.connect(str(database))
